@@ -1,0 +1,14 @@
+# Code Linting & Static Analysis
+ruff>=0.5.0
+
+# Security Analysis for Python
+bandit>=1.7.5
+
+# Testing Framework
+pytest>=7.4.0
+
+# Multi-Agent Workflow & LLM Integration (Milestone 2)
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+python-dotenv>=1.0.0
