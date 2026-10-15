@@ -4,8 +4,6 @@ tests/test_safety.py - Unit tests for safety boundaries and input sanitization.
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
 import pytest
 
 from safety import (

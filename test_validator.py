@@ -21,7 +21,6 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +75,7 @@ def _extract_python_code_block(content: str) -> str:
     return cleaned.strip()
 
 
-def validate_generated_test_content(content: str) -> Tuple[bool, str]:
+def validate_generated_test_content(content: str) -> tuple[bool, str]:
     """
     Validate that LLM-generated content looks like a safe pytest test file.
 
@@ -117,14 +116,16 @@ def validate_generated_test_content(content: str) -> Tuple[bool, str]:
     # 3. Structural AST check: must contain test functions or Test classes
     has_test_function = False
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if node.name.startswith("test_") or node.name == "test":
-                has_test_function = True
-                break
-        elif isinstance(node, ast.ClassDef):
-            if node.name.startswith("Test"):
-                has_test_function = True
-                break
+        if (
+            (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and (node.name.startswith("test_") or node.name == "test")
+            )
+            or (isinstance(node, ast.ClassDef) and node.name.startswith("Test"))
+        ):
+            has_test_function = True
+            break
+
 
     if not has_test_function:
         return False, (
@@ -147,9 +148,13 @@ def validate_generated_test_content(content: str) -> Tuple[bool, str]:
                     if alias.name in ("system", "popen", "spawn"):
                         return False, f"Generated test imports prohibited function 'os.{alias.name}'."
         # Disallow dangerous function calls
-        elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name) and node.func.id in ("eval", "exec", "__import__"):
-                return False, f"Generated test calls prohibited built-in '{node.func.id}()'."
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in ("eval", "exec", "__import__")
+        ):
+            return False, f"Generated test calls prohibited built-in '{node.func.id}()'."
+
 
     return True, ""
 
@@ -157,7 +162,7 @@ def validate_generated_test_content(content: str) -> Tuple[bool, str]:
 def store_test_in_workspace(
     content: str,
     target_source_file: str,
-    workspace_dir: Optional[str] = None,
+    workspace_dir: str | None = None,
 ) -> str:
     """
     Validate and safely store generated test content in an isolated temp workspace.

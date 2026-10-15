@@ -29,10 +29,8 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-import textwrap
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -65,15 +63,15 @@ class SandboxResult:
         test_workspace: Path to the disposable test workspace used.
     """
     executed: bool = False
-    exit_code: Optional[int] = None
+    exit_code: int | None = None
     passed: bool = False
     stdout: str = ""
     stderr: str = ""
     timed_out: bool = False
     docker_unavailable: bool = False
-    error_message: Optional[str] = None
-    source_workspace: Optional[str] = None
-    test_workspace: Optional[str] = None
+    error_message: str | None = None
+    source_workspace: str | None = None
+    test_workspace: str | None = None
 
 
 def is_docker_available() -> bool:
@@ -129,7 +127,7 @@ def _build_docker_run_command(
     test_mount: str,
     test_filename: str,
     timeout: int,
-) -> List[str]:
+) -> list[str]:
     """
     Build the complete `docker run` command with security constraints.
 
@@ -172,8 +170,8 @@ def run_tests_in_sandbox(
     source_dir: str,
     test_file: str,
     timeout: int = DEFAULT_SANDBOX_TIMEOUT,
-    _docker_runner: Optional[object] = None,  # injection point for unit tests
-    test_workspace: Optional[str] = None,
+    _docker_runner: object | None = None,  # injection point for unit tests
+    test_workspace: str | None = None,
 ) -> SandboxResult:
     """
     Execute a test file against a source directory inside a disposable Docker container.
@@ -230,8 +228,8 @@ def run_tests_in_sandbox(
 
     test_filename = test_path.name
 
-    disposable_src: Optional[str] = None
-    disposable_tests: Optional[str] = None
+    disposable_src: str | None = None
+    disposable_tests: str | None = None
 
     try:
         # 2. Create disposable copies in isolated temp directories
@@ -239,7 +237,7 @@ def run_tests_in_sandbox(
         disposable_tests = tempfile.mkdtemp(prefix="sandbox_tests_")
 
         # Symlink guard: ignore any symlinks pointing outside the source tree
-        def _filter_escaping_symlinks(dir_path: str, names: List[str]) -> List[str]:
+        def _filter_escaping_symlinks(dir_path: str, names: list[str]) -> list[str]:
             ignored = []
             dir_p = Path(dir_path).resolve()
             for name in names:
@@ -285,8 +283,7 @@ def run_tests_in_sandbox(
         else:
             proc = subprocess.run(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=timeout,
                 check=False,
             )
@@ -321,7 +318,7 @@ def run_tests_in_sandbox(
             source_workspace=disposable_src,
             test_workspace=disposable_tests,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - sandbox boundary containment
         logger.error("Sandbox execution failed: %s: %s", type(exc).__name__, exc)
         return SandboxResult(
             error_message=f"Sandbox execution error: {type(exc).__name__}: {exc}",
@@ -332,7 +329,4 @@ def run_tests_in_sandbox(
         # 5. Cleanup disposable workspaces unconditionally
         for temp_dir in [disposable_src, disposable_tests]:
             if temp_dir and os.path.exists(temp_dir):
-                try:
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-                except Exception:
-                    pass
+                shutil.rmtree(temp_dir, ignore_errors=True)

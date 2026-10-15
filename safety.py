@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional
 
 
-def get_workspace_root(override_root: Optional[str] = None) -> Path:
+def get_workspace_root(override_root: str | None = None) -> Path:
     """
     Return the canonical Path of the project workspace root.
 
@@ -34,7 +33,7 @@ def get_workspace_root(override_root: Optional[str] = None) -> Path:
     return Path(__file__).resolve().parent
 
 
-def is_path_within_workspace(file_path: str, workspace_root: Optional[str] = None) -> bool:
+def is_path_within_workspace(file_path: str, workspace_root: str | None = None) -> bool:
     """
     Verify whether a target file path resolves strictly within the workspace root.
 
@@ -49,7 +48,7 @@ def is_path_within_workspace(file_path: str, workspace_root: Optional[str] = Non
         return False
 
 
-def validate_workspace_path(file_path: str, workspace_root: Optional[str] = None) -> Path:
+def validate_workspace_path(file_path: str, workspace_root: str | None = None) -> Path:
     """
     Resolve and validate a file path, ensuring it stays inside the workspace.
 
@@ -71,9 +70,9 @@ def validate_workspace_path(file_path: str, workspace_root: Optional[str] = None
 
 def extract_source_snippet(
     file_path: str,
-    line: Optional[int],
+    line: int | None,
     context_lines: int = 3,
-    workspace_root: Optional[str] = None,
+    workspace_root: str | None = None,
 ) -> str:
     """
     Safely extract a narrow line snippet around a target issue line.
@@ -117,8 +116,9 @@ def extract_source_snippet(
 
         return "\n".join(snippet_lines)
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - safe snippet fallback
         return f"[Failed to read snippet from '{file_path}': {exc}]"
+
 
 
 def wrap_untrusted_content(
@@ -144,8 +144,8 @@ def wrap_untrusted_content(
 def find_reviewable_python_files(
     target_path: str,
     max_files: int = 15,
-    workspace_root: Optional[str] = None,
-) -> List[str]:
+    workspace_root: str | None = None,
+) -> list[str]:
     """
     Discover reviewable Python source files under target_path.
 
@@ -174,7 +174,7 @@ def find_reviewable_python_files(
         "build", "dist", "site-packages",
     }
 
-    found: List[str] = []
+    found: list[str] = []
     for root, dirs, files in os.walk(p):
         # Exclude directories in-place
         dirs[:] = [d for d in dirs if d not in excluded_dirs and not d.startswith(".")]

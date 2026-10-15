@@ -8,21 +8,17 @@ No Docker calls are made; no network access required.
 from __future__ import annotations
 
 import subprocess
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from sandbox_runner import (
-    DEFAULT_SANDBOX_TIMEOUT,
     SANDBOX_IMAGE,
-    SandboxResult,
     _build_docker_run_command,
     is_docker_available,
     run_tests_in_sandbox,
     validate_test_file_path,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,21 +42,28 @@ class TestIsDockerAvailable:
             assert is_docker_available() is False
 
     def test_returns_false_when_docker_info_fails(self):
-        with patch("sandbox_runner.shutil.which", return_value="/usr/bin/docker"):
-            with patch("sandbox_runner.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=1)
-                assert is_docker_available() is False
+        with (
+            patch("sandbox_runner.shutil.which", return_value="/usr/bin/docker"),
+            patch("sandbox_runner.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=1)
+            assert is_docker_available() is False
 
     def test_returns_true_when_docker_info_succeeds(self):
-        with patch("sandbox_runner.shutil.which", return_value="/usr/bin/docker"):
-            with patch("sandbox_runner.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=0)
-                assert is_docker_available() is True
+        with (
+            patch("sandbox_runner.shutil.which", return_value="/usr/bin/docker"),
+            patch("sandbox_runner.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            assert is_docker_available() is True
 
     def test_returns_false_on_file_not_found_exception(self):
-        with patch("sandbox_runner.shutil.which", return_value="/usr/bin/docker"):
-            with patch("sandbox_runner.subprocess.run", side_effect=FileNotFoundError):
-                assert is_docker_available() is False
+        with (
+            patch("sandbox_runner.shutil.which", return_value="/usr/bin/docker"),
+            patch("sandbox_runner.subprocess.run", side_effect=FileNotFoundError),
+        ):
+            assert is_docker_available() is False
+
 
 
 # ---------------------------------------------------------------------------

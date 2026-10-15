@@ -14,21 +14,25 @@ Safety guarantees:
 
 from __future__ import annotations
 
-import difflib
 import logging
 import os
 import re
 import shutil
 import tempfile
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm_config import MissingApiKeyError, get_llm
-from safety import extract_source_snippet, is_path_within_workspace, wrap_untrusted_content
+from safety import (
+    extract_source_snippet,
+    is_path_within_workspace,
+    wrap_untrusted_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,10 +64,10 @@ class PatchProposal:
     attempt_number: int = 1
     target_file: str = ""
     unified_diff: str = ""
-    patch_applied_to_copy: Optional[str] = None
+    patch_applied_to_copy: str | None = None
     patch_succeeded: bool = False
-    verification_result: Optional[Any] = None  # SandboxResult, avoid circular import
-    error_message: Optional[str] = None
+    verification_result: Any | None = None  # SandboxResult, avoid circular import
+    error_message: str | None = None
     llm_raw_response: str = ""
 
 
@@ -92,7 +96,7 @@ def _extract_diff_from_response(response_text: str) -> str:
     diff_lines = []
     in_diff = False
     for line in lines:
-        if line.startswith("--- ") or line.startswith("+++ "):
+        if line.startswith(("--- ", "+++ ")):
             in_diff = True
         if in_diff:
             diff_lines.append(line)
@@ -126,18 +130,18 @@ def _validate_patch_safety(patch_text: str) -> bool:
         if line.startswith("+++ ") and "/dev/null" in line:
             return False
         # Reject patches with path traversal in file headers
-        if line.startswith("--- ") or line.startswith("+++ "):
-            if ".." in line:
-                return False
+        if line.startswith(("--- ", "+++ ")) and ".." in line:
+            return False
 
     return True
+
 
 
 def apply_patch_to_copy(
     original_file: str,
     patch_text: str,
-    workspace_root: Optional[str] = None,
-) -> tuple[bool, str, Optional[str]]:
+    workspace_root: str | None = None,
+) -> tuple[bool, str, str | None]:
     """
     Apply a unified diff patch to a disposable copy of the target file.
 
@@ -181,14 +185,15 @@ def apply_patch_to_copy(
         patched_copy.write_text("".join(patched_lines), encoding="utf-8")
         return True, "", str(patched_copy)
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - defensive patch sandbox isolation
         return False, f"Patch application error: {type(exc).__name__}: {exc}", None
 
 
+
 def _apply_unified_diff(
-    original_lines: List[str],
-    patch_lines: List[str],
-) -> Optional[List[str]]:
+    original_lines: list[str],
+    patch_lines: list[str],
+) -> list[str] | None:
     """
     Apply a unified diff (list of patch lines) to original_lines.
 
@@ -198,7 +203,7 @@ def _apply_unified_diff(
     unified diff format without requiring the external `patch` binary.
     """
     try:
-        result_lines: List[str] = list(original_lines)
+        result_lines: list[str] = list(original_lines)
         hunk_header = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
         i = 0
@@ -220,7 +225,7 @@ def _apply_unified_diff(
 
             # Apply this hunk
             pos = orig_start + offset
-            new_chunk: List[str] = []
+            new_chunk: list[str] = []
             orig_consumed = 0
 
             for hunk_line in hunk_lines:
@@ -230,7 +235,7 @@ def _apply_unified_diff(
                     orig_consumed += 1
                 else:
                     # Context line
-                    ctx = hunk_line[1:] if hunk_line.startswith(" ") else hunk_line
+                    ctx = hunk_line.removeprefix(" ")
                     new_chunk.append(ctx)
                     orig_consumed += 1
 
@@ -239,9 +244,10 @@ def _apply_unified_diff(
 
         return result_lines
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - malformed hunk recovery
         logger.warning("Diff application error: %s", exc)
         return None
+
 
 
 class DebuggingAgent:
@@ -259,9 +265,9 @@ class DebuggingAgent:
 
     def __init__(
         self,
-        llm: Optional[BaseChatModel] = None,
+        llm: BaseChatModel | None = None,
         max_attempts: int = MAX_DEBUG_ATTEMPTS,
-        workspace_root: Optional[str] = None,
+        workspace_root: str | None = None,
     ) -> None:
         self.llm = llm
         self.max_attempts = max(1, min(max_attempts, 5))  # bound between 1 and 5
@@ -275,8 +281,8 @@ class DebuggingAgent:
     def propose_patch(
         self,
         target_file: str,
-        ruff_findings: List[Dict[str, Any]],
-        bandit_findings: List[Dict[str, Any]],
+        ruff_findings: list[dict[str, Any]],
+        bandit_findings: list[dict[str, Any]],
         failed_test_output: str,
         attempt_number: int = 1,
     ) -> PatchProposal:
@@ -394,7 +400,7 @@ class DebuggingAgent:
 
         except MissingApiKeyError as key_err:
             proposal.error_message = f"LLM credentials missing: {key_err}"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - agent error containment
             proposal.error_message = f"Debugging Agent error: {type(exc).__name__}: {exc}"
 
         return proposal
@@ -402,13 +408,13 @@ class DebuggingAgent:
     def run(
         self,
         target_file: str,
-        ruff_findings: List[Dict[str, Any]],
-        bandit_findings: List[Dict[str, Any]],
+        ruff_findings: list[dict[str, Any]],
+        bandit_findings: list[dict[str, Any]],
         failed_test_output: str,
-        sandbox_runner: Optional[Callable] = None,
-        test_file: Optional[str] = None,
-        source_dir: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        sandbox_runner: Callable | None = None,
+        test_file: str | None = None,
+        source_dir: str | None = None,
+    ) -> dict[str, Any]:
         """
         Main entry point: propose patches and optionally verify them.
 
@@ -417,8 +423,8 @@ class DebuggingAgent:
           - patch_verified: bool indicating if any patch passed verification
           - agent_errors: List[str]
         """
-        errors: List[str] = []
-        proposals: List[Dict[str, Any]] = []
+        errors: list[str] = []
+        proposals: list[dict[str, Any]] = []
         patch_verified = False
 
         for attempt in range(1, self.max_attempts + 1):
@@ -455,11 +461,12 @@ class DebuggingAgent:
                         patch_verified = True
                         proposals.append(_proposal_to_dict(proposal))
                         break  # Stop on first passing patch
-                except Exception as verify_err:
+                except Exception as verify_err:  # noqa: BLE001 - runner error containment
                     errors.append(
                         f"Attempt {attempt} verification error: "
                         f"{type(verify_err).__name__}: {verify_err}"
                     )
+
 
             proposals.append(_proposal_to_dict(proposal))
 
@@ -473,7 +480,7 @@ class DebuggingAgent:
         }
 
 
-def _proposal_to_dict(proposal: PatchProposal) -> Dict[str, Any]:
+def _proposal_to_dict(proposal: PatchProposal) -> dict[str, Any]:
     """Convert a PatchProposal dataclass to a JSON-serializable dict."""
     verification_dict = None
     if proposal.verification_result is not None:

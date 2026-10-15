@@ -7,21 +7,18 @@ No Docker calls are made; no network access required.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-import pytest
 
 from debugging_agent import (
     DEBUGGING_DISCLAIMER,
     DebuggingAgent,
-    PatchProposal,
     _apply_unified_diff,
     _extract_diff_from_response,
     _validate_patch_safety,
     apply_patch_to_copy,
 )
 from llm_config import MissingApiKeyError
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -154,18 +151,17 @@ class TestApplyPatchToCopy:
             "+x = 42\n"
         )
 
-        success, err, patched_path = apply_patch_to_copy(str(original_file), patch_text)
+        success, _err, patched_path = apply_patch_to_copy(str(original_file), patch_text)
 
         # Original should be unchanged
         assert original_file.read_text() == "x = 1\n"
         # Patched copy should be different
         if success and patched_path:
-            from pathlib import Path
             p = Path(patched_path)
             assert p.is_file()
 
     def test_returns_false_for_missing_original(self, tmp_path):
-        success, err, path = apply_patch_to_copy(
+        success, err, _path = apply_patch_to_copy(
             str(tmp_path / "nonexistent.py"),
             SIMPLE_DIFF,
         )
@@ -175,11 +171,12 @@ class TestApplyPatchToCopy:
     def test_returns_false_for_empty_patch(self, tmp_path):
         orig = tmp_path / "f.py"
         orig.write_text("x = 1\n")
-        success, err, path = apply_patch_to_copy(str(orig), "")
+        _success, _err, _path = apply_patch_to_copy(str(orig), "")
         # Empty patch should fail validation in the pipeline but apply_patch_to_copy
         # itself may succeed with no changes; we just check it doesn't crash
         # and that the original is unchanged.
         assert orig.read_text() == "x = 1\n"
+
 
 
 # ---------------------------------------------------------------------------

@@ -23,13 +23,14 @@ from __future__ import annotations
 
 import operator
 from dataclasses import asdict
-from typing import Any, Dict, List
-from typing_extensions import Annotated, TypedDict
+from typing import Annotated, Any
+
+from typing_extensions import TypedDict
 
 from tools import Issue
 
 
-def merge_dict_reducer(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+def merge_dict_reducer(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     """
     State reducer for merging dictionary updates across parallel graph branches.
 
@@ -47,28 +48,28 @@ class ReviewState(TypedDict, total=False):
     """
     # Milestone 1 & 2 fields
     target_path: str
-    ruff_findings: List[Dict[str, Any]]
-    bandit_findings: List[Dict[str, Any]]
-    ai_explanations: Annotated[Dict[str, str], merge_dict_reducer]
-    generated_test_suggestions: List[Dict[str, Any]]
-    agent_errors: Annotated[List[str], operator.add]
-    final_review_report: Dict[str, Any]
+    ruff_findings: list[dict[str, Any]]
+    bandit_findings: list[dict[str, Any]]
+    ai_explanations: Annotated[dict[str, str], merge_dict_reducer]
+    generated_test_suggestions: list[dict[str, Any]]
+    agent_errors: Annotated[list[str], operator.add]
+    final_review_report: dict[str, Any]
 
     # Milestone 3 fields
-    stored_test_files: List[str]           # Paths to validated test files in temp workspace
-    sandbox_results: List[Dict[str, Any]]  # SandboxResult serialized dicts
-    patch_proposals: List[Dict[str, Any]]  # PatchProposal serialized dicts
+    stored_test_files: list[str]           # Paths to validated test files in temp workspace
+    sandbox_results: list[dict[str, Any]]  # SandboxResult serialized dicts
+    patch_proposals: list[dict[str, Any]]  # PatchProposal serialized dicts
     patch_verified: bool                   # Did any proposed patch pass sandbox tests?
     debug_attempts: int                    # Number of debugging attempts used
     sandbox_skipped: bool                  # Was sandbox skipped (Docker unavailable)?
 
 
-def issue_to_dict(issue: Issue) -> Dict[str, Any]:
+def issue_to_dict(issue: Issue) -> dict[str, Any]:
     """Convert an Issue dataclass instance to a serializable dictionary."""
     return asdict(issue)
 
 
-def dict_to_issue(data: Dict[str, Any]) -> Issue:
+def dict_to_issue(data: dict[str, Any]) -> Issue:
     """Reconstruct an Issue dataclass instance from a dictionary."""
     return Issue(
         code=data.get("code", "UNKNOWN"),

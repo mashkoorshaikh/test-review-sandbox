@@ -8,6 +8,7 @@ Ensures no real API calls are made during tests.
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
+
 import pytest
 
 from agents import (
@@ -20,7 +21,6 @@ from agents import (
 )
 from llm_config import MissingApiKeyError
 from tools import Issue, ToolResult
-
 
 # -----------------------------------------------------------------------------
 # Reusable Helpers & Fixtures

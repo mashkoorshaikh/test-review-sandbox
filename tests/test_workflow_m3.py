@@ -14,17 +14,14 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from sandbox_runner import SandboxResult
-from state import ReviewState, create_initial_state
+from state import create_initial_state
 from tools import Issue, ToolResult
 from workflow import (
     build_review_graph,
     create_orchestrator_report,
     run_review_pipeline,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers

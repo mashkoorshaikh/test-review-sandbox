@@ -15,9 +15,8 @@ Defines three specialized agents:
 from __future__ import annotations
 
 import logging
-import tempfile
-from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -26,12 +25,11 @@ from llm_config import MissingApiKeyError, get_llm
 from safety import (
     extract_source_snippet,
     find_reviewable_python_files,
-    is_path_within_workspace,
     wrap_untrusted_content,
 )
 from state import issue_to_dict
 from test_validator import TestValidationError, store_test_in_workspace
-from tools import Issue, ToolResult, run_bandit, run_ruff
+from tools import ToolResult, run_bandit, run_ruff
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +64,9 @@ class LinterAgent:
 
     def __init__(
         self,
-        llm: Optional[BaseChatModel] = None,
-        ruff_runner: Optional[Callable[..., ToolResult]] = None,
-        workspace_root: Optional[str] = None,
+        llm: BaseChatModel | None = None,
+        ruff_runner: Callable[..., ToolResult] | None = None,
+        workspace_root: str | None = None,
     ) -> None:
         self.llm = llm
         self.ruff_runner = ruff_runner or run_ruff
@@ -79,7 +77,7 @@ class LinterAgent:
             return self.llm
         return get_llm()
 
-    def run(self, target_path: str) -> Dict[str, Any]:
+    def run(self, target_path: str) -> dict[str, Any]:
         """
         Execute Ruff on target_path, extract code snippets, and generate AI explanations.
 
@@ -89,7 +87,7 @@ class LinterAgent:
               - ai_explanations: {'linter': str}
               - agent_errors: List[str]
         """
-        errors: List[str] = []
+        errors: list[str] = []
         result = self.ruff_runner(target_path)
 
         serialized_findings = [issue_to_dict(i) for i in result.issues]
@@ -120,7 +118,7 @@ class LinterAgent:
             }
 
         # Case: Lint issues found -> generate beginner-friendly explanation
-        prompt_parts: List[str] = [
+        prompt_parts: list[str] = [
             f"Ruff detected {len(result.issues)} lint/style issue(s) in target '{target_path}':\n"
         ]
 
@@ -164,11 +162,12 @@ class LinterAgent:
         except MissingApiKeyError as key_err:
             explanation = f"[AI Linter Explanation Unavailable: {key_err}]\n\n{LINTER_DISCLAIMER}"
             errors.append(f"Linter Agent: {key_err}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - agent error containment
             explanation = (
                 f"[AI Linter Explanation Failed: {type(exc).__name__}: {exc}]\n\n{LINTER_DISCLAIMER}"
             )
             errors.append(f"Linter Agent Provider Error: {type(exc).__name__}: {exc}")
+
 
         return {
             "ruff_findings": serialized_findings,
@@ -188,9 +187,9 @@ class SecurityAgent:
 
     def __init__(
         self,
-        llm: Optional[BaseChatModel] = None,
-        bandit_runner: Optional[Callable[..., ToolResult]] = None,
-        workspace_root: Optional[str] = None,
+        llm: BaseChatModel | None = None,
+        bandit_runner: Callable[..., ToolResult] | None = None,
+        workspace_root: str | None = None,
     ) -> None:
         self.llm = llm
         self.bandit_runner = bandit_runner or run_bandit
@@ -201,7 +200,7 @@ class SecurityAgent:
             return self.llm
         return get_llm()
 
-    def run(self, target_path: str) -> Dict[str, Any]:
+    def run(self, target_path: str) -> dict[str, Any]:
         """
         Execute Bandit on target_path, analyze severity, and generate security commentary.
 
@@ -211,7 +210,7 @@ class SecurityAgent:
               - ai_explanations: {'security': str}
               - agent_errors: List[str]
         """
-        errors: List[str] = []
+        errors: list[str] = []
         result = self.bandit_runner(target_path)
 
         serialized_findings = [issue_to_dict(i) for i in result.issues]
@@ -242,7 +241,7 @@ class SecurityAgent:
             }
 
         # Case: Security issues detected -> generate risk breakdown
-        prompt_parts: List[str] = [
+        prompt_parts: list[str] = [
             f"Bandit detected {len(result.issues)} security issue(s) in target '{target_path}':\n"
         ]
 
@@ -285,11 +284,12 @@ class SecurityAgent:
         except MissingApiKeyError as key_err:
             explanation = f"[AI Security Explanation Unavailable: {key_err}]\n\n{SECURITY_DISCLAIMER}"
             errors.append(f"Security Agent: {key_err}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - agent error containment
             explanation = (
                 f"[AI Security Explanation Failed: {type(exc).__name__}: {exc}]\n\n{SECURITY_DISCLAIMER}"
             )
             errors.append(f"Security Agent Provider Error: {type(exc).__name__}: {exc}")
+
 
         return {
             "bandit_findings": serialized_findings,
@@ -315,9 +315,9 @@ class TestWriterAgent:
 
     def __init__(
         self,
-        llm: Optional[BaseChatModel] = None,
-        workspace_root: Optional[str] = None,
-        test_workspace_dir: Optional[str] = None,
+        llm: BaseChatModel | None = None,
+        workspace_root: str | None = None,
+        test_workspace_dir: str | None = None,
         store_tests: bool = True,
     ) -> None:
         self.llm = llm
@@ -330,7 +330,7 @@ class TestWriterAgent:
             return self.llm
         return get_llm()
 
-    def run(self, target_path: str) -> Dict[str, Any]:
+    def run(self, target_path: str) -> dict[str, Any]:
         """
         Analyze Python source files under target_path and suggest pytest tests.
 
@@ -343,7 +343,7 @@ class TestWriterAgent:
               - stored_test_files: List[str] - paths to stored validated test files
               - agent_errors: List[str]
         """
-        errors: List[str] = []
+        errors: list[str] = []
         files = find_reviewable_python_files(target_path, workspace_root=self.workspace_root)
 
         if not files:
@@ -360,7 +360,7 @@ class TestWriterAgent:
             }
 
         # Analyze files safely (cap characters to prevent token overflows)
-        source_blocks: List[str] = []
+        source_blocks: list[str] = []
         for file_path in files[:3]:  # inspect up to 3 primary source files
             try:
                 snippet = extract_source_snippet(
@@ -369,7 +369,7 @@ class TestWriterAgent:
                 source_blocks.append(f"File: {file_path}")
                 source_blocks.append(wrap_untrusted_content(snippet, label="SOURCE_FILE_UNDER_REVIEW"))
                 source_blocks.append("")
-            except Exception as read_err:
+            except Exception as read_err:  # noqa: BLE001 - source read resilience
                 errors.append(f"Test-Writer Agent read error on '{file_path}': {read_err}")
 
         if not source_blocks:
@@ -415,18 +415,18 @@ class TestWriterAgent:
         except MissingApiKeyError as key_err:
             formatted_suggestion = f"[AI Test Suggestions Unavailable: {key_err}]\n\n{TEST_WRITER_DISCLAIMER}"
             errors.append(f"Test-Writer Agent: {key_err}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - agent error containment
             formatted_suggestion = (
                 f"[AI Test Suggestions Failed: {type(exc).__name__}: {exc}]\n\n{TEST_WRITER_DISCLAIMER}"
             )
             errors.append(f"Test-Writer Agent Provider Error: {type(exc).__name__}: {exc}")
 
-        stored_test_files: List[str] = []
-        suggestions_data: List[Dict[str, Any]] = []
+        stored_test_files: list[str] = []
+        suggestions_data: list[dict[str, Any]] = []
 
         for f in files[:3]:
-            stored_path: Optional[str] = None
-            validation_error: Optional[str] = None
+            stored_path: str | None = None
+            validation_error: str | None = None
 
             # Attempt to store validated test in isolated temp workspace
             if self.store_tests and formatted_suggestion and "Unavailable" not in formatted_suggestion and "Failed" not in formatted_suggestion[:50]:
@@ -440,9 +440,10 @@ class TestWriterAgent:
                 except TestValidationError as val_err:
                     validation_error = f"Test validation failed for '{f}': {val_err}"
                     errors.append(validation_error)
-                except Exception as store_err:
+                except Exception as store_err:  # noqa: BLE001 - storage error containment
                     validation_error = f"Test storage error for '{f}': {store_err}"
                     errors.append(validation_error)
+
 
             suggestions_data.append({
                 "target_file": f,

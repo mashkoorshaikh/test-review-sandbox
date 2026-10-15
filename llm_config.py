@@ -15,7 +15,6 @@ Safety & Graceful Degradation:
 from __future__ import annotations
 
 import os
-from typing import Optional
 
 from dotenv import load_dotenv
 from langchain_core.language_models import BaseChatModel
@@ -34,7 +33,6 @@ PLACEHOLDER_KEYS = {
 
 class MissingApiKeyError(RuntimeError):
     """Raised when required LLM credentials are not configured."""
-    pass
 
 
 def is_api_key_configured() -> bool:
@@ -44,12 +42,12 @@ def is_api_key_configured() -> bool:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         return False
-    if api_key.lower() in PLACEHOLDER_KEYS:
-        return False
-    return True
+    return api_key.lower() not in PLACEHOLDER_KEYS
 
 
-def get_configured_model_name(override_model: Optional[str] = None) -> str:
+
+
+def get_configured_model_name(override_model: str | None = None) -> str:
     """Return the configured model name or default to 'gpt-4o-mini'."""
     if override_model:
         return override_model
@@ -66,9 +64,9 @@ def get_configured_timeout() -> int:
 
 
 def get_llm(
-    model: Optional[str] = None,
+    model: str | None = None,
     temperature: float = 0.0,
-    timeout: Optional[int] = None,
+    timeout: int | None = None,
 ) -> BaseChatModel:
     """
     Factory to construct an authenticated ChatOpenAI instance.

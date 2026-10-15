@@ -20,14 +20,14 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 
 from llm_config import is_api_key_configured
 from sandbox_runner import is_docker_available
-from tools import Issue, ToolResult, run_bandit, run_ruff
-from workflow import run_deterministic_only, run_review_pipeline
+from tools import ToolResult, run_bandit, run_ruff
+from workflow import run_review_pipeline
 
 
 def format_separator(char: str = "=", length: int = 78) -> str:
@@ -44,7 +44,7 @@ def print_banner() -> None:
     print()
 
 
-def display_tool_summary(results: Dict[str, ToolResult]) -> None:
+def display_tool_summary(results: dict[str, ToolResult]) -> None:
     """Print an executive summary table of all tool execution results."""
     print("OVERVIEW SUMMARY:")
     print("-" * 78)
@@ -110,7 +110,7 @@ def display_tool_findings(result: ToolResult) -> None:
         print()
 
 
-def display_ai_explanations(ai_explanations: Dict[str, str]) -> None:
+def display_ai_explanations(ai_explanations: dict[str, str]) -> None:
     """Print AI agent diagnostic explanations."""
     print(format_separator("="))
     print("SECTION: AI AGENT EXPLANATIONS & THREAT MODELING")
@@ -132,7 +132,7 @@ def display_ai_explanations(ai_explanations: Dict[str, str]) -> None:
     print()
 
 
-def display_test_suggestions(suggestions: List[Dict[str, Any]]) -> None:
+def display_test_suggestions(suggestions: list[dict[str, Any]]) -> None:
     """Print test-writer agent suggestions."""
     print(format_separator("="))
     print("SECTION: AI TEST-WRITER AGENT SUGGESTIONS (FOR HUMAN REVIEW ONLY)")
@@ -161,7 +161,7 @@ def display_test_suggestions(suggestions: List[Dict[str, Any]]) -> None:
 
 
 def display_sandbox_results(
-    sandbox_results: List[Dict[str, Any]],
+    sandbox_results: list[dict[str, Any]],
     sandbox_skipped: bool,
 ) -> None:
     """Print sandbox execution results."""
@@ -194,14 +194,14 @@ def display_sandbox_results(
 
         print(f"Sandbox Run #{idx}:")
         if not executed:
-            print(f"  Status   : NOT EXECUTED")
+            print("  Status   : NOT EXECUTED")
             if err_msg:
                 print(f"  Reason   : {err_msg}")
         elif timed_out:
-            print(f"  Status   : TIMED OUT")
+            print("  Status   : TIMED OUT")
             print(f"  Reason   : {err_msg or 'Execution exceeded time limit.'}")
         elif passed:
-            print(f"  Status   : [PASSED] All tests passed (exit code 0)")
+            print("  Status   : [PASSED] All tests passed (exit code 0)")
         else:
             print(f"  Status   : [FAILED] Tests failed (exit code {exit_code})")
 
@@ -218,7 +218,7 @@ def display_sandbox_results(
 
 
 def display_patch_proposals(
-    proposals: List[Dict[str, Any]],
+    proposals: list[dict[str, Any]],
     patch_verified: bool,
 ) -> None:
     """Print debugging agent patch proposals."""
@@ -260,7 +260,7 @@ def display_patch_proposals(
         if patch_ok and copy_path:
             print(f"\n  [+] Patch applied to disposable copy at: {copy_path}")
         elif not patch_ok and not err_msg:
-            print(f"\n  [-] Patch could not be applied cleanly to disposable copy.")
+            print("\n  [-] Patch could not be applied cleanly to disposable copy.")
 
         if verification:
             v_passed = verification.get("passed", False)
@@ -279,7 +279,7 @@ def display_patch_proposals(
         print()
 
 
-def display_agent_errors(errors: List[str]) -> None:
+def display_agent_errors(errors: list[str]) -> None:
     """Print any provider or agent execution errors."""
     if not errors:
         return
@@ -297,7 +297,7 @@ def run_pipeline(
     enable_ai: bool = True,
     enable_sandbox: bool = True,
     enable_debugging: bool = True,
-    llm: Optional[BaseChatModel] = None,
+    llm: BaseChatModel | None = None,
 ) -> int:
     """
     Run the multi-agent code review pipeline on target_path.
@@ -344,7 +344,7 @@ def run_pipeline(
     bandit_result = run_bandit(normalized_path)
     print()
 
-    results: Dict[str, ToolResult] = {
+    results: dict[str, ToolResult] = {
         "Ruff": ruff_result,
         "Bandit": bandit_result,
     }
@@ -431,16 +431,95 @@ def run_pipeline(
         return 0
 
 
+from github_client import redact_token
+from github_review_workflow import (
+    run_pr_review_workflow,
+)
+
+
+def run_pr_pipeline(
+    pr_target: str,
+    repo: str | None = None,
+    token: str | None = None,
+    enable_ai: bool = True,
+    enable_sandbox: bool = True,
+    enable_debugging: bool = True,
+    llm: BaseChatModel | None = None,
+) -> int:
+    """
+    Execute the read-only PR review workflow for a GitHub repository and PR.
+    """
+    print(format_separator("="))
+    print("  MULTI-AGENT CODE REVIEW & DEBUGGING PIPELINE")
+    print("  Milestone 4: Read-Only Pull Request Review & Approval Preview")
+    print(format_separator("="))
+    print()
+    print(f"Target PR: {pr_target} (Read-Only Preview Mode)")
+    print(format_separator("-"))
+
+    has_credentials = is_api_key_configured() or llm is not None
+    effective_enable_ai = enable_ai and has_credentials
+    if enable_ai and not has_credentials:
+        print("[Notice] LLM credentials not configured. Running PR review in deterministic mode.")
+        print()
+
+    try:
+        result = run_pr_review_workflow(
+            repo_or_url=repo if repo else pr_target,
+            pr_number=pr_target if repo else None,
+            token=token,
+            enable_ai=effective_enable_ai,
+            llm=llm,
+            enable_sandbox=enable_sandbox,
+            enable_debugging=enable_debugging,
+            display_preview=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        safe_msg = redact_token(str(e), token)
+        print(format_separator("="))
+        print(f"PR WORKFLOW FAILED: {safe_msg}")
+        print(format_separator("="))
+        return 2
+
+
+    # Exit code based on verdict and issues
+    if not result.success:
+        return 2
+    if result.action_plan.verdict == "REQUEST_CHANGES":
+        return 1
+    if result.review_comments:
+        return 1
+    return 0
+
+
 def main() -> None:
     """Command-line interface entry point."""
     parser = argparse.ArgumentParser(
-        description="Multi-Agent Code Review & Debugging Pipeline - Milestone 3"
+        description="Multi-Agent Code Review & Debugging Pipeline - Milestone 4"
     )
     parser.add_argument(
         "target",
         nargs="?",
         default="sample_project",
         help="Path to Python file or directory to review (default: 'sample_project')",
+    )
+    parser.add_argument(
+        "--pr",
+        dest="pr",
+        default=None,
+        help="GitHub PR to review in read-only preview mode (e.g., 'owner/repo#123' or PR URL)",
+    )
+    parser.add_argument(
+        "--repo",
+        dest="repo",
+        default=None,
+        help="GitHub repository name if --pr is only the PR number (e.g. 'owner/repo')",
+    )
+    parser.add_argument(
+        "--token",
+        dest="token",
+        default=None,
+        help="GitHub token (defaults to GITHUB_TOKEN or GH_TOKEN env var)",
     )
     parser.add_argument(
         "--no-ai",
@@ -465,12 +544,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    exit_code = run_pipeline(
-        args.target,
-        enable_ai=args.enable_ai,
-        enable_sandbox=args.enable_sandbox,
-        enable_debugging=args.enable_debugging,
-    )
+    if args.pr:
+        exit_code = run_pr_pipeline(
+            pr_target=args.pr,
+            repo=args.repo,
+            token=args.token,
+            enable_ai=args.enable_ai,
+            enable_sandbox=args.enable_sandbox,
+            enable_debugging=args.enable_debugging,
+        )
+    else:
+        exit_code = run_pipeline(
+            args.target,
+            enable_ai=args.enable_ai,
+            enable_sandbox=args.enable_sandbox,
+            enable_debugging=args.enable_debugging,
+        )
     sys.exit(exit_code)
 
 

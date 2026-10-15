@@ -7,17 +7,17 @@ Uses tmp_path for file system isolation.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from test_validator import (
     MAX_TEST_FILE_SIZE_BYTES,
-    MIN_TEST_CONTENT_LENGTH,
     TestValidationError,
     _extract_python_code_block,
     store_test_in_workspace,
     validate_generated_test_content,
 )
-
 
 # ---------------------------------------------------------------------------
 # _extract_python_code_block
@@ -60,7 +60,7 @@ class TestValidateGeneratedTestContent:
 
     def test_valid_test_class(self):
         valid = "class TestCalc:\n    def test_add(self):\n        assert True\n"
-        ok, reason = validate_generated_test_content(valid)
+        ok, _ = validate_generated_test_content(valid)
         assert ok is True
 
     def test_rejects_empty_content(self):
@@ -82,22 +82,22 @@ class TestValidateGeneratedTestContent:
 
     def test_rejects_os_system_call(self):
         content = "import os\ndef test_y():\n    os.system('rm -rf /')\n"
-        ok, reason = validate_generated_test_content(content)
+        ok, _ = validate_generated_test_content(content)
         assert ok is False
 
     def test_rejects_eval_call(self):
         content = "def test_z():\n    eval('print(1)')\n"
-        ok, reason = validate_generated_test_content(content)
+        ok, _ = validate_generated_test_content(content)
         assert ok is False
 
     def test_rejects_exec_call(self):
         content = "def test_w():\n    exec('import os')\n"
-        ok, reason = validate_generated_test_content(content)
+        ok, _ = validate_generated_test_content(content)
         assert ok is False
 
     def test_rejects_write_mode_open(self):
         content = "def test_write():\n    open('out.txt', 'w').write('x')\n"
-        ok, reason = validate_generated_test_content(content)
+        ok, _ = validate_generated_test_content(content)
         assert ok is False
 
     def test_rejects_oversized_content(self):
@@ -118,8 +118,9 @@ class TestValidateGeneratedTestContent:
             "def test_add_parametrized(a, b, expected):\n"
             "    assert add(a, b) == expected\n"
         )
-        ok, reason = validate_generated_test_content(content)
+        ok, _ = validate_generated_test_content(content)
         assert ok is True
+
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +164,7 @@ class TestStoreTestInWorkspace:
             target_source_file="mod.py",
             workspace_dir=workspace,
         )
-        content = open(stored, encoding="utf-8").read()
+        content = Path(stored).read_text(encoding="utf-8")
         assert "AUTO-GENERATED TEST FILE" in content
         assert "SANDBOX REVIEW ONLY" in content
 
@@ -174,7 +175,7 @@ class TestStoreTestInWorkspace:
             target_source_file="mod.py",
             workspace_dir=workspace,
         )
-        content = open(stored, encoding="utf-8").read()
+        content = Path(stored).read_text(encoding="utf-8")
         assert "def test_simple():" in content
 
     def test_raises_validation_error_for_invalid_content(self, tmp_path):
@@ -194,13 +195,13 @@ class TestStoreTestInWorkspace:
             "def test_extracted():\n"
             "    assert True\n"
             "```\n"
-        )
+            )
         stored = store_test_in_workspace(
             content=md_content,
             target_source_file="app.py",
             workspace_dir=workspace,
         )
-        content = open(stored, encoding="utf-8").read()
+        content = Path(stored).read_text(encoding="utf-8")
         assert "def test_extracted():" in content
 
     def test_creates_workspace_directory_if_missing(self, tmp_path):
@@ -210,8 +211,8 @@ class TestStoreTestInWorkspace:
             target_source_file="mod.py",
             workspace_dir=workspace,
         )
-        from pathlib import Path
         assert Path(stored).is_file()
+
 
     def test_raises_validation_error_for_unsafe_content(self, tmp_path):
         workspace = str(tmp_path / "ws")

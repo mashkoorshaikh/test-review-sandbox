@@ -14,13 +14,12 @@ Uses mocked subprocess calls to test:
 from __future__ import annotations
 
 import json
-import os
 import subprocess
+import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
-import sys
-from pathlib import Path
 
 # Ensure project root is present in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -37,7 +36,6 @@ from tools import (
     run_bandit,
     run_ruff,
 )
-
 
 # -----------------------------------------------------------------------------
 # Fixtures & Sample Mock Data

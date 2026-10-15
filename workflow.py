@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import datetime
 import logging
-from typing import Any, Callable, Dict, List, Literal, Optional
+from collections.abc import Callable
+from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
 from agents import LinterAgent, SecurityAgent, TestWriterAgent
-from debugging_agent import DebuggingAgent, MAX_DEBUG_ATTEMPTS
+from debugging_agent import MAX_DEBUG_ATTEMPTS, DebuggingAgent
 from sandbox_runner import SandboxResult, is_docker_available, run_tests_in_sandbox
 from state import (
     ReviewState,
@@ -42,7 +43,7 @@ from tools import ToolResult, run_bandit, run_ruff
 logger = logging.getLogger(__name__)
 
 
-def _sandbox_result_to_dict(result: SandboxResult) -> Dict[str, Any]:
+def _sandbox_result_to_dict(result: SandboxResult) -> dict[str, Any]:
     """Convert a SandboxResult to a JSON-serializable dict for state storage."""
     return {
         "executed": result.executed,
@@ -56,7 +57,7 @@ def _sandbox_result_to_dict(result: SandboxResult) -> Dict[str, Any]:
     }
 
 
-def create_orchestrator_report(state: ReviewState) -> Dict[str, Any]:
+def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
     """
     Synthesize all agent outputs from the graph state into a structured report.
     """
@@ -94,7 +95,7 @@ def create_orchestrator_report(state: ReviewState) -> Dict[str, Any]:
 
     return {
         "target_path": target,
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(),
         "summary": {
             "status": status,
             "total_issues_found": total_code_issues,
@@ -124,15 +125,15 @@ def create_orchestrator_report(state: ReviewState) -> Dict[str, Any]:
 
 
 def build_review_graph(
-    llm: Optional[BaseChatModel] = None,
-    ruff_runner: Optional[Callable[..., ToolResult]] = None,
-    bandit_runner: Optional[Callable[..., ToolResult]] = None,
-    workspace_root: Optional[str] = None,
+    llm: BaseChatModel | None = None,
+    ruff_runner: Callable[..., ToolResult] | None = None,
+    bandit_runner: Callable[..., ToolResult] | None = None,
+    workspace_root: str | None = None,
     enable_sandbox: bool = True,
     enable_debugging: bool = True,
     max_debug_attempts: int = MAX_DEBUG_ATTEMPTS,
-    test_workspace_dir: Optional[str] = None,
-    sandbox_runner_fn: Optional[Callable] = None,
+    test_workspace_dir: str | None = None,
+    sandbox_runner_fn: Callable | None = None,
 ):
     """
     Construct and compile the LangGraph StateGraph review workflow.
@@ -176,26 +177,25 @@ def build_review_graph(
     # Node functions
     # -------------------------------------------------------------------------
 
-    def linter_node(state: ReviewState) -> Dict[str, Any]:
+    def linter_node(state: ReviewState) -> dict[str, Any]:
         target = state.get("target_path", "")
         return linter_agent.run(target)
 
-    def security_node(state: ReviewState) -> Dict[str, Any]:
+    def security_node(state: ReviewState) -> dict[str, Any]:
         target = state.get("target_path", "")
         return security_agent.run(target)
 
-    def test_writer_node(state: ReviewState) -> Dict[str, Any]:
+    def test_writer_node(state: ReviewState) -> dict[str, Any]:
         target = state.get("target_path", "")
         result = test_writer_agent.run(target)
         return result
 
-    def sandbox_node(state: ReviewState) -> Dict[str, Any]:
+    def sandbox_node(state: ReviewState) -> dict[str, Any]:
         """Execute stored tests in a Docker sandbox, or skip gracefully."""
         stored_files = state.get("stored_test_files", [])
         target = state.get("target_path", "")
 
         # Resolve source directory (parent of target if it's a file)
-        import os
         from pathlib import Path as _Path
 
         target_p = _Path(target).resolve()
@@ -223,8 +223,8 @@ def build_review_graph(
                 "agent_errors": [],
             }
 
-        sandbox_results: List[Dict[str, Any]] = []
-        errors: List[str] = []
+        sandbox_results: list[dict[str, Any]] = []
+        errors: list[str] = []
 
         for test_file in stored_files:
             try:
@@ -233,9 +233,10 @@ def build_review_graph(
                     test_file=test_file,
                 )
                 sandbox_results.append(_sandbox_result_to_dict(result))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - sandbox failure containment
                 err_msg = f"Sandbox runner error for '{test_file}': {type(exc).__name__}: {exc}"
                 errors.append(err_msg)
+
                 sandbox_results.append({
                     "executed": False,
                     "passed": False,
@@ -248,7 +249,7 @@ def build_review_graph(
             "agent_errors": errors,
         }
 
-    def debugging_node(state: ReviewState) -> Dict[str, Any]:
+    def debugging_node(state: ReviewState) -> dict[str, Any]:
         """Propose patches for failed sandbox tests (bounded retry)."""
         target = state.get("target_path", "")
         ruff_findings = state.get("ruff_findings", [])
@@ -258,7 +259,7 @@ def build_review_graph(
         current_attempts = state.get("debug_attempts", 0)
 
         # Collect failed test output
-        failed_output_parts: List[str] = []
+        failed_output_parts: list[str] = []
         for sr in sandbox_results:
             if not sr.get("passed", False):
                 stdout = sr.get("stdout", "")
@@ -271,7 +272,6 @@ def build_review_graph(
         failed_output = "\n\n".join(failed_output_parts)[:4000]
 
         # Determine primary source file to patch (first file in target dir)
-        import os
         from pathlib import Path as _Path
         target_p = _Path(target).resolve()
         if target_p.is_file():
@@ -300,7 +300,7 @@ def build_review_graph(
             "agent_errors": result.get("agent_errors", []),
         }
 
-    def orchestrator_node(state: ReviewState) -> Dict[str, Any]:
+    def orchestrator_node(state: ReviewState) -> dict[str, Any]:
         report = create_orchestrator_report(state)
         return {"final_review_report": report}
 
@@ -385,8 +385,8 @@ def build_review_graph(
 
 def run_deterministic_only(
     target_path: str,
-    ruff_runner: Optional[Callable[..., ToolResult]] = None,
-    bandit_runner: Optional[Callable[..., ToolResult]] = None,
+    ruff_runner: Callable[..., ToolResult] | None = None,
+    bandit_runner: Callable[..., ToolResult] | None = None,
 ) -> ReviewState:
     """
     Run purely deterministic scanners (Ruff and Bandit) without AI agents.
@@ -408,7 +408,7 @@ def run_deterministic_only(
         {"target_file": target_path, "suggestions": "[AI test generation disabled by user (--no-ai).]"}
     ]
 
-    errors: List[str] = []
+    errors: list[str] = []
     if not ruff_res.success:
         errors.append(f"Ruff: {ruff_res.error_message}")
     if not bandit_res.success:
@@ -422,15 +422,15 @@ def run_deterministic_only(
 def run_review_pipeline(
     target_path: str,
     enable_ai: bool = True,
-    llm: Optional[BaseChatModel] = None,
-    ruff_runner: Optional[Callable[..., ToolResult]] = None,
-    bandit_runner: Optional[Callable[..., ToolResult]] = None,
-    workspace_root: Optional[str] = None,
+    llm: BaseChatModel | None = None,
+    ruff_runner: Callable[..., ToolResult] | None = None,
+    bandit_runner: Callable[..., ToolResult] | None = None,
+    workspace_root: str | None = None,
     enable_sandbox: bool = True,
     enable_debugging: bool = True,
     max_debug_attempts: int = MAX_DEBUG_ATTEMPTS,
-    test_workspace_dir: Optional[str] = None,
-    sandbox_runner_fn: Optional[Callable] = None,
+    test_workspace_dir: str | None = None,
+    sandbox_runner_fn: Callable | None = None,
 ) -> ReviewState:
     """
     Execute the code review pipeline on the designated target path.

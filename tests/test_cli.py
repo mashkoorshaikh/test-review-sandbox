@@ -10,9 +10,10 @@ Verifies:
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
+
 import pytest
 
-from main import main, run_pipeline
+from main import run_pipeline
 from tools import Issue, ToolResult
 
 

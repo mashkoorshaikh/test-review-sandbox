@@ -12,14 +12,13 @@ Verifies:
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
+
 import pytest
 
-from state import ReviewState, create_initial_state
 from tools import Issue, ToolResult
 from workflow import (
     build_review_graph,
-    create_orchestrator_report,
     run_deterministic_only,
     run_review_pipeline,
 )
