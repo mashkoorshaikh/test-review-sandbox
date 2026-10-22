@@ -15,21 +15,30 @@ Tests:
 from __future__ import annotations
 
 from types import MappingProxyType
+from unittest.mock import MagicMock
 
 import pytest
 
 from approval_gate import (
+    DEFAULT_APPROVAL_TTL_SECONDS,
+    DEFAULT_MAX_PLAN_AGE_SECONDS,
     ActionPlan,
+    ApprovalExpiredError,
+    ApprovalGateError,
     ApprovalRejectedError,
     ApprovalResult,
+    DryRunBlockedError,
     HeadShaMismatchError,
     InvalidActionPlanError,
+    NonInteractivePublishingDisabledError,
+    PlanFingerprintMismatchError,
     ReviewComment,
     _canonicalize_value,
     calculate_plan_fingerprint,
     check_can_write,
     format_approval_preview,
     request_approval,
+    verify_approval_for_write,
     verify_head_sha_unchanged,
 )
 
@@ -384,7 +393,7 @@ class TestDryRunBehavior:
         assert result.dry_run is True
         assert result.can_write is False  # can_write MUST be False!
 
-    def test_dry_run_with_non_interactive_token_cannot_write(self):
+    def test_dry_run_rejection_cannot_write(self):
         plan = ActionPlan(
             owner="owner",
             repo="repo",
@@ -394,25 +403,22 @@ class TestDryRunBehavior:
             summary="All good",
             dry_run=True,
         )
-        result = request_approval(
-            plan,
-            interactive=False,
-            non_interactive_token="ci-secret-token",
-            expected_non_interactive_token="ci-secret-token",
-            output_func=lambda _: None,
-        )
-        assert result.approved is True
-        assert result.dry_run is True
-        assert result.can_write is False
+        with pytest.raises(ApprovalRejectedError):
+            request_approval(
+                plan,
+                interactive=True,
+                input_func=lambda _: "n",
+                output_func=lambda _: None,
+            )
 
 
 # ============================================================================
-# Non-Interactive Fail-Closed Tests
+# Non-Interactive Publishing Disabled Tests
 # ============================================================================
 
 
-class TestNonInteractiveFailClosed:
-    """Test non-interactive execution safety and deliberate token mechanism."""
+class TestNonInteractivePublishingDisabled:
+    """Test that non-interactive publishing is strictly disabled and fails closed."""
 
     def setup_method(self):
         self.plan = ActionPlan(
@@ -425,46 +431,54 @@ class TestNonInteractiveFailClosed:
             dry_run=False,
         )
 
-    def test_non_interactive_without_token_fails_closed(self):
-        with pytest.raises(ApprovalRejectedError, match="fails closed by default"):
+    def test_non_interactive_without_token_raises_disabled(self):
+        with pytest.raises(NonInteractivePublishingDisabledError, match="Non-interactive review publishing is disabled"):
             request_approval(
                 self.plan,
                 interactive=False,
                 output_func=lambda _: None,
             )
 
-    def test_non_interactive_with_wrong_token_fails_closed(self):
-        with pytest.raises(ApprovalRejectedError, match="fails closed by default"):
+    def test_non_interactive_with_token_still_raises_disabled(self):
+        with pytest.raises(NonInteractivePublishingDisabledError, match="Non-interactive review publishing is disabled"):
             request_approval(
                 self.plan,
                 interactive=False,
-                non_interactive_token="wrong-token",
+                non_interactive_token="wrong-or-correct-token",
                 expected_non_interactive_token="correct-token",
                 output_func=lambda _: None,
             )
 
-    def test_non_interactive_with_valid_explicit_token_approves(self):
-        result = request_approval(
-            self.plan,
-            interactive=False,
-            non_interactive_token="correct-token",
-            expected_non_interactive_token="correct-token",
-            output_func=lambda _: None,
-        )
-        assert result.approved is True
-        assert result.can_write is True
-        assert result.source == "non_interactive"
-
-    def test_non_interactive_with_valid_env_var_token_approves(self, monkeypatch):
+    def test_non_interactive_with_env_var_token_still_raises_disabled(self, monkeypatch):
         monkeypatch.setenv("GITHUB_REVIEW_APPROVAL_TOKEN", "env-secret-token-1234")
-        result = request_approval(
-            self.plan,
-            interactive=False,
-            non_interactive_token="env-secret-token-1234",
-            output_func=lambda _: None,
+        with pytest.raises(NonInteractivePublishingDisabledError, match="Non-interactive review publishing is disabled"):
+            request_approval(
+                self.plan,
+                interactive=False,
+                non_interactive_token="env-secret-token-1234",
+                output_func=lambda _: None,
+            )
+
+    def test_non_interactive_dry_run_still_raises_disabled(self):
+        plan = ActionPlan(
+            owner="owner",
+            repo="repo",
+            pr_number=1,
+            head_sha="1234567890abcdef",
+            verdict="APPROVE",
+            summary="Summary",
+            dry_run=True,
         )
-        assert result.approved is True
-        assert result.can_write is True
+        with pytest.raises(NonInteractivePublishingDisabledError, match="Non-interactive review publishing is disabled"):
+            request_approval(
+                plan,
+                interactive=False,
+                output_func=lambda _: None,
+            )
+
+    def test_non_interactive_error_hierarchy(self):
+        assert issubclass(NonInteractivePublishingDisabledError, ApprovalRejectedError)
+        assert issubclass(NonInteractivePublishingDisabledError, ApprovalGateError)
 
 
 # ============================================================================
@@ -487,7 +501,7 @@ class TestAntiTampering:
             metadata={"approved": True, "bypass_gate": True, "skip_human": True},
         )
         # Calling without interactive approval must fail closed
-        with pytest.raises(ApprovalRejectedError, match="fails closed by default"):
+        with pytest.raises(NonInteractivePublishingDisabledError, match="Non-interactive review publishing is disabled"):
             request_approval(
                 malicious_plan, interactive=False, output_func=lambda _: None
             )
@@ -1064,3 +1078,603 @@ class TestPlanImmutabilityAndFingerprinting:
 
         with pytest.raises(InvalidActionPlanError):
             _canonicalize_value({123: "int_key"})
+
+
+# ============================================================================
+# Deterministic Payload Serialization Tests
+# ============================================================================
+
+
+class TestPayloadSerialization:
+    """Test ReviewComment.to_github_payload and ActionPlan.to_github_payload."""
+
+    def test_review_comment_to_github_payload_single_line(self):
+        c = ReviewComment(path="src/main.py", line=42, body="Fix line", side="RIGHT")
+        payload = c.to_github_payload()
+        assert payload == {
+            "path": "src/main.py",
+            "line": 42,
+            "side": "RIGHT",
+            "body": "Fix line",
+        }
+        assert "start_line" not in payload
+        assert "start_side" not in payload
+
+    def test_review_comment_to_github_payload_multiline(self):
+        c = ReviewComment(
+            path="src/utils.py",
+            line=80,
+            start_line=75,
+            body="Refactor block",
+            side="RIGHT",
+        )
+        payload = c.to_github_payload()
+        assert payload == {
+            "path": "src/utils.py",
+            "line": 80,
+            "start_line": 75,
+            "side": "RIGHT",
+            "start_side": "RIGHT",
+            "body": "Refactor block",
+        }
+
+    def test_action_plan_to_github_payload_deterministic_ordering(self):
+        c1 = ReviewComment(path="z.py", line=10, body="Z comment")
+        c2 = ReviewComment(path="a.py", line=50, body="A50 comment")
+        c3 = ReviewComment(path="a.py", line=10, body="A10 comment")
+        c4 = ReviewComment(path="a.py", line=10, start_line=5, body="A10 multiline")
+
+        plan = ActionPlan(
+            owner="octocat",
+            repo="repo",
+            pr_number=1,
+            head_sha="ABCDEF1234567890ABCDEF1234567890ABCDEF12",
+            verdict="COMMENT",
+            summary="Review Summary",
+            comments=(c1, c2, c3, c4),
+        )
+
+        payload = plan.to_github_payload(publication_marker="test-fp-12345")
+        assert payload["commit_id"] == "abcdef1234567890abcdef1234567890abcdef12"
+        assert payload["event"] == "COMMENT"
+        assert "<!-- agy-review-marker: test-fp-12345 -->" in payload["body"]
+
+        # Comments must be deterministically sorted: a.py:10, a.py:10(start=5), a.py:50, z.py:10
+        paths_and_lines = [
+            (c["path"], c.get("line"), c.get("start_line")) for c in payload["comments"]
+        ]
+        assert paths_and_lines == [
+            ("a.py", 10, None),
+            ("a.py", 10, 5),
+            ("a.py", 50, None),
+            ("z.py", 10, None),
+        ]
+
+    def test_action_plan_to_github_payload_no_comments(self):
+        plan = ActionPlan(
+            owner="octocat",
+            repo="repo",
+            pr_number=5,
+            head_sha="1234567",
+            verdict="APPROVE",
+            summary="Clean code",
+            comments=(),
+        )
+        payload = plan.to_github_payload()
+        assert "comments" not in payload
+        assert payload["body"] == "Clean code"
+
+    def test_action_plan_to_github_payload_marker_not_duplicated(self):
+        plan = ActionPlan(
+            owner="octocat",
+            repo="repo",
+            pr_number=5,
+            head_sha="1234567",
+            verdict="COMMENT",
+            summary="Summary with <!-- agy-review-marker: already-present -->",
+        )
+        payload = plan.to_github_payload(publication_marker="already-present")
+        assert payload["body"].count("<!-- agy-review-marker: already-present -->") == 1
+
+
+# ============================================================================
+# Stage 3: Monotonic Approval Expiry and Non-Interactive Gate Defenses
+# ============================================================================
+
+
+class TestApprovalExpiryAndTTL:
+    """Test strict monotonic clock-based 600-second approval expiry."""
+
+    def test_default_constants(self):
+        assert DEFAULT_APPROVAL_TTL_SECONDS == 600.0
+        assert DEFAULT_MAX_PLAN_AGE_SECONDS == 600.0
+
+    @pytest.fixture
+    def base_plan(self):
+        return ActionPlan(
+            owner="octocat",
+            repo="hello-world",
+            pr_number=42,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict="COMMENT",
+            summary="Review Summary",
+            comments=(ReviewComment(path="app.py", line=10, body="LGTM"),),
+            created_at_mono=100.0,
+        )
+
+    def test_approval_accepted_within_ttl_allows_write(self, base_plan):
+        clock_mono = 100.0
+
+        def fake_clock():
+            return clock_mono
+
+        result = request_approval(
+            base_plan,
+            interactive=True,
+            input_func=lambda _: "y",
+            output_func=lambda _: None,
+            clock=fake_clock,
+            approval_ttl_seconds=600.0,
+        )
+
+        assert result.approved is True
+        assert result.approved_at_mono == 100.0
+        assert result.expires_at_mono == 700.0
+        assert result.approval_ttl == 600.0
+
+        # At 699.9s (within TTL): write is permitted
+        assert result.is_expired(current_mono=699.9) is False
+        assert check_can_write(result, current_mono=699.9) is True
+        assert check_can_write(result, current_plan=base_plan, current_mono=699.9) is True
+        verify_approval_for_write(result, current_mono=699.9)  # does not raise
+
+    def test_approval_expires_at_exact_boundary_blocks_write(self, base_plan):
+        clock_mono = 100.0
+
+        def fake_clock():
+            return clock_mono
+
+        result = request_approval(
+            base_plan,
+            interactive=True,
+            input_func=lambda _: "y",
+            output_func=lambda _: None,
+            clock=fake_clock,
+            approval_ttl_seconds=600.0,
+        )
+
+        # Advance clock to exactly 700.0s (100.0 + 600.0 boundary): expired!
+        clock_mono = 700.0
+        assert result.is_expired() is True
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        assert check_can_write(result, current_mono=700.0) is False
+
+        with pytest.raises(ApprovalExpiredError, match="Approval has expired"):
+            verify_approval_for_write(result)
+
+    def test_approval_expires_beyond_boundary_blocks_write(self, base_plan):
+        clock_mono = 100.0
+
+        def fake_clock():
+            return clock_mono
+
+        result = request_approval(
+            base_plan,
+            interactive=True,
+            input_func=lambda _: "y",
+            output_func=lambda _: None,
+            clock=fake_clock,
+            approval_ttl_seconds=600.0,
+        )
+
+        # Advance clock to 700.1s and 1000.0s (beyond boundary): expired!
+        clock_mono = 700.1
+        assert result.is_expired() is True
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(ApprovalExpiredError, match="Approval has expired"):
+            verify_approval_for_write(result)
+
+        clock_mono = 1000.0
+        assert result.is_expired() is True
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(ApprovalExpiredError, match="Approval has expired"):
+            verify_approval_for_write(result)
+
+
+class TestStalePlansBeforeApproval:
+    """Test rejection of stale plans before user approval prompt is displayed."""
+
+    def test_stale_plan_rejected_before_prompting_user(self):
+        plan = ActionPlan(
+            owner="octocat",
+            repo="hello-world",
+            pr_number=42,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict="COMMENT",
+            summary="Review Summary",
+            created_at_mono=100.0,
+        )
+
+        # Current time is 700.1s (plan age = 600.1s > max 600.0s)
+        clock_mono = 700.1
+        mock_input = MagicMock()
+
+        with pytest.raises(ApprovalExpiredError, match="Action plan is stale"):
+            request_approval(
+                plan,
+                interactive=True,
+                input_func=mock_input,
+                output_func=lambda _: None,
+                clock=lambda: clock_mono,
+                max_plan_age_seconds=600.0,
+            )
+
+        # User was NEVER prompted because plan was rejected as stale first
+        mock_input.assert_not_called()
+
+    def test_fresh_plan_within_max_age_prompted_and_approved(self):
+        plan = ActionPlan(
+            owner="octocat",
+            repo="hello-world",
+            pr_number=42,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict="COMMENT",
+            summary="Review Summary",
+            created_at_mono=100.0,
+        )
+
+        # Current time is 699.9s (plan age = 599.9s <= max 600.0s)
+        clock_mono = 699.9
+
+        result = request_approval(
+            plan,
+            interactive=True,
+            input_func=lambda _: "y",
+            output_func=lambda _: None,
+            clock=lambda: clock_mono,
+            max_plan_age_seconds=600.0,
+        )
+
+        assert result.approved is True
+        assert result.created_at_mono == 100.0
+        assert result.approved_at_mono == 699.9
+
+
+class TestFingerprintTamperingEveryField:
+    """Ensure any change to summary, verdict, target repo, PR, SHA, or comments invalidates approval."""
+
+    @pytest.fixture
+    def approved_setup(self):
+        c1 = ReviewComment(path="src/a.py", line=10, body="Comment 1")
+        c2 = ReviewComment(path="src/b.py", line=20, start_line=15, side="RIGHT", body="Comment 2")
+        plan = ActionPlan(
+            owner="octocat",
+            repo="hello-world",
+            pr_number=42,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict="COMMENT",
+            summary="Original Summary",
+            comments=(c1, c2),
+            dry_run=False,
+            metadata={"scanner": "ruff"},
+            created_at_mono=100.0,
+        )
+
+        result = request_approval(
+            plan,
+            interactive=True,
+            input_func=lambda _: "y",
+            output_func=lambda _: None,
+            clock=lambda: 100.0,
+        )
+        return plan, result
+
+    def test_tampering_summary_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        object.__setattr__(result.plan, "summary", "Tampered Summary")
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Plan tampering detected"):
+            verify_approval_for_write(result)
+
+    def test_tampering_verdict_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        object.__setattr__(result.plan, "verdict", "REQUEST_CHANGES")
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Plan tampering detected"):
+            verify_approval_for_write(result)
+
+    def test_tampering_owner_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        object.__setattr__(result.plan, "owner", "evil-org")
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Plan tampering detected"):
+            verify_approval_for_write(result)
+
+    def test_tampering_repo_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        object.__setattr__(result.plan, "repo", "evil-repo")
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Plan tampering detected"):
+            verify_approval_for_write(result)
+
+    def test_tampering_pr_number_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        object.__setattr__(result.plan, "pr_number", 999)
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Plan tampering detected"):
+            verify_approval_for_write(result)
+
+    def test_tampering_head_sha_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        object.__setattr__(result.plan, "head_sha", "ffffffffffffffffffffffffffffffffffffffff")
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Plan tampering detected"):
+            verify_approval_for_write(result)
+
+    def test_tampering_comments_content_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        tampered_comment = ReviewComment(path="src/a.py", line=10, body="Tampered Body")
+        object.__setattr__(result.plan, "comments", (tampered_comment, result.plan.comments[1]))
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Plan tampering detected"):
+            verify_approval_for_write(result)
+
+    def test_tampering_comments_ordering_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        # Swap comment 1 and comment 2
+        reversed_comments = (result.plan.comments[1], result.plan.comments[0])
+        object.__setattr__(result.plan, "comments", reversed_comments)
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Plan tampering detected"):
+            verify_approval_for_write(result)
+
+    def test_tampering_comments_added_or_removed_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        # Remove a comment
+        object.__setattr__(result.plan, "comments", (result.plan.comments[0],))
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError):
+            verify_approval_for_write(result)
+
+        # Add a comment
+        extra_comment = ReviewComment(path="src/c.py", line=30, body="Extra")
+        object.__setattr__(result.plan, "comments", (result.plan.comments[0], extra_comment))
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError):
+            verify_approval_for_write(result)
+
+    def test_tampering_metadata_invalidates_approval(self, approved_setup):
+        _, result = approved_setup
+        object.__setattr__(result.plan, "metadata", MappingProxyType({"scanner": "tampered"}))
+
+        assert result.can_write is False
+        assert check_can_write(result) is False
+        with pytest.raises(PlanFingerprintMismatchError):
+            verify_approval_for_write(result)
+
+    def test_substitute_current_plan_mismatch_blocks_write(self, approved_setup):
+        plan, result = approved_setup
+        substitute_plan = ActionPlan(
+            owner=plan.owner,
+            repo=plan.repo,
+            pr_number=plan.pr_number,
+            head_sha=plan.head_sha,
+            verdict=plan.verdict,
+            summary="Substitute summary",
+        )
+
+        assert check_can_write(result, current_plan=substitute_plan) is False
+        with pytest.raises(PlanFingerprintMismatchError, match="Current plan does not match"):
+            verify_approval_for_write(result, current_plan=substitute_plan)
+
+
+class TestRejectionEmptyInputAndEOF:
+    """Test fail-closed behavior on human rejection, empty input, and EOF/Interrupt."""
+
+    @pytest.fixture
+    def sample_plan(self):
+        return ActionPlan(
+            owner="octocat",
+            repo="hello-world",
+            pr_number=42,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict="COMMENT",
+            summary="Review Summary",
+        )
+
+    def test_explicit_user_rejection_raises_approval_rejected(self, sample_plan):
+        for choice in ("n", "no", "N", "NO", "reject", "cancel"):
+            with pytest.raises(ApprovalRejectedError, match="rejected by user"):
+                request_approval(
+                    sample_plan,
+                    interactive=True,
+                    input_func=lambda _, c=choice: c,
+                    output_func=lambda _: None,
+                )
+
+    def test_empty_user_input_defaults_to_rejection(self, sample_plan):
+        # Pressing Enter without input (empty string) must default to rejection
+        with pytest.raises(ApprovalRejectedError, match="rejected by user"):
+            request_approval(
+                sample_plan,
+                interactive=True,
+                input_func=lambda _: "",
+                output_func=lambda _: None,
+            )
+
+    def test_eof_aborts_and_raises_approval_rejected(self, sample_plan):
+        def raise_eof(_):
+            raise EOFError
+
+        with pytest.raises(ApprovalRejectedError, match="aborted by user"):
+            request_approval(
+                sample_plan,
+                interactive=True,
+                input_func=raise_eof,
+                output_func=lambda _: None,
+            )
+
+    def test_keyboard_interrupt_aborts_and_raises_approval_rejected(self, sample_plan):
+        def raise_sigint(_):
+            raise KeyboardInterrupt
+
+        with pytest.raises(ApprovalRejectedError, match="aborted by user"):
+            request_approval(
+                sample_plan,
+                interactive=True,
+                input_func=raise_sigint,
+                output_func=lambda _: None,
+            )
+
+
+class TestMissingOrMismatchedApproval:
+    """Test write prevention on missing approval, dry-run, or mismatched states."""
+
+    def test_unapproved_result_blocks_write(self):
+        plan = ActionPlan(
+            owner="octocat",
+            repo="hello-world",
+            pr_number=42,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict="COMMENT",
+            summary="Review Summary",
+        )
+        unapproved = ApprovalResult(
+            approved=False,
+            dry_run=False,
+            plan=plan,
+            source="rejected",
+            reason="User said no",
+        )
+
+        assert unapproved.can_write is False
+        assert check_can_write(unapproved) is False
+        with pytest.raises(ApprovalRejectedError, match="approval was not granted"):
+            verify_approval_for_write(unapproved)
+
+    def test_dry_run_approved_result_blocks_write(self):
+        plan = ActionPlan(
+            owner="octocat",
+            repo="hello-world",
+            pr_number=42,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict="COMMENT",
+            summary="Review Summary",
+            dry_run=True,
+        )
+        dry_run_approved = ApprovalResult(
+            approved=True,
+            dry_run=True,
+            plan=plan,
+            source="interactive",
+            reason="Dry run acknowledged",
+        )
+
+        assert dry_run_approved.can_write is False
+        assert check_can_write(dry_run_approved) is False
+        with pytest.raises(DryRunBlockedError, match="running in dry-run mode"):
+            verify_approval_for_write(dry_run_approved)
+
+
+class TestZeroWriteRequestsGuaranteed:
+    """
+    Ensure ZERO write operations are sent to GitHub across every rejected, expired,
+    tampered, non-interactive, dry-run, or invalid path.
+    """
+
+    @pytest.fixture
+    def mock_writer(self):
+        mock = MagicMock()
+        mock.create_pull_request_review = MagicMock()
+        return mock
+
+    def simulate_publish(self, result, mock_writer, current_plan=None, current_mono=None):
+        verify_approval_for_write(result, current_plan=current_plan, current_mono=current_mono)
+        mock_writer.create_pull_request_review(
+            owner=result.plan.owner,
+            repo=result.plan.repo,
+            pr_number=result.plan.pr_number,
+            commit_sha=result.plan.head_sha,
+            body=result.plan.summary,
+            event=result.plan.verdict,
+        )
+
+    def test_zero_writes_on_user_rejection(self, mock_writer):
+        plan = ActionPlan(owner="octocat", repo="repo", pr_number=1, head_sha="1234567", verdict="COMMENT", summary="S")
+        with pytest.raises(ApprovalRejectedError):
+            result = request_approval(plan, interactive=True, input_func=lambda _: "n", output_func=lambda _: None)
+            self.simulate_publish(result, mock_writer)
+        mock_writer.create_pull_request_review.assert_not_called()
+
+    def test_zero_writes_on_empty_input(self, mock_writer):
+        plan = ActionPlan(owner="octocat", repo="repo", pr_number=1, head_sha="1234567", verdict="COMMENT", summary="S")
+        with pytest.raises(ApprovalRejectedError):
+            result = request_approval(plan, interactive=True, input_func=lambda _: "", output_func=lambda _: None)
+            self.simulate_publish(result, mock_writer)
+        mock_writer.create_pull_request_review.assert_not_called()
+
+    def test_zero_writes_on_eof(self, mock_writer):
+        plan = ActionPlan(owner="octocat", repo="repo", pr_number=1, head_sha="1234567", verdict="COMMENT", summary="S")
+        with pytest.raises(ApprovalRejectedError):
+            result = request_approval(plan, interactive=True, input_func=MagicMock(side_effect=EOFError), output_func=lambda _: None)
+            self.simulate_publish(result, mock_writer)
+        mock_writer.create_pull_request_review.assert_not_called()
+
+    def test_zero_writes_on_non_interactive_disabled(self, mock_writer):
+        plan = ActionPlan(owner="octocat", repo="repo", pr_number=1, head_sha="1234567", verdict="COMMENT", summary="S")
+        with pytest.raises(NonInteractivePublishingDisabledError):
+            result = request_approval(plan, interactive=False, output_func=lambda _: None)
+            self.simulate_publish(result, mock_writer)
+        mock_writer.create_pull_request_review.assert_not_called()
+
+    def test_zero_writes_on_stale_plan(self, mock_writer):
+        plan = ActionPlan(owner="octocat", repo="repo", pr_number=1, head_sha="1234567", verdict="COMMENT", summary="S", created_at_mono=100.0)
+        with pytest.raises(ApprovalExpiredError):
+            result = request_approval(plan, interactive=True, input_func=lambda _: "y", output_func=lambda _: None, clock=lambda: 700.1)
+            self.simulate_publish(result, mock_writer)
+        mock_writer.create_pull_request_review.assert_not_called()
+
+    def test_zero_writes_on_expired_approval(self, mock_writer):
+        plan = ActionPlan(owner="octocat", repo="repo", pr_number=1, head_sha="1234567", verdict="COMMENT", summary="S", created_at_mono=100.0)
+        result = request_approval(plan, interactive=True, input_func=lambda _: "y", output_func=lambda _: None, clock=lambda: 100.0, approval_ttl_seconds=600.0)
+        # Attempt to publish after expiration (at 700.0s)
+        with pytest.raises(ApprovalExpiredError):
+            self.simulate_publish(result, mock_writer, current_mono=700.0)
+        mock_writer.create_pull_request_review.assert_not_called()
+
+    def test_zero_writes_on_tampered_plan(self, mock_writer):
+        plan = ActionPlan(owner="octocat", repo="repo", pr_number=1, head_sha="1234567", verdict="COMMENT", summary="S", created_at_mono=100.0)
+        result = request_approval(plan, interactive=True, input_func=lambda _: "y", output_func=lambda _: None, clock=lambda: 100.0)
+        # Tamper summary
+        object.__setattr__(result.plan, "summary", "Malicious content")
+        with pytest.raises(PlanFingerprintMismatchError):
+            self.simulate_publish(result, mock_writer, current_mono=150.0)
+        mock_writer.create_pull_request_review.assert_not_called()
+
+    def test_zero_writes_on_dry_run(self, mock_writer):
+        plan = ActionPlan(owner="octocat", repo="repo", pr_number=1, head_sha="1234567", verdict="COMMENT", summary="S", dry_run=True, created_at_mono=100.0)
+        result = request_approval(plan, interactive=True, input_func=lambda _: "y", output_func=lambda _: None, clock=lambda: 100.0)
+        with pytest.raises(DryRunBlockedError):
+            self.simulate_publish(result, mock_writer, current_mono=150.0)
+        mock_writer.create_pull_request_review.assert_not_called()

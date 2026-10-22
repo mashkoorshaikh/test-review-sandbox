@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -431,8 +433,22 @@ def run_pipeline(
         return 0
 
 
-from github_client import redact_token
+from approval_gate import (
+    ApprovalGateError,
+    ApprovalRejectedError,
+    NonInteractivePublishingDisabledError,
+)
+from github_client import (
+    GitHubClient,
+    GitHubClientError,
+    GitHubUncertainWriteError,
+    GitHubValidationError,
+    redact_token,
+)
 from github_review_workflow import (
+    PrePublicationValidationError,
+    PRReviewWorkflowError,
+    run_pr_publishing_workflow,
     run_pr_review_workflow,
 )
 
@@ -445,42 +461,140 @@ def run_pr_pipeline(
     enable_sandbox: bool = True,
     enable_debugging: bool = True,
     llm: BaseChatModel | None = None,
+    publish: bool = False,
+    dry_run: bool = False,
+    interactive: bool | None = None,
+    input_func: Callable[[str], str] | None = None,
+    output_func: Callable[[str], None] | None = None,
+    client: GitHubClient | None = None,
+    clock: Callable[[], float] | None = None,
+    utc_now: Callable[[], datetime] | None = None,
+    publication_marker: str | None = None,
+    ruff_runner: Callable[..., ToolResult] | None = None,
+    bandit_runner: Callable[..., ToolResult] | None = None,
+    sandbox_runner_fn: Callable[..., Any] | None = None,
 ) -> int:
     """
-    Execute the read-only PR review workflow for a GitHub repository and PR.
+    Execute the PR review workflow or controlled publishing workflow for a GitHub PR.
     """
-    print(format_separator("="))
-    print("  MULTI-AGENT CODE REVIEW & DEBUGGING PIPELINE")
-    print("  Milestone 4: Read-Only Pull Request Review & Approval Preview")
-    print(format_separator("="))
-    print()
-    print(f"Target PR: {pr_target} (Read-Only Preview Mode)")
-    print(format_separator("-"))
-
+    out = output_func or print
     has_credentials = is_api_key_configured() or llm is not None
     effective_enable_ai = enable_ai and has_credentials
     if enable_ai and not has_credentials:
-        print("[Notice] LLM credentials not configured. Running PR review in deterministic mode.")
-        print()
+        out("[Notice] LLM credentials not configured. Running PR review in deterministic mode.")
+        out("")
+
+    if publish:
+        out(format_separator("="))
+        out("  MULTI-AGENT CODE REVIEW & DEBUGGING PIPELINE")
+        if dry_run:
+            out("  Milestone 4 — Stage 5: PR Review Publishing (Dry-Run Mode)")
+        else:
+            out("  Milestone 4 — Stage 5: Controlled Review Publication")
+        out(format_separator("="))
+        out("")
+        out(f"Target PR: {pr_target} (Publishing {'Dry-Run' if dry_run else 'Controlled Mode'})")
+        out(format_separator("-"))
+
+        try:
+            workflow_res = run_pr_publishing_workflow(
+                repo_or_url=repo if repo else pr_target,
+                pr_number=pr_target if repo else None,
+                dry_run=dry_run,
+                client=client,
+                token=token,
+                enable_ai=effective_enable_ai,
+                llm=llm,
+                enable_sandbox=enable_sandbox,
+                enable_debugging=enable_debugging,
+                interactive=interactive,
+                input_func=input_func,
+                output_func=out,
+                clock=clock,
+                utc_now=utc_now,
+                publication_marker=publication_marker,
+                ruff_runner=ruff_runner,
+                bandit_runner=bandit_runner,
+                sandbox_runner_fn=sandbox_runner_fn,
+            )
+        except NonInteractivePublishingDisabledError as e:
+            safe_msg = redact_token(str(e), token)
+            out(format_separator("="))
+            out(f"PUBLISHING REJECTED (NON-INTERACTIVE): {safe_msg}")
+            out(format_separator("="))
+            return 2
+        except ApprovalRejectedError as e:
+            safe_msg = redact_token(str(e), token)
+            out(format_separator("="))
+            out(f"PUBLISHING CANCELLED: {safe_msg}")
+            out(format_separator("="))
+            return 1
+        except GitHubValidationError as e:
+            safe_msg = redact_token(str(e), token)
+            out(format_separator("="))
+            out(f"PUBLISHING FAILED (HTTP 422 VALIDATION ERROR): {safe_msg}")
+            out(format_separator("="))
+            return 2
+        except GitHubUncertainWriteError as e:
+            safe_msg = redact_token(str(e), token)
+            out(format_separator("="))
+            out(f"PUBLISHING UNCERTAIN (TIMEOUT/CONNECTION DROP): {safe_msg}")
+            out("No retry performed. Reconcile PR reviews before proceeding.")
+            out(format_separator("="))
+            return 2
+        except (PrePublicationValidationError, ApprovalGateError, GitHubClientError, PRReviewWorkflowError) as e:
+            safe_msg = redact_token(str(e), token)
+            out(format_separator("="))
+            out(f"PUBLISHING FAILED: {safe_msg}")
+            out(format_separator("="))
+            return 2
+        except Exception as e:  # noqa: BLE001
+            safe_msg = redact_token(str(e), token)
+            out(format_separator("="))
+            out(f"PUBLISHING WORKFLOW ERROR: {safe_msg}")
+            out(format_separator("="))
+            return 2
+
+        if not workflow_res.success:
+            return 2
+        if workflow_res.action_plan.verdict == "REQUEST_CHANGES":
+            return 1
+        if workflow_res.action_plan.comments:
+            return 1
+        return 0
+
+    # Default read-only PR preview mode
+    out(format_separator("="))
+    out("  MULTI-AGENT CODE REVIEW & DEBUGGING PIPELINE")
+    out("  Milestone 4: Read-Only Pull Request Review & Approval Preview")
+    out(format_separator("="))
+    out("")
+    out(f"Target PR: {pr_target} (Read-Only Preview Mode)")
+    out(format_separator("-"))
 
     try:
         result = run_pr_review_workflow(
             repo_or_url=repo if repo else pr_target,
             pr_number=pr_target if repo else None,
+            client=client,
             token=token,
             enable_ai=effective_enable_ai,
             llm=llm,
             enable_sandbox=enable_sandbox,
             enable_debugging=enable_debugging,
+            output_func=out,
             display_preview=True,
+            clock=clock,
+            ruff_runner=ruff_runner,
+            bandit_runner=bandit_runner,
+            sandbox_runner_fn=sandbox_runner_fn,
         )
     except Exception as e:  # noqa: BLE001
         safe_msg = redact_token(str(e), token)
-        print(format_separator("="))
-        print(f"PR WORKFLOW FAILED: {safe_msg}")
-        print(format_separator("="))
+        out(format_separator("="))
+        out(f"PR WORKFLOW FAILED: {safe_msg}")
+        out(format_separator("="))
         return 2
-
 
     # Exit code based on verdict and issues
     if not result.success:
@@ -522,6 +636,20 @@ def main() -> None:
         help="GitHub token (defaults to GITHUB_TOKEN or GH_TOKEN env var)",
     )
     parser.add_argument(
+        "--publish",
+        dest="publish",
+        action="store_true",
+        default=False,
+        help="Publish the review to GitHub PR after interactive human approval",
+    )
+    parser.add_argument(
+        "--dry-run",
+        dest="dry_run",
+        action="store_true",
+        default=False,
+        help="Simulate review publishing without performing any write requests",
+    )
+    parser.add_argument(
         "--no-ai",
         dest="enable_ai",
         action="store_false",
@@ -544,6 +672,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.publish and not args.pr:
+        print("ERROR: --publish requires a GitHub PR target specified via --pr.")
+        sys.exit(2)
+
     if args.pr:
         exit_code = run_pr_pipeline(
             pr_target=args.pr,
@@ -552,6 +684,8 @@ def main() -> None:
             enable_ai=args.enable_ai,
             enable_sandbox=args.enable_sandbox,
             enable_debugging=args.enable_debugging,
+            publish=args.publish,
+            dry_run=args.dry_run,
         )
     else:
         exit_code = run_pipeline(

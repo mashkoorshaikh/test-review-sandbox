@@ -15,20 +15,23 @@ Milestone 4 — Stage 2:
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import math
-import os
 import re
 import sys
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any
 
 # SHA verification pattern (Git full 40-char SHA or at least 7-char short SHA)
 _GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 _REPO_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+
+DEFAULT_APPROVAL_TTL_SECONDS: float = 600.0  # 10-minute approval window
+DEFAULT_MAX_PLAN_AGE_SECONDS: float = 600.0  # 10-minute maximum age before approval
 
 
 # ============================================================================
@@ -45,7 +48,19 @@ class InvalidActionPlanError(ApprovalGateError):
 
 
 class ApprovalRejectedError(ApprovalGateError):
-    """Raised when human approval is denied or non-interactive fails closed."""
+    """Raised when human approval is denied or aborted."""
+
+
+class ApprovalExpiredError(ApprovalGateError):
+    """Raised when approval has expired or the plan is stale."""
+
+
+class NonInteractivePublishingDisabledError(ApprovalRejectedError):
+    """Raised when review publishing is attempted in a non-interactive environment."""
+
+
+class PlanFingerprintMismatchError(ApprovalGateError):
+    """Raised when plan fingerprint verification fails due to tampering or mismatch."""
 
 
 class DryRunBlockedError(ApprovalGateError):
@@ -117,6 +132,30 @@ class ReviewComment:
             "side": self.side,
             "start_line": self.start_line,
         }
+
+    def to_github_payload(self) -> dict[str, Any]:
+        """
+        Deterministic serialization of this ReviewComment into GitHub REST API format.
+
+        Single-line format:
+            {"path": path, "line": line, "side": side, "body": body}
+        Multi-line format:
+            {"path": path, "line": line, "side": side, "start_line": start_line, "start_side": side, "body": body}
+        """
+        self.validate()
+        payload: dict[str, Any] = {
+            "path": self.path,
+            "body": self.body,
+            "side": self.side,
+        }
+        if self.line is not None:
+            payload["line"] = self.line
+
+        if self.start_line is not None:
+            payload["start_line"] = self.start_line
+            payload["start_side"] = self.side
+
+        return payload
 
 
 def _freeze_metadata(obj: Any) -> Any:
@@ -280,6 +319,8 @@ class ActionPlan:
     metadata: MappingProxyType[str, Any] = field(
         default_factory=lambda: MappingProxyType({})
     )
+    created_at_mono: float | None = None
+    created_at_utc: str = ""
 
     def __post_init__(self) -> None:
         raw_comments = self.comments or ()
@@ -292,6 +333,13 @@ class ActionPlan:
         else:
             # Non-mapping metadata is left as-is so validate() will catch and reject it
             pass
+
+        if self.created_at_mono is None:
+            object.__setattr__(self, "created_at_mono", time.monotonic())
+        if not self.created_at_utc:
+            object.__setattr__(
+                self, "created_at_utc", datetime.now(UTC).isoformat()
+            )
 
     @property
     def fingerprint(self) -> str:
@@ -355,6 +403,38 @@ class ActionPlan:
                 )
             _validate_metadata_value(v, f"metadata.{k}")
 
+    def to_github_payload(self, publication_marker: str | None = None) -> dict[str, Any]:
+        """
+        Deterministic serialization of the ActionPlan into GitHub PR Review POST payload format.
+
+        - Comments are sorted deterministically by (path, line or 0, start_line or 0, body).
+        - If publication_marker is provided, appends '<!-- agy-review-marker: <marker> -->' to the body.
+        """
+        self.validate()
+        final_body = self.summary
+        if publication_marker:
+            clean_marker = publication_marker.strip()
+            if clean_marker:
+                marker_str = f"<!-- agy-review-marker: {clean_marker} -->"
+                if marker_str not in final_body:
+                    final_body = f"{final_body.rstrip()}\n\n{marker_str}"
+
+        sorted_comments = sorted(
+            self.comments,
+            key=lambda c: (c.path, c.line or 0, c.start_line or 0, c.body),
+        )
+        comments_payload = [c.to_github_payload() for c in sorted_comments]
+
+        payload: dict[str, Any] = {
+            "commit_id": self.head_sha.strip().lower(),
+            "event": self.verdict,
+            "body": final_body,
+        }
+        if comments_payload:
+            payload["comments"] = comments_payload
+
+        return payload
+
 
 @dataclass(frozen=True)
 class ApprovalResult:
@@ -366,24 +446,49 @@ class ApprovalResult:
     source: str  # "interactive", "non_interactive", "rejected", "dry_run"
     reason: str = ""
     plan_fingerprint: str = ""
+    created_at_mono: float = 0.0
+    approved_at_mono: float = 0.0
+    approved_at_utc: str = ""
+    expires_at_mono: float = 0.0
+    approval_ttl: float = DEFAULT_APPROVAL_TTL_SECONDS
+    clock: Callable[[], float] = field(default=time.monotonic, compare=False)
 
     def __post_init__(self) -> None:
         if not self.plan_fingerprint and self.plan is not None:
             object.__setattr__(self, "plan_fingerprint", self.plan.fingerprint)
+        if self.approved and self.expires_at_mono <= 0.0 and self.approved_at_mono > 0.0:
+            object.__setattr__(
+                self, "expires_at_mono", self.approved_at_mono + self.approval_ttl
+            )
+
+    def is_expired(self, current_mono: float | None = None) -> bool:
+        """
+        Check if the approval window has expired.
+        Measured strictly against expires_at_mono (at or beyond boundary is expired).
+        """
+        if not self.approved or self.expires_at_mono <= 0.0:
+            return True
+        now = current_mono if current_mono is not None else self.clock()
+        return now >= self.expires_at_mono
 
     @property
     def can_write(self) -> bool:
         """
-        Returns True ONLY if approved AND NOT dry_run AND plan fingerprint matches.
-        Guarantees that --dry-run always blocks write actions, and plan has not been tampered with.
+        Returns True ONLY if approved AND NOT dry_run AND unexpired AND plan fingerprint matches.
+        Guarantees that --dry-run always blocks write actions, expired approvals cannot write,
+        and plan has not been tampered with.
         """
         if not self.approved or self.dry_run:
+            return False
+        if self.is_expired():
             return False
         return self.plan.fingerprint == self.plan_fingerprint
 
 
 def check_can_write(
-    result: ApprovalResult, current_plan: ActionPlan | None = None
+    result: ApprovalResult,
+    current_plan: ActionPlan | None = None,
+    current_mono: float | None = None,
 ) -> bool:
     """
     Verify whether write operations can proceed.
@@ -391,14 +496,57 @@ def check_can_write(
     Ensures:
       1. Gate was approved.
       2. Operation is not dry_run.
-      3. The result's plan fingerprint matches the recorded approved fingerprint.
-      4. If current_plan is supplied, its fingerprint also matches the approved fingerprint.
+      3. Approval has not expired (strictly within TTL measured from approval event).
+      4. The result's plan fingerprint matches the recorded approved fingerprint.
+      5. If current_plan is supplied, its fingerprint also matches the approved fingerprint.
     """
-    if not result.can_write:
+    if not result.approved or result.dry_run:
+        return False
+    if result.is_expired(current_mono=current_mono):
+        return False
+    if result.plan.fingerprint != result.plan_fingerprint:
         return False
     if current_plan is not None:
         return current_plan.fingerprint == result.plan_fingerprint
     return True
+
+
+def verify_approval_for_write(
+    result: ApprovalResult,
+    current_plan: ActionPlan | None = None,
+    current_mono: float | None = None,
+) -> None:
+    """
+    Strictly verify that an approval result is valid and unexpired before publishing.
+    Fails closed by raising specific typed errors.
+
+    Raises:
+        ApprovalRejectedError: If gate was not approved.
+        DryRunBlockedError: If operation is in dry-run mode.
+        ApprovalExpiredError: If approval window has elapsed.
+        PlanFingerprintMismatchError: If plan or current_plan fingerprint has changed.
+    """
+    if not result.approved:
+        raise ApprovalRejectedError(
+            f"Write operation rejected: approval was not granted ({result.reason})."
+        )
+    if result.dry_run:
+        raise DryRunBlockedError("Write operation blocked: running in dry-run mode.")
+    if result.is_expired(current_mono=current_mono):
+        now = current_mono if current_mono is not None else result.clock()
+        elapsed = now - result.approved_at_mono
+        raise ApprovalExpiredError(
+            f"Approval has expired (elapsed {elapsed:.1f}s at or beyond {result.approval_ttl:.1f}s TTL). "
+            "A fresh review and human authorization are required."
+        )
+    if result.plan.fingerprint != result.plan_fingerprint:
+        raise PlanFingerprintMismatchError(
+            "Plan tampering detected! The approved plan's fingerprint does not match the recorded authorization fingerprint."
+        )
+    if current_plan is not None and current_plan.fingerprint != result.plan_fingerprint:
+        raise PlanFingerprintMismatchError(
+            "Current plan does not match the approved plan fingerprint. Re-authorization required."
+        )
 
 
 # ============================================================================
@@ -429,6 +577,7 @@ def format_approval_preview(plan: ActionPlan) -> str:
         f"Pull Request:     #{plan.pr_number}",
         f"Target Head SHA:  {plan.head_sha}",
         f"Review Verdict:   {plan.verdict}",
+        f"Plan Fingerprint: {plan.fingerprint}",
         f"Dry Run Mode:     {'YES (Writes blocked)' if plan.dry_run else 'NO (Live write if approved)'}",
         "-" * 78,
         "Summary:",
@@ -465,94 +614,111 @@ def request_approval(
     non_interactive_token: str | None = None,
     expected_non_interactive_token: str | None = None,
     output_func: Callable[[str], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    utc_now: Callable[[], datetime] | None = None,
+    max_plan_age_seconds: float = DEFAULT_MAX_PLAN_AGE_SECONDS,
+    approval_ttl_seconds: float = DEFAULT_APPROVAL_TTL_SECONDS,
 ) -> ApprovalResult:
     """
     Evaluate human authorization for the proposed ActionPlan.
 
     Guarantees:
       1. Plan is strictly validated before any approval is requested.
-      2. Shows complete formatted preview.
-      3. Dry-run mode is explicitly displayed and permanently prevents writes.
-      4. Interactive approval defaults to rejection (unambiguous '[y/N]' prompt).
-      5. Non-interactive environments fail closed unless deliberate token is provided.
-      6. LLM content cannot grant approval.
+      2. Plan staleness is checked: plans older than max_plan_age_seconds are rejected immediately.
+      3. Shows complete formatted preview.
+      4. Dry-run mode is explicitly displayed and permanently prevents writes.
+      5. Interactive approval defaults to rejection (unambiguous '[y/N]' prompt).
+      6. Non-interactive publishing is disabled and fails closed with NonInteractivePublishingDisabledError.
+      7. LLM content cannot grant approval.
+      8. Approval records monotonic approval time and enforces a 600-second approval window.
 
     Args:
         plan: The validated ActionPlan.
         interactive: Override for TTY check. If None, checks sys.stdin.isatty().
         input_func: Callable for reading user input (defaults to built-in input).
-        non_interactive_token: Token provided by caller in automated/CI environment.
-        expected_non_interactive_token: Token to compare against. Defaults to
-            GITHUB_REVIEW_APPROVAL_TOKEN environment variable.
+        non_interactive_token: Deprecated/disabled. Non-interactive publishing is prohibited.
+        expected_non_interactive_token: Deprecated/disabled.
         output_func: Callable for printing preview (defaults to print).
+        clock: Monotonic clock callable (defaults to time.monotonic).
+        utc_now: UTC datetime callable (defaults to datetime.now(timezone.utc)).
+        max_plan_age_seconds: Maximum allowed plan age before approval (default: 600.0s).
+        approval_ttl_seconds: Approval validity window from approval event (default: 600.0s).
 
     Returns:
-        ApprovalResult with approved=True/False and can_write=True/False.
+        ApprovalResult with approved=True and valid monotonic timestamps.
 
     Raises:
         InvalidActionPlanError: If plan data is invalid or incomplete.
-        ApprovalRejectedError: If human rejects or non-interactive fails closed.
+        ApprovalExpiredError: If the plan is stale before approval.
+        ApprovalRejectedError: If human rejects or aborts approval.
+        NonInteractivePublishingDisabledError: If execution is non-interactive.
     """
     # 1. Strictly validate plan
     plan.validate()
 
-    # 2. Render preview
+    # 2. Clock setup and Staleness Check (Before Approval)
+    _clock = clock or time.monotonic
+    _utc_now = utc_now or (lambda: datetime.now(UTC))
+    current_mono = _clock()
+
+    if plan.created_at_mono is not None:
+        plan_age = current_mono - plan.created_at_mono
+        if plan_age > max_plan_age_seconds:
+            raise ApprovalExpiredError(
+                f"Action plan is stale (age {plan_age:.1f}s exceeds maximum allowed "
+                f"{max_plan_age_seconds:.1f}s). A fresh review analysis is required."
+            )
+
+    # 3. Render preview
     out = output_func or print
     preview = format_approval_preview(plan)
     out(preview)
 
-    # 3. Determine interactivity
+    # 4. Determine interactivity
     is_interactive = sys.stdin.isatty() if interactive is None else bool(interactive)
     _input = input_func or input
 
-    # 4. Interactive Mode
-    if is_interactive:
-        prompt = (
-            "Authorize publishing this review to GitHub? [y/N]: "
-            if not plan.dry_run
-            else "Acknowledge dry-run preview? [y/N]: "
+    # 5. Non-Interactive Mode: Publishing is strictly disabled
+    if not is_interactive:
+        raise NonInteractivePublishingDisabledError(
+            "Non-interactive review publishing is disabled. "
+            "Human approval must be granted interactively in an interactive terminal."
         )
-        try:
-            user_choice = _input(prompt).strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            raise ApprovalRejectedError(
-                "Approval aborted by user (EOF/Interrupt)."
-            ) from None
 
-        if user_choice in ("y", "yes"):
-            return ApprovalResult(
-                approved=True,
-                dry_run=plan.dry_run,
-                plan=plan,
-                source="interactive",
-                reason="Explicit human approval granted via interactive prompt.",
-            )
-        else:
-            raise ApprovalRejectedError(
-                f"Action plan rejected by user (response: {user_choice!r})."
-            )
-
-    # 5. Non-Interactive Mode (Fail-Closed by Default)
-    expected_secret = expected_non_interactive_token or os.getenv(
-        "GITHUB_REVIEW_APPROVAL_TOKEN"
+    # 6. Interactive Mode
+    prompt = (
+        "Authorize publishing this review to GitHub? [y/N]: "
+        if not plan.dry_run
+        else "Acknowledge dry-run preview? [y/N]: "
     )
-    if (
-        non_interactive_token
-        and expected_secret
-        and hmac.compare_digest(non_interactive_token, expected_secret)
-    ):
+    try:
+        user_choice = _input(prompt).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        raise ApprovalRejectedError(
+            "Approval aborted by user (EOF/Interrupt)."
+        ) from None
+
+    if user_choice in ("y", "yes"):
+        approval_time_mono = _clock()
+        approval_time_utc = _utc_now().isoformat()
         return ApprovalResult(
             approved=True,
             dry_run=plan.dry_run,
             plan=plan,
-            source="non_interactive",
-            reason="Explicit approval granted via authorized non-interactive token.",
+            source="interactive",
+            reason="Explicit human approval granted via interactive prompt.",
+            plan_fingerprint=plan.fingerprint,
+            created_at_mono=plan.created_at_mono or approval_time_mono,
+            approved_at_mono=approval_time_mono,
+            approved_at_utc=approval_time_utc,
+            expires_at_mono=approval_time_mono + approval_ttl_seconds,
+            approval_ttl=approval_ttl_seconds,
+            clock=_clock,
         )
-
-    # Fail closed
-    raise ApprovalRejectedError(
-        "Non-interactive execution detected without valid authorization token. Gate fails closed by default."
-    )
+    else:
+        raise ApprovalRejectedError(
+            f"Action plan rejected by user (response: {user_choice!r})."
+        )
 
 
 def verify_head_sha_unchanged(expected_sha: str, live_sha: str) -> bool:

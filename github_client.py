@@ -22,6 +22,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -37,6 +38,7 @@ _TOKEN_PATTERNS = [
 
 _REPO_NAME_RE = re.compile(r"^[a-zA-Z0-9_.-]+$")
 _GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_LINK_NEXT_RE = re.compile(r'<([^>]+)>;\s*rel="next"')
 
 
 def redact_token(text: str, token: str | None = None) -> str:
@@ -120,6 +122,23 @@ class GitHubNotFoundError(GitHubClientError):
 
 class GitHubNetworkError(GitHubClientError):
     """Raised on connection timeout or network connectivity failure."""
+
+
+class GitHubUncertainWriteError(GitHubNetworkError):
+    """Raised when a write operation encounters a timeout or network drop and its outcome is uncertain."""
+
+
+class GitHubValidationError(GitHubClientError):
+    """Raised when GitHub API rejects a payload as invalid or unprocessable (HTTP 422)."""
+
+    def __init__(
+        self,
+        message: str,
+        errors: list[dict[str, Any]] | None = None,
+        token: str | None = None,
+    ) -> None:
+        super().__init__(message, token=token)
+        self.errors = errors or []
 
 
 class DiffParsingError(GitHubClientError):
@@ -273,6 +292,28 @@ class DiffFile:
                 return hunk
         return None
 
+    def find_hunk_for_span(self, start_line: int, end_line: int) -> DiffHunk | None:
+        """
+        Return the DiffHunk containing the entire [start_line, end_line] span on the new side.
+        Returns None if start_line > end_line or if the span crosses multiple hunks or falls outside diff hunks.
+        """
+        if start_line > end_line or start_line <= 0:
+            return None
+        for hunk in self.hunks:
+            hunk_end = (
+                hunk.new_start + hunk.new_count - 1
+                if hunk.new_count > 0
+                else hunk.new_start
+            )
+            if (
+                hunk.new_start <= start_line
+                and end_line <= hunk_end
+                and start_line in hunk.valid_new_lines
+                and end_line in hunk.valid_new_lines
+            ):
+                return hunk
+        return None
+
 
 # ============================================================================
 # GitHub Client
@@ -365,8 +406,9 @@ class GitHubClient:
     ) -> None:
         status = response.status_code
         if status == 401:
+            snippet = f": {response.text[:200]}" if response.text else "."
             raise GitHubAuthError(
-                f"GitHub authentication failed (HTTP 401 Unauthorized) for {owner}/{repo}.",
+                f"GitHub authentication failed (HTTP 401 Unauthorized) for {owner}/{repo}{snippet}",
                 token=self._token,
             )
         if status == 404:
@@ -406,6 +448,43 @@ class GitHubClient:
                 f"GitHub API access forbidden: HTTP 403 for {owner}/{repo} PR #{pr_number}.",
                 token=self._token,
             )
+        if status == 422:
+            error_details = ""
+            errors_list: list[dict[str, Any]] = []
+            try:
+                err_data = response.json()
+                msg = err_data.get("message", "")
+                raw_errors = err_data.get("errors", [])
+                if isinstance(raw_errors, list) and raw_errors:
+                    errors_list = raw_errors
+                    formatted = []
+                    for e in raw_errors:
+                        if isinstance(e, dict):
+                            field_name = e.get("field", "")
+                            code = e.get("code", "")
+                            err_msg = e.get("message", "")
+                            detail = f"{field_name}: {err_msg or code}".strip(": ")
+                            formatted.append(detail)
+                        else:
+                            formatted.append(str(e))
+                    if formatted:
+                        error_details = f" ({'; '.join(formatted)})"
+                elif msg:
+                    error_details = f" ({msg})"
+            except (ValueError, requests.exceptions.JSONDecodeError, AttributeError, KeyError):
+                error_details = f": {response.text[:200]}" if response.text else ""
+            raise GitHubValidationError(
+                f"GitHub API validation failed (HTTP 422 Unprocessable Entity) for {owner}/{repo} PR #{pr_number}{error_details}.",
+                errors=errors_list,
+                token=self._token,
+            )
+        if 300 <= status < 400:
+            location = response.headers.get("Location", "")
+            loc_msg = f" to {location}" if location else "."
+            raise GitHubClientError(
+                f"Unexpected redirect response (HTTP {status}) from GitHub API for {owner}/{repo} PR #{pr_number}{loc_msg}",
+                token=self._token,
+            )
         if status >= 500:
             raise GitHubClientError(
                 f"GitHub server error: HTTP {status} for {owner}/{repo} PR #{pr_number}.",
@@ -417,6 +496,71 @@ class GitHubClient:
             f"GitHub API request failed with HTTP {status}: {snippet}",
             token=self._token,
         )
+
+    def get_authenticated_user(self) -> dict[str, Any]:
+        """
+        Fetch authenticated user / bot metadata from GitHub REST API (GET /user).
+
+        Raises:
+            GitHubAuthError: If authentication fails (401).
+            GitHubRateLimitError: If rate limit exceeded (403/429).
+            GitHubNetworkError: On timeout or connection failure.
+            GitHubClientError: On other HTTP or JSON parsing errors.
+        """
+        url = f"{self.base_url}/user"
+        headers = self._get_headers(accept="application/vnd.github+json")
+        try:
+            resp = self._session.get(
+                url, headers=headers, timeout=self.timeout, allow_redirects=False
+            )
+        except requests.exceptions.Timeout as e:
+            raise GitHubNetworkError(
+                f"GitHub API user request timed out after {self.timeout}s: {e}",
+                token=self._token,
+            ) from None
+        except requests.exceptions.ConnectionError as e:
+            raise GitHubNetworkError(
+                f"GitHub API user connection failed: {e}",
+                token=self._token,
+            ) from None
+        except requests.exceptions.RequestException as e:
+            raise GitHubClientError(
+                f"GitHub API user request error: {e}",
+                token=self._token,
+            ) from None
+
+        if resp.status_code != 200:
+            snippet = f": {resp.text[:200]}" if resp.text else "."
+            if resp.status_code == 401:
+                raise GitHubAuthError(
+                    f"GitHub authentication failed (HTTP 401 Unauthorized) for /user{snippet}",
+                    token=self._token,
+                )
+            if resp.status_code in (403, 429):
+                raise GitHubRateLimitError(
+                    "GitHub API rate limit exceeded for /user.",
+                    token=self._token,
+                )
+            raise GitHubClientError(
+                f"GitHub user request failed with HTTP {resp.status_code}{snippet}",
+                token=self._token,
+            )
+
+        try:
+            data = resp.json()
+        except (ValueError, requests.exceptions.JSONDecodeError) as e:
+            raise GitHubClientError(
+                f"Failed to parse JSON response from GitHub user API: {e}",
+                token=self._token,
+            ) from None
+
+        if not isinstance(data, dict):
+            raise GitHubClientError(
+                f"Unexpected response type from GitHub user API: expected dict, got {type(data).__name__}.",
+                token=self._token,
+            )
+
+        return data
 
     def get_pr_metadata(self, owner: str, repo: str, pr_number: int) -> PRMetadata:
         """
@@ -434,7 +578,9 @@ class GitHubClient:
         headers = self._get_headers(accept="application/vnd.github.v3+json")
 
         try:
-            resp = self._session.get(url, headers=headers, timeout=self.timeout)
+            resp = self._session.get(
+                url, headers=headers, timeout=self.timeout, allow_redirects=False
+            )
         except requests.exceptions.Timeout as e:
             raise GitHubNetworkError(
                 f"GitHub API request timed out after {self.timeout}s: {e}",
@@ -494,7 +640,9 @@ class GitHubClient:
         headers = self._get_headers(accept="application/vnd.github.v3.diff")
 
         try:
-            resp = self._session.get(url, headers=headers, timeout=self.timeout)
+            resp = self._session.get(
+                url, headers=headers, timeout=self.timeout, allow_redirects=False
+            )
         except requests.exceptions.Timeout as e:
             raise GitHubNetworkError(
                 f"GitHub API diff request timed out after {self.timeout}s: {e}",
@@ -557,6 +705,19 @@ class GitHubClient:
                 if resp.status_code != 200:
                     self._handle_response_error(resp, owner, repo, 0)
 
+                # Validate redirect origin if 3xx redirect was followed
+                if hasattr(resp, "history") and resp.history:
+                    for prev_resp in resp.history:
+                        loc = prev_resp.headers.get("Location", "")
+                        if loc:
+                            parsed_loc = urlparse(loc)
+                            loc_host = parsed_loc.netloc.lower()
+                            if loc_host != "github.com" and not loc_host.endswith(".github.com"):
+                                raise GitHubClientError(
+                                    f"Untrusted redirect origin detected during archive download: {loc_host!r}",
+                                    token=self._token,
+                                )
+
                 total_downloaded = 0
                 with open(out_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=64 * 1024):
@@ -587,6 +748,289 @@ class GitHubClient:
             if out_path.exists():
                 out_path.unlink(missing_ok=True)
             raise
+
+    def create_pull_request_review(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        commit_sha: str,
+        body: str,
+        event: str = "COMMENT",
+        comments: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Submit a pull request review with top-level summary and inline comments (POST).
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            pr_number: PR number.
+            commit_sha: Hexadecimal git commit SHA to anchor the review.
+            body: Top-level review markdown summary.
+            event: Review verdict. Must be one of 'COMMENT', 'REQUEST_CHANGES', or 'APPROVE'.
+            comments: Optional list of inline comment dictionaries.
+
+        Returns:
+            dict containing the created GitHub review object.
+
+        Raises:
+            ValueError: If input arguments or comment coordinates fail validation.
+            GitHubAuthError: If unauthorized (HTTP 401).
+            GitHubNotFoundError: If repository or PR not found (HTTP 404).
+            GitHubRateLimitError: If rate limit exceeded (HTTP 403/429).
+            GitHubValidationError: If payload rejected by GitHub (HTTP 422).
+            GitHubUncertainWriteError: If POST request timed out or connection dropped.
+            GitHubClientError: On other HTTP errors.
+        """
+        num = self._validate_repo_params(owner, repo, pr_number)
+        if not _REPO_NAME_RE.match(owner):
+            raise ValueError(f"Invalid repository owner: {owner!r}")
+        if not _REPO_NAME_RE.match(repo):
+            raise ValueError(f"Invalid repository name: {repo!r}")
+
+        if not commit_sha or not isinstance(commit_sha, str) or not _GIT_SHA_RE.match(commit_sha.strip()):
+            raise ValueError(f"Invalid commit SHA: {commit_sha!r}. Expected 7-40 hex git commit SHA.")
+        clean_sha = commit_sha.strip().lower()
+
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError("Review body must be a non-empty string.")
+        clean_body = body.strip()
+
+        clean_event = event.strip().upper() if isinstance(event, str) else ""
+        if clean_event not in ("COMMENT", "REQUEST_CHANGES", "APPROVE"):
+            raise ValueError(
+                f"Invalid review event: {event!r}. Must be 'COMMENT', 'REQUEST_CHANGES', or 'APPROVE'."
+            )
+
+        validated_comments: list[dict[str, Any]] = []
+        if comments:
+            for idx, c in enumerate(comments):
+                if not isinstance(c, dict):
+                    raise TypeError(f"Comment at index {idx} must be a dictionary, got {type(c).__name__}.")
+
+                path = c.get("path")
+                if not path or not isinstance(path, str) or not path.strip():
+                    raise ValueError(f"Comment at index {idx} has missing or empty 'path'.")
+                clean_path = path.strip().replace("\\", "/")
+                if ".." in clean_path or clean_path.startswith("/"):
+                    raise ValueError(f"Comment at index {idx} has invalid path '{path}'.")
+
+                c_body = c.get("body")
+                if not c_body or not isinstance(c_body, str) or not c_body.strip():
+                    raise ValueError(f"Comment at index {idx} has missing or empty 'body'.")
+
+                line = c.get("line")
+                if line is not None and (not isinstance(line, int) or line <= 0):
+                    raise ValueError(f"Comment at index {idx} 'line' must be a positive integer, got {line!r}.")
+
+                side = c.get("side", "RIGHT")
+                if side not in ("LEFT", "RIGHT"):
+                    raise ValueError(f"Comment at index {idx} 'side' must be 'LEFT' or 'RIGHT', got {side!r}.")
+
+                comment_obj: dict[str, Any] = {
+                    "path": clean_path,
+                    "body": c_body.strip(),
+                    "side": side,
+                }
+                if line is not None:
+                    comment_obj["line"] = line
+
+                start_line = c.get("start_line")
+                if start_line is not None:
+                    if not isinstance(start_line, int) or start_line <= 0:
+                        raise ValueError(
+                            f"Comment at index {idx} 'start_line' must be a positive integer, got {start_line!r}."
+                        )
+                    if line is not None and start_line > line:
+                        raise ValueError(
+                            f"Comment at index {idx} 'start_line' ({start_line}) cannot be greater than 'line' ({line})."
+                        )
+                    comment_obj["start_line"] = start_line
+                    start_side = c.get("start_side", side)
+                    if start_side not in ("LEFT", "RIGHT"):
+                        raise ValueError(
+                            f"Comment at index {idx} 'start_side' must be 'LEFT' or 'RIGHT', got {start_side!r}."
+                        )
+                    comment_obj["start_side"] = start_side
+
+                validated_comments.append(comment_obj)
+
+        payload: dict[str, Any] = {
+            "commit_id": clean_sha,
+            "body": clean_body,
+            "event": clean_event,
+        }
+        if validated_comments:
+            payload["comments"] = validated_comments
+
+        url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{num}/reviews"
+        headers = self._get_headers(accept="application/vnd.github+json")
+
+        try:
+            resp = self._session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+        except requests.exceptions.Timeout as e:
+            raise GitHubUncertainWriteError(
+                f"GitHub review creation request timed out after {self.timeout}s for {owner}/{repo} PR #{num}: {e}. "
+                "Outcome is uncertain; check PR review state before retrying.",
+                token=self._token,
+            ) from None
+        except requests.exceptions.ConnectionError as e:
+            raise GitHubUncertainWriteError(
+                f"GitHub review creation connection failed for {owner}/{repo} PR #{num}: {e}",
+                token=self._token,
+            ) from None
+        except requests.exceptions.RequestException as e:
+            raise GitHubClientError(
+                f"GitHub review creation request error for {owner}/{repo} PR #{num}: {e}",
+                token=self._token,
+            ) from None
+
+        if resp.status_code not in (200, 201):
+            self._handle_response_error(resp, owner, repo, num)
+
+        try:
+            data = resp.json()
+        except (ValueError, requests.exceptions.JSONDecodeError) as e:
+            raise GitHubClientError(
+                f"Failed to parse JSON response from GitHub review creation API: {e}",
+                token=self._token,
+            ) from None
+
+        if not isinstance(data, dict):
+            raise GitHubClientError(
+                f"Unexpected response type from GitHub review creation API: expected dict, got {type(data).__name__}.",
+                token=self._token,
+            )
+
+        return data
+
+    def get_pr_reviews(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        per_page: int = 100,
+        max_pages: int = 10,
+    ) -> list[dict[str, Any]]:
+        """
+        Fetch all reviews for a pull request, following GitHub Link pagination headers safely.
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            pr_number: PR number.
+            per_page: Items per page (default 100, max 100).
+            max_pages: Maximum pages to retrieve to prevent unbounded loops.
+
+        Returns:
+            List of review dictionaries from GitHub REST API.
+
+        Raises:
+            GitHubAuthError: If authentication fails (401).
+            GitHubNotFoundError: If repository or PR not found (404).
+            GitHubRateLimitError: If rate limit exceeded.
+            GitHubNetworkError: On timeout or connection failure.
+            GitHubClientError: On invalid response or HTTP errors.
+        """
+        num = self._validate_repo_params(owner, repo, pr_number)
+        safe_per_page = max(1, min(int(per_page), 100))
+        safe_max_pages = max(1, int(max_pages))
+
+        next_url: str | None = f"{self.base_url}/repos/{owner}/{repo}/pulls/{num}/reviews?per_page={safe_per_page}"
+        headers = self._get_headers(accept="application/vnd.github+json")
+
+        all_reviews: list[dict[str, Any]] = []
+        pages_fetched = 0
+        seen_urls: set[str] = set()
+
+        base_parsed = urlparse(self.base_url)
+        expected_path = f"{base_parsed.path.rstrip('/')}/repos/{owner}/{repo}/pulls/{num}/reviews"
+
+        while next_url and pages_fetched < safe_max_pages:
+            pages_fetched += 1
+            seen_urls.add(next_url)
+
+            # SSRF and path tampering defense: ensure next_url does not escape expected API base scheme, host, and path
+            next_parsed = urlparse(next_url)
+            if (
+                next_parsed.scheme != base_parsed.scheme
+                or next_parsed.netloc.lower() != base_parsed.netloc.lower()
+                or next_parsed.path.rstrip("/") != expected_path
+            ):
+                raise GitHubClientError(
+                    f"Untrusted pagination URL detected in Link header: {next_url!r}",
+                    token=self._token,
+                )
+
+            try:
+                resp = self._session.get(
+                    next_url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=False,
+                )
+            except requests.exceptions.Timeout as e:
+                raise GitHubNetworkError(
+                    f"GitHub API reviews request timed out after {self.timeout}s: {e}",
+                    token=self._token,
+                ) from None
+            except requests.exceptions.ConnectionError as e:
+                raise GitHubNetworkError(
+                    f"GitHub API reviews connection failed: {e}",
+                    token=self._token,
+                ) from None
+            except requests.exceptions.RequestException as e:
+                raise GitHubClientError(
+                    f"GitHub API reviews request error: {e}",
+                    token=self._token,
+                ) from None
+
+            if resp.status_code != 200:
+                self._handle_response_error(resp, owner, repo, num)
+
+            try:
+                data = resp.json()
+            except (ValueError, requests.exceptions.JSONDecodeError) as e:
+                raise GitHubClientError(
+                    f"Failed to parse JSON response from GitHub reviews API: {e}",
+                    token=self._token,
+                ) from None
+
+            if not isinstance(data, list):
+                raise GitHubClientError(
+                    f"Unexpected response type from GitHub reviews API: expected list, got {type(data).__name__}.",
+                    token=self._token,
+                )
+
+            for item in data:
+                if isinstance(item, dict):
+                    all_reviews.append(item)
+
+            # Follow Link header rel="next" safely
+            candidate_next = None
+            if hasattr(resp, "links") and isinstance(resp.links, dict):
+                next_info = resp.links.get("next")
+                if next_info and isinstance(next_info, dict) and "url" in next_info:
+                    candidate_next = next_info["url"]
+
+            if not candidate_next and resp.headers.get("Link"):
+                match = _LINK_NEXT_RE.search(resp.headers["Link"])
+                if match:
+                    candidate_next = match.group(1)
+
+            if candidate_next and candidate_next not in seen_urls:
+                next_url = candidate_next
+            else:
+                next_url = None
+
+        return all_reviews
 
     def parse_diff_hunks(self, diff_text: str, strict: bool = True) -> list[DiffFile]:
         """Convenience wrapper for parse_diff_hunks."""
@@ -925,3 +1369,51 @@ def get_pr_diff(
     """Convenience helper to fetch PR diff."""
     client = GitHubClient(token=token, base_url=base_url, timeout=timeout, **kwargs)
     return client.get_pr_diff(owner, repo, pr_number)
+
+
+def create_pull_request_review(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    commit_sha: str,
+    body: str,
+    event: str = "COMMENT",
+    comments: list[dict[str, Any]] | tuple[dict[str, Any], ...] | None = None,
+    token: str | None = None,
+    base_url: str | None = None,
+    timeout: float = 30.0,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Convenience helper to create a pull request review."""
+    client = GitHubClient(token=token, base_url=base_url, timeout=timeout, **kwargs)
+    return client.create_pull_request_review(
+        owner=owner,
+        repo=repo,
+        pr_number=pr_number,
+        commit_sha=commit_sha,
+        body=body,
+        event=event,
+        comments=comments,
+    )
+
+
+def get_pr_reviews(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    token: str | None = None,
+    base_url: str | None = None,
+    timeout: float = 30.0,
+    per_page: int = 100,
+    max_pages: int = 10,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Convenience helper to fetch all reviews for a pull request."""
+    client = GitHubClient(token=token, base_url=base_url, timeout=timeout, **kwargs)
+    return client.get_pr_reviews(
+        owner=owner,
+        repo=repo,
+        pr_number=pr_number,
+        per_page=per_page,
+        max_pages=max_pages,
+    )

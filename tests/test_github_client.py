@@ -20,10 +20,14 @@ from github_client import (
     GitHubNetworkError,
     GitHubNotFoundError,
     GitHubRateLimitError,
+    GitHubUncertainWriteError,
+    GitHubValidationError,
     PRMetadata,
     TokenRedactingFilter,
+    create_pull_request_review,
     get_pr_diff,
     get_pr_metadata,
+    get_pr_reviews,
     parse_diff_hunks,
     redact_token,
 )
@@ -795,3 +799,772 @@ class TestModuleLevelFunctions:
         res = get_pr_diff("owner", "repo", 12, token="dummy_token")
         assert res == "diff --git a/x b/x\n"
         mock_get_diff.assert_called_once_with("owner", "repo", 12)
+
+    @patch("github_client.GitHubClient.create_pull_request_review")
+    def test_create_pull_request_review_helper(self, mock_create):
+        mock_create.return_value = {"id": 123, "state": "COMMENTED"}
+        res = create_pull_request_review(
+            "owner",
+            "repo",
+            10,
+            "1234567890abcdef1234567890abcdef12345678",
+            "LGTM",
+            event="COMMENT",
+            token="dummy_token",
+        )
+        assert res == {"id": 123, "state": "COMMENTED"}
+        mock_create.assert_called_once_with(
+            owner="owner",
+            repo="repo",
+            pr_number=10,
+            commit_sha="1234567890abcdef1234567890abcdef12345678",
+            body="LGTM",
+            event="COMMENT",
+            comments=None,
+        )
+
+    @patch("github_client.GitHubClient.get_pr_reviews")
+    def test_get_pr_reviews_helper(self, mock_get_reviews):
+        mock_get_reviews.return_value = [{"id": 1}, {"id": 2}]
+        res = get_pr_reviews("owner", "repo", 10, token="dummy_token", per_page=50, max_pages=3)
+        assert res == [{"id": 1}, {"id": 2}]
+        mock_get_reviews.assert_called_once_with(
+            owner="owner",
+            repo="repo",
+            pr_number=10,
+            per_page=50,
+            max_pages=3,
+        )
+
+
+# ============================================================================
+# Create PR Review (POST) Tests
+# ============================================================================
+
+
+class TestCreatePullRequestReview:
+    """Test create_pull_request_review with mocked responses."""
+
+    def test_create_review_success_no_comments(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 201
+        mock_response.json.return_value = {
+            "id": 999,
+            "user": {"login": "bot-reviewer"},
+            "body": "Executive Summary",
+            "state": "COMMENTED",
+            "html_url": "https://github.com/octocat/repo/pull/10#pullrequestreview-999",
+            "commit_id": "1234567890abcdef1234567890abcdef12345678",
+        }
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token="ghp_test_token_1234567890", session=mock_session)
+        review = client.create_pull_request_review(
+            owner="octocat",
+            repo="repo",
+            pr_number=10,
+            commit_sha="1234567890abcdef1234567890abcdef12345678",
+            body="Executive Summary",
+            event="COMMENT",
+        )
+
+        assert review["id"] == 999
+        assert review["state"] == "COMMENTED"
+
+        mock_session.post.assert_called_once()
+        args, kwargs = mock_session.post.call_args
+        assert args[0] == "https://api.github.com/repos/octocat/repo/pulls/10/reviews"
+        assert kwargs["headers"]["Authorization"] == "Bearer ghp_test_token_1234567890"
+        assert kwargs["headers"]["Accept"] == "application/vnd.github+json"
+        assert kwargs["json"] == {
+            "commit_id": "1234567890abcdef1234567890abcdef12345678",
+            "body": "Executive Summary",
+            "event": "COMMENT",
+        }
+
+    def test_create_review_success_with_single_and_multiline_comments(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"id": 1001, "state": "CHANGES_REQUESTED"}
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token="ghp_test_token_1234567890", session=mock_session)
+        comments = [
+            {
+                "path": "src/app.py",
+                "line": 42,
+                "body": "Fix this bug.",
+                "side": "RIGHT",
+            },
+            {
+                "path": "src/utils.py",
+                "line": 80,
+                "start_line": 75,
+                "body": "Refactor multi-line block.",
+                "side": "RIGHT",
+                "start_side": "RIGHT",
+            },
+        ]
+
+        review = client.create_pull_request_review(
+            owner="octocat",
+            repo="repo",
+            pr_number=42,
+            commit_sha="abcdef1234567890abcdef1234567890abcdef12",
+            body="Review with inline comments",
+            event="REQUEST_CHANGES",
+            comments=comments,
+        )
+
+        assert review["id"] == 1001
+        _, kwargs = mock_session.post.call_args
+        payload = kwargs["json"]
+        assert payload["event"] == "REQUEST_CHANGES"
+        assert len(payload["comments"]) == 2
+        assert payload["comments"][0]["path"] == "src/app.py"
+        assert payload["comments"][0]["line"] == 42
+        assert payload["comments"][0]["side"] == "RIGHT"
+        assert payload["comments"][1]["start_line"] == 75
+        assert payload["comments"][1]["line"] == 80
+        assert payload["comments"][1]["start_side"] == "RIGHT"
+
+    def test_create_review_verdicts(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 201
+        mock_response.json.return_value = {"id": 1}
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+
+        # APPROVE
+        client.create_pull_request_review(
+            "owner", "repo", 1, "1234567", "Clean code", event="APPROVE"
+        )
+        assert mock_session.post.call_args[1]["json"]["event"] == "APPROVE"
+
+        # COMMENT
+        client.create_pull_request_review(
+            "owner", "repo", 1, "1234567", "Suggestions", event="comment"
+        )
+        assert mock_session.post.call_args[1]["json"]["event"] == "COMMENT"
+
+        # REQUEST_CHANGES
+        client.create_pull_request_review(
+            "owner", "repo", 1, "1234567", "Issues found", event="request_changes"
+        )
+        assert mock_session.post.call_args[1]["json"]["event"] == "REQUEST_CHANGES"
+
+    def test_create_review_validation_errors(self):
+        client = GitHubClient()
+
+        # Invalid owner/repo
+        with pytest.raises(ValueError, match="Repository owner"):
+            client.create_pull_request_review("", "repo", 1, "1234567", "body")
+        with pytest.raises(ValueError, match="Invalid repository owner"):
+            client.create_pull_request_review("owner/slash", "repo", 1, "1234567", "body")
+        with pytest.raises(ValueError, match="Invalid repository name"):
+            client.create_pull_request_review("owner", "repo/slash", 1, "1234567", "body")
+        with pytest.raises(ValueError, match="PR number"):
+            client.create_pull_request_review("owner", "repo", 0, "1234567", "body")
+
+        # Invalid commit SHA
+        with pytest.raises(ValueError, match="Invalid commit SHA"):
+            client.create_pull_request_review("owner", "repo", 1, "", "body")
+        with pytest.raises(ValueError, match="Invalid commit SHA"):
+            client.create_pull_request_review("owner", "repo", 1, "short", "body")  # < 7 chars
+        with pytest.raises(ValueError, match="Invalid commit SHA"):
+            client.create_pull_request_review("owner", "repo", 1, "not_hex_commit_sha!", "body")
+
+        # Invalid body
+        with pytest.raises(ValueError, match="Review body must be a non-empty string"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "   ")
+
+        # Invalid event
+        with pytest.raises(ValueError, match="Invalid review event"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body", event="MERGE")
+
+        # Non-dict comment
+        with pytest.raises(TypeError, match="must be a dictionary"):
+            client.create_pull_request_review(
+                "owner", "repo", 1, "1234567", "body", comments=["not a dict"]  # type: ignore[list-item]
+            )
+
+        # Comment missing path
+        with pytest.raises(ValueError, match="missing or empty 'path'"):
+            client.create_pull_request_review(
+                "owner", "repo", 1, "1234567", "body", comments=[{"path": "", "body": "x"}]
+            )
+
+        # Comment path traversal
+        with pytest.raises(ValueError, match="invalid path"):
+            client.create_pull_request_review(
+                "owner", "repo", 1, "1234567", "body", comments=[{"path": "../escape.py", "body": "x"}]
+            )
+        with pytest.raises(ValueError, match="invalid path"):
+            client.create_pull_request_review(
+                "owner", "repo", 1, "1234567", "body", comments=[{"path": "/abs.py", "body": "x"}]
+            )
+
+        # Comment missing body
+        with pytest.raises(ValueError, match="missing or empty 'body'"):
+            client.create_pull_request_review(
+                "owner", "repo", 1, "1234567", "body", comments=[{"path": "a.py", "body": ""}]
+            )
+
+        # Invalid line numbers
+        with pytest.raises(ValueError, match="'line' must be a positive integer"):
+            client.create_pull_request_review(
+                "owner", "repo", 1, "1234567", "body", comments=[{"path": "a.py", "body": "x", "line": 0}]
+            )
+        with pytest.raises(ValueError, match="'line' must be a positive integer"):
+            client.create_pull_request_review(
+                "owner", "repo", 1, "1234567", "body", comments=[{"path": "a.py", "body": "x", "line": -5}]
+            )
+
+        # Invalid side
+        with pytest.raises(ValueError, match="'side' must be 'LEFT' or 'RIGHT'"):
+            client.create_pull_request_review(
+                "owner",
+                "repo",
+                1,
+                "1234567",
+                "body",
+                comments=[{"path": "a.py", "body": "x", "line": 10, "side": "TOP"}],
+            )
+
+        # Invalid start_line > line
+        with pytest.raises(ValueError, match="cannot be greater than 'line'"):
+            client.create_pull_request_review(
+                "owner",
+                "repo",
+                1,
+                "1234567",
+                "body",
+                comments=[{"path": "a.py", "body": "x", "line": 10, "start_line": 20}],
+            )
+
+    def test_create_review_http_401_auth_error(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 401
+        mock_response.text = "Bad credentials"
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token="ghp_bad_secret_token", session=mock_session)
+        with pytest.raises(GitHubAuthError, match="HTTP 401 Unauthorized"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+    def test_create_review_http_403_forbidden(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 403
+        mock_response.headers = {"X-RateLimit-Remaining": "50"}
+        mock_response.text = "Resource not accessible by integration"
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="HTTP 403"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+    def test_create_review_http_404_not_found(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 404
+        mock_response.text = "Not Found"
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubNotFoundError, match="HTTP 404"):
+            client.create_pull_request_review("owner", "repo", 999, "1234567", "body")
+
+    def test_create_review_http_422_validation_error(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 422
+        mock_response.json.return_value = {
+            "message": "Validation Failed",
+            "errors": [
+                {"field": "line", "code": "invalid", "message": "Line must be part of the diff"}
+            ],
+        }
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubValidationError) as exc_info:
+            client.create_pull_request_review(
+                "owner",
+                "repo",
+                1,
+                "1234567",
+                "body",
+                comments=[{"path": "a.py", "body": "x", "line": 999}],
+            )
+
+        err = exc_info.value
+        assert "HTTP 422" in str(err)
+        assert len(err.errors) == 1
+        assert err.errors[0]["field"] == "line"
+
+    def test_create_review_http_429_rate_limit(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 429
+        mock_response.headers = {"Retry-After": "60"}
+        mock_response.text = "Too Many Requests"
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubRateLimitError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+        assert exc_info.value.retry_after == 60
+
+    def test_create_review_http_500_server_error(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="HTTP 500"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+    def test_create_review_timeout_raises_uncertain_write_error(self):
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.side_effect = requests.exceptions.Timeout("Read timeout")
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubUncertainWriteError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        assert issubclass(GitHubUncertainWriteError, GitHubNetworkError)
+        assert "timed out" in str(exc_info.value)
+        assert "Outcome is uncertain" in str(exc_info.value)
+
+    def test_create_review_connection_error_raises_uncertain_write_error(self):
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.side_effect = requests.exceptions.ConnectionError("Connection reset by peer")
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubUncertainWriteError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        assert "connection failed" in str(exc_info.value)
+
+    def test_create_review_request_exception(self):
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.side_effect = requests.exceptions.RequestException("Generic failure")
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="request error"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+    def test_create_review_malformed_json_response(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 201
+        mock_response.json.side_effect = ValueError("Invalid JSON")
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="Failed to parse JSON response"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+    def test_create_review_unexpected_json_type(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 201
+        mock_response.json.return_value = ["unexpected", "list"]
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="Unexpected response type"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+
+# ============================================================================
+# Get PR Reviews (Paginated GET) Tests
+# ============================================================================
+
+
+class TestGetPRReviews:
+    """Test get_pr_reviews pagination and error handling."""
+
+    def test_get_pr_reviews_single_page(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.json.return_value = [
+            {"id": 1, "state": "COMMENTED", "commit_id": "1111111"},
+            {"id": 2, "state": "APPROVED", "commit_id": "1111111"},
+        ]
+        mock_response.headers = {}
+        mock_response.links = {}
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        reviews = client.get_pr_reviews("owner", "repo", 10, per_page=50)
+
+        assert len(reviews) == 2
+        assert reviews[0]["id"] == 1
+        assert reviews[1]["id"] == 2
+        mock_session.get.assert_called_once_with(
+            "https://api.github.com/repos/owner/repo/pulls/10/reviews?per_page=50",
+            headers={
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "code-review-agent/1.0",
+            },
+            timeout=30.0,
+            allow_redirects=False,
+        )
+
+    def test_get_pr_reviews_pagination_two_pages(self):
+        # Page 1
+        resp_p1 = MagicMock(spec=requests.Response)
+        resp_p1.status_code = 200
+        resp_p1.json.return_value = [{"id": 10}, {"id": 11}]
+        resp_p1.headers = {
+            "Link": '<https://api.github.com/repos/owner/repo/pulls/5/reviews?per_page=2&page=2>; rel="next"'
+        }
+        resp_p1.links = {
+            "next": {
+                "url": "https://api.github.com/repos/owner/repo/pulls/5/reviews?per_page=2&page=2"
+            }
+        }
+
+        # Page 2
+        resp_p2 = MagicMock(spec=requests.Response)
+        resp_p2.status_code = 200
+        resp_p2.json.return_value = [{"id": 12}]
+        resp_p2.headers = {}
+        resp_p2.links = {}
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.side_effect = [resp_p1, resp_p2]
+
+        client = GitHubClient(session=mock_session)
+        reviews = client.get_pr_reviews("owner", "repo", 5, per_page=2)
+
+        assert len(reviews) == 3
+        assert [r["id"] for r in reviews] == [10, 11, 12]
+        assert mock_session.get.call_count == 2
+
+    def test_get_pr_reviews_pagination_fallback_header_regex(self):
+        # resp.links is empty dict, but Link header present
+        resp_p1 = MagicMock(spec=requests.Response)
+        resp_p1.status_code = 200
+        resp_p1.json.return_value = [{"id": 1}]
+        resp_p1.headers = {
+            "Link": '<https://api.github.com/repos/owner/repo/pulls/1/reviews?per_page=1&page=2>; rel="next"'
+        }
+        resp_p1.links = {}
+
+        resp_p2 = MagicMock(spec=requests.Response)
+        resp_p2.status_code = 200
+        resp_p2.json.return_value = [{"id": 2}]
+        resp_p2.headers = {}
+        resp_p2.links = {}
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.side_effect = [resp_p1, resp_p2]
+
+        client = GitHubClient(session=mock_session)
+        reviews = client.get_pr_reviews("owner", "repo", 1, per_page=1)
+
+        assert len(reviews) == 2
+        assert mock_session.get.call_count == 2
+
+    def test_get_pr_reviews_respects_max_pages(self):
+        # Continuous rel="next" links
+        def create_page(page_num):
+            r = MagicMock(spec=requests.Response)
+            r.status_code = 200
+            r.json.return_value = [{"id": page_num}]
+            next_url = f"https://api.github.com/repos/owner/repo/pulls/1/reviews?page={page_num + 1}"
+            r.headers = {"Link": f'<{next_url}>; rel="next"'}
+            r.links = {"next": {"url": next_url}}
+            return r
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.side_effect = [create_page(1), create_page(2), create_page(3)]
+
+        client = GitHubClient(session=mock_session)
+        reviews = client.get_pr_reviews("owner", "repo", 1, max_pages=2)
+
+        assert len(reviews) == 2
+        assert mock_session.get.call_count == 2
+
+    def test_get_pr_reviews_rejects_untrusted_pagination_url(self):
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 200
+        resp.json.return_value = [{"id": 1}]
+        resp.headers = {"Link": '<https://attacker.evil.com/leak>; rel="next"'}
+        resp.links = {"next": {"url": "https://attacker.evil.com/leak"}}
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = resp
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="Untrusted pagination URL"):
+            client.get_pr_reviews("owner", "repo", 1)
+
+    def test_get_pr_reviews_http_errors(self):
+        mock_session = MagicMock(spec=requests.Session)
+        mock_resp_401 = MagicMock(status_code=401)
+        mock_resp_404 = MagicMock(status_code=404)
+
+        mock_session.get.side_effect = [mock_resp_401, mock_resp_404]
+        client = GitHubClient(session=mock_session)
+
+        with pytest.raises(GitHubAuthError):
+            client.get_pr_reviews("owner", "repo", 1)
+        with pytest.raises(GitHubNotFoundError):
+            client.get_pr_reviews("owner", "repo", 1)
+
+    def test_get_pr_reviews_network_errors(self):
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.side_effect = requests.exceptions.Timeout("Timeout")
+        client = GitHubClient(session=mock_session)
+
+        with pytest.raises(GitHubNetworkError, match="timed out"):
+            client.get_pr_reviews("owner", "repo", 1)
+
+        mock_session.get.side_effect = requests.exceptions.ConnectionError("Refused")
+        with pytest.raises(GitHubNetworkError, match="connection failed"):
+            client.get_pr_reviews("owner", "repo", 1)
+
+    def test_get_pr_reviews_malformed_json_response(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.json.side_effect = ValueError("Bad JSON")
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="Failed to parse JSON response"):
+            client.get_pr_reviews("owner", "repo", 1)
+
+    def test_get_pr_reviews_unexpected_json_type(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"message": "not a list"}
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="Unexpected response type"):
+            client.get_pr_reviews("owner", "repo", 1)
+
+
+# ============================================================================
+# Token Redaction in Stage 1 Methods Tests
+# ============================================================================
+
+
+class TestTokenRedactionInReviewMethods:
+    """Test token scrub guarantees on write/review operations."""
+
+    def test_create_review_token_redacted_in_auth_error(self):
+        secret = "ghp_stage1_super_secret_pat_987654321"
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 401
+        mock_response.text = f"Bad credentials for bearer {secret}"
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token=secret, session=mock_session)
+        with pytest.raises(GitHubAuthError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        err_str = str(exc_info.value)
+        assert secret not in err_str
+        assert "[REDACTED]" in err_str
+
+    def test_create_review_token_redacted_in_422_error(self):
+        secret = "ghp_stage1_super_secret_pat_987654321"
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 422
+        mock_response.json.return_value = {
+            "message": f"Token {secret} cannot comment on this line",
+            "errors": [],
+        }
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token=secret, session=mock_session)
+        with pytest.raises(GitHubValidationError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        err_str = str(exc_info.value)
+        assert secret not in err_str
+        assert "[REDACTED]" in err_str
+
+    def test_create_review_token_redacted_in_timeout_error(self):
+        secret = "ghp_stage1_super_secret_pat_987654321"
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.side_effect = requests.exceptions.Timeout(
+            f"Timeout while communicating with auth header Bearer {secret}"
+        )
+
+        client = GitHubClient(token=secret, session=mock_session)
+        with pytest.raises(GitHubUncertainWriteError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        err_str = str(exc_info.value)
+        assert secret not in err_str
+
+    def test_get_pr_reviews_token_redacted_in_errors(self):
+        secret = "ghp_stage1_super_secret_pat_987654321"
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.side_effect = requests.exceptions.ConnectionError(
+            f"Failed to connect using token {secret}"
+        )
+
+        client = GitHubClient(token=secret, session=mock_session)
+        with pytest.raises(GitHubNetworkError) as exc_info:
+            client.get_pr_reviews("owner", "repo", 1)
+
+        err_str = str(exc_info.value)
+        assert secret not in err_str
+
+
+# ============================================================================
+# Stage 2: Security Checks & Hunk Span Tests
+# ============================================================================
+
+
+class TestStage1SecurityFixesAndHunkSpan:
+    """Tests for pagination path validation, redirect blocking, and hunk span resolution."""
+
+    def test_pagination_url_path_tampering_rejected(self):
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 200
+        resp.json.return_value = [{"id": 1}]
+        # Same host api.github.com, but different repo path
+        tampered_url = "https://api.github.com/repos/attacker/malicious-repo/pulls/1/reviews"
+        resp.headers = {"Link": f'<{tampered_url}>; rel="next"'}
+        resp.links = {"next": {"url": tampered_url}}
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = resp
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="Untrusted pagination URL"):
+            client.get_pr_reviews("owner", "repo", 1)
+
+    def test_create_review_rejects_3xx_redirect(self):
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 302
+        resp.headers = {"Location": "https://api.github.com/redirected"}
+        resp.text = "Found"
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = resp
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="Unexpected redirect response"):
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        # Verify allow_redirects=False was passed
+        _, kwargs = mock_session.post.call_args
+        assert kwargs["allow_redirects"] is False
+
+    def test_get_pr_reviews_rejects_3xx_redirect(self):
+        resp = MagicMock(spec=requests.Response)
+        resp.status_code = 301
+        resp.headers = {"Location": "https://api.github.com/redirected"}
+        resp.text = "Moved Permanently"
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = resp
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="Unexpected redirect response"):
+            client.get_pr_reviews("owner", "repo", 1)
+
+        _, kwargs = mock_session.get.call_args
+        assert kwargs["allow_redirects"] is False
+
+    def test_diff_file_find_hunk_for_span_success(self):
+        diff_text = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -10,6 +10,8 @@
+ context line 10
++added line 11
++added line 12
+ context line 13
+ context line 14
+"""
+        client = GitHubClient()
+        files = client.parse_diff_hunks(diff_text)
+        assert len(files) == 1
+        df = files[0]
+
+        # Valid span within single hunk (10 to 12)
+        hunk = df.find_hunk_for_span(10, 12)
+        assert hunk is not None
+        assert hunk.new_start == 10
+
+        # Exact boundary span
+        hunk_exact = df.find_hunk_for_span(10, 14)
+        assert hunk_exact is not None
+
+    def test_diff_file_find_hunk_for_span_cross_hunk_returns_none(self):
+        diff_text = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -10,3 +10,3 @@
+ line 10
+ line 11
+ line 12
+@@ -50,3 +50,3 @@
+ line 50
+ line 51
+ line 52
+"""
+        client = GitHubClient()
+        files = client.parse_diff_hunks(diff_text)
+        df = files[0]
+        assert len(df.hunks) == 2
+
+        # Span crossing hunk 1 (10..12) and hunk 2 (50..52)
+        assert df.find_hunk_for_span(11, 51) is None
+        assert df.find_hunk_for_span(12, 50) is None
+
+    def test_diff_file_find_hunk_for_span_out_of_bounds_and_inverted(self):
+        diff_text = """diff --git a/app.py b/app.py
+--- a/app.py
++++ b/app.py
+@@ -10,3 +10,3 @@
+ line 10
+ line 11
+ line 12
+"""
+        client = GitHubClient()
+        files = client.parse_diff_hunks(diff_text)
+        df = files[0]
+
+        # Out of bounds
+        assert df.find_hunk_for_span(5, 10) is None
+        assert df.find_hunk_for_span(10, 20) is None
+        assert df.find_hunk_for_span(100, 105) is None
+
+        # Inverted coordinates
+        assert df.find_hunk_for_span(12, 10) is None
+
+        # Zero or negative
+        assert df.find_hunk_for_span(0, 10) is None
+        assert df.find_hunk_for_span(-5, -1) is None
