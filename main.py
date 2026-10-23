@@ -290,7 +290,7 @@ def display_agent_errors(errors: list[str]) -> None:
     print("SECTION: AGENT & PROVIDER WARNINGS / ERRORS")
     print(format_separator("!"))
     for err in errors:
-        print(f"  [!] {err}")
+        print(f"  [!] {redact_token(err)}")
     print()
 
 
@@ -595,6 +595,12 @@ def run_pr_pipeline(
         out(f"PR WORKFLOW FAILED: {safe_msg}")
         out(format_separator("="))
         return 2
+
+    # Display errors / warnings in PR preview mode if any
+    wf_state = getattr(result, "workflow_state", None) or {}
+    agent_errors = wf_state.get("agent_errors", []) if isinstance(wf_state, dict) else []
+    if agent_errors:
+        display_agent_errors(agent_errors)
 
     # Exit code based on verdict and issues
     if not result.success:

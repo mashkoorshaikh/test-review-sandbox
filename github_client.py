@@ -34,6 +34,8 @@ _TOKEN_PATTERNS = [
     re.compile(r"(?i)\b(bearer\s+)[a-zA-Z0-9_\-\.]+"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b"),
+    re.compile(r"\bsk-[a-zA-Z0-9_\-]{20,}\b"),
+    re.compile(r"\bsk-proj-[a-zA-Z0-9_\-]{20,}\b"),
 ]
 
 _REPO_NAME_RE = re.compile(r"^[a-zA-Z0-9_.-]+$")
@@ -51,11 +53,18 @@ def redact_token(text: str, token: str | None = None) -> str:
     sanitized = str(text)
     if token and len(token) >= 3:
         sanitized = sanitized.replace(token, "[REDACTED]")
+    for _env in ("GITHUB_TOKEN", "GH_TOKEN", "OPENAI_API_KEY"):
+        _v = os.getenv(_env, "").strip()
+        if _v and len(_v) >= 4:
+            sanitized = sanitized.replace(_v, "[REDACTED]")
     for pattern in _TOKEN_PATTERNS:
         if pattern.groups == 1:
             sanitized = pattern.sub(r"\1[REDACTED]", sanitized)
         else:
-            sanitized = pattern.sub("[REDACTED_GH_TOKEN]", sanitized)
+            if "sk-" in pattern.pattern:
+                sanitized = pattern.sub("[REDACTED_API_KEY]", sanitized)
+            else:
+                sanitized = pattern.sub("[REDACTED_GH_TOKEN]", sanitized)
     return sanitized
 
 

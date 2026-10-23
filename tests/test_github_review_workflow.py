@@ -1064,6 +1064,77 @@ class TestVerdictMapping:
         assert has_fatal_analysis_error([]) is False
         assert has_fatal_analysis_error(["Warning: linter found 2 notices"]) is False
 
+    def test_test_writer_http_401_auth_error_maps_to_comment(self):
+        """HTTP 401 / invalid API key in TestWriterAgent is an advisory warning, not fatal."""
+        auth_err = (
+            "Test-Writer Agent Provider Error: OpenAIAuthenticationError, "
+            "HTTP 401, invalid_api_key."
+        )
+        assert determine_review_verdict([], [auth_err]) == "COMMENT"
+
+    def test_test_validation_and_storage_failures_map_to_comment(self):
+        """Test validation or workspace storage errors are advisory and map to COMMENT."""
+        val_err = "Test validation failed for 'calc.py': Content is too short (< 20 chars) to be valid test code."
+        assert determine_review_verdict([], [val_err]) == "COMMENT"
+
+        store_err = "Test storage error for 'calc.py': disk full"
+        assert determine_review_verdict([], [store_err]) == "COMMENT"
+
+    def test_genuine_fatal_primary_tool_failure_maps_to_request_changes(self):
+        """Primary static analysis tool crashes or timeouts map to REQUEST_CHANGES."""
+        assert determine_review_verdict([], ["Fatal error: Ruff crashed with SIGSEGV"]) == "REQUEST_CHANGES"
+        assert determine_review_verdict([], ["Linter tool error: Failed to parse configuration"]) == "REQUEST_CHANGES"
+        assert determine_review_verdict([], ["Security tool error: Bandit process timed out after 30s"]) == "REQUEST_CHANGES"
+        assert determine_review_verdict([], ["Tool execution failed: non-zero exit"]) == "REQUEST_CHANGES"
+
+    def test_fatal_primary_failure_overrides_auxiliary_advisory_warning(self):
+        """When both a primary tool crash and an auxiliary warning exist, fatal failure takes precedence."""
+        assert determine_review_verdict(
+            [],
+            [
+                "Fatal error: Ruff crashed",
+                "Test-Writer Agent Provider Error: OpenAIAuthenticationError, HTTP 401, invalid_api_key.",
+            ],
+        ) == "REQUEST_CHANGES"
+
+    def test_generate_review_summary_surfaces_advisory_warnings_and_redacts_credentials(self):
+        """Executive summary surfaces advisory warnings and redacts secrets."""
+        from github_client import PRMetadata
+        meta = PRMetadata(
+            owner="octocat",
+            repo="Hello-World",
+            pr_number=42,
+            title="Test PR",
+            body="Desc",
+            state="open",
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            base_sha="base_sha",
+            head_branch="feature",
+            base_branch="main",
+            author="alice",
+            html_url="https://github.com/octocat/Hello-World/pull/42",
+        )
+        workflow_state = {
+            "agent_errors": [
+                "Test-Writer Agent Provider Error: OpenAIAuthenticationError sk-1234567890abcdef1234567890 HTTP 401"
+            ],
+            "final_review_report": {},
+        }
+        summary = generate_review_summary(
+            meta=meta,
+            verdict="COMMENT",
+            total_issues=0,
+            inline_comments_count=0,
+            unmapped_issues_count=0,
+            workflow_state=workflow_state,
+            changed_files=["calc.py"],
+        )
+        assert "Auxiliary Agent Warnings" in summary
+        assert "sk-1234567890abcdef1234567890" not in summary
+        assert "[REDACTED" in summary
+        assert "Primary Static Analysis Status:" in summary
+        assert "PASSED (Ruff & Bandit completed)" in summary
+
 
 # ============================================================================
 # 10. Stage 4: Pre-Publication Revalidation Tests

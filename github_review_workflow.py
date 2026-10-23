@@ -67,7 +67,7 @@ from pr_workspace import (
 )
 from state import ReviewState
 from tools import ToolResult
-from workflow import run_review_pipeline
+from workflow import run_review_pipeline, split_agent_errors
 
 logger = logging.getLogger(__name__)
 
@@ -368,16 +368,12 @@ def is_high_confidence_critical_issue(issue: dict[str, Any]) -> bool:
 
 def has_fatal_analysis_error(agent_errors: list[str]) -> bool:
     """
-    Check if agent errors contain fatal analysis failures or tool crashes.
+    Check if agent errors contain genuine fatal analysis failures or primary tool crashes.
+    Auxiliary advisory warnings (such as Test-Writer provider errors or test validation failures)
+    are excluded from fatal error determination and do not trigger REQUEST_CHANGES.
     """
-    if not agent_errors:
-        return False
-    fatal_indicators = ("error", "failed", "crash", "exception", "timeout", "fatal")
-    return any(
-        any(ind in err.lower() for ind in fatal_indicators)
-        for err in agent_errors
-        if err and err.strip()
-    )
+    fatal_errors, _ = split_agent_errors(agent_errors)
+    return len(fatal_errors) > 0
 
 
 def determine_review_verdict(
@@ -428,6 +424,9 @@ def generate_review_summary(
     sandbox_skipped = summary_rep.get("sandbox_skipped", False)
     patch_verified = summary_rep.get("patch_verified", False)
 
+    agent_errors = workflow_state.get("agent_errors", [])
+    fatal_errors, advisory_warnings = split_agent_errors(agent_errors)
+
     lines = [
         f"### Automated Code Review & Security Report: PR #{meta.pr_number}",
         f"**Repository:** `{meta.owner}/{meta.repo}`  ",
@@ -440,7 +439,10 @@ def generate_review_summary(
         f"- **Total code issues found:** {total_issues}",
         f"- **Proposed inline comments (anchored in diff):** {inline_comments_count}",
         f"- **File-level / unmapped findings:** {unmapped_issues_count}",
+        f"- **Primary Static Analysis Status:** {'FAILED (' + str(len(fatal_errors)) + ' tool error(s))' if fatal_errors else 'PASSED (Ruff & Bandit completed)'}",
     ]
+    if advisory_warnings:
+        lines.append(f"- **Auxiliary Agent Status:** {len(advisory_warnings)} non-blocking advisory warning(s)")
 
     # File-level & unmapped findings detail
     if unmapped_issues:
@@ -470,6 +472,35 @@ def generate_review_summary(
             lines.append("- **Automated Patch Verification:** Minimal patch generated and verified!")
     elif sandbox_skipped:
         lines.append("- **Docker Sandbox Test Execution:** Skipped (Docker unavailable or disabled)")
+
+    # Required primary tool failures detail
+    if fatal_errors:
+        lines.extend([
+            "",
+            "#### Required Primary Tool Failures (Analysis Incomplete)",
+            (
+                "> [!WARNING]\n"
+                "> One or more required primary analysis tools failed or timed out. "
+                "The review verdict is set to REQUEST_CHANGES to prevent merging unanalyzed code:"
+            ),
+        ])
+        for fe in fatal_errors:
+            safe_fe = redact_token(fe)
+            lines.append(f"- **[Primary Tool Failure]** {safe_fe}")
+
+    # Auxiliary agent warnings detail
+    if advisory_warnings:
+        lines.extend([
+            "",
+            "#### Auxiliary Agent Warnings (Non-Blocking)",
+            (
+                "The following non-blocking warnings occurred during auxiliary agent analysis "
+                "(such as AI test generation or test validation) and did not block the review:"
+            ),
+        ])
+        for aw in advisory_warnings:
+            safe_aw = redact_token(aw)
+            lines.append(f"- **[Advisory Warning]** {safe_aw}")
 
     # Advisory notice
     lines.extend([
@@ -1303,7 +1334,7 @@ def run_pr_review_workflow(
             out(preview_text)
 
         report = workflow_state.get("final_review_report", {})
-        has_execution_error = any("error" in e.lower() for e in agent_errors)
+        has_execution_error = has_fatal_analysis_error(agent_errors)
 
         return PRReviewResult(
             owner=owner,

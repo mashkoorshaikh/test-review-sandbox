@@ -57,6 +57,45 @@ def _sandbox_result_to_dict(result: SandboxResult) -> dict[str, Any]:
     }
 
 
+def is_advisory_agent_error(err: str) -> bool:
+    """
+    Check if an error string represents an auxiliary/advisory agent warning
+    (such as Test-Writer Agent provider/auth errors, test validation failures,
+    or test storage warnings) rather than a failure of required primary analysis tools.
+    """
+    lower = str(err).strip().lower()
+    advisory_indicators = (
+        "test-writer",
+        "test validation",
+        "test storage",
+        "test suggestion",
+        "ai test",
+    )
+    return any(ind in lower for ind in advisory_indicators)
+
+
+def split_agent_errors(agent_errors: list[str]) -> tuple[list[str], list[str]]:
+    """
+    Split agent errors into (fatal_primary_errors, advisory_warnings).
+    """
+    fatal_errors: list[str] = []
+    advisory_warnings: list[str] = []
+    fatal_indicators = ("error", "failed", "crash", "exception", "timeout", "fatal")
+
+    for err in agent_errors:
+        if not err or not str(err).strip():
+            continue
+        err_str = str(err).strip()
+        if is_advisory_agent_error(err_str):
+            advisory_warnings.append(err_str)
+        elif any(ind in err_str.lower() for ind in fatal_indicators):
+            fatal_errors.append(err_str)
+        else:
+            advisory_warnings.append(err_str)
+
+    return fatal_errors, advisory_warnings
+
+
 def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
     """
     Synthesize all agent outputs from the graph state into a structured report.
@@ -83,11 +122,8 @@ def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
     sandbox_executed = any(r.get("executed", False) for r in sandbox_results)
 
     if errors:
-        status = (
-            "FAILED"
-            if (total_code_issues == 0 and any("error" in e.lower() for e in errors))
-            else "COMPLETED_WITH_WARNINGS"
-        )
+        fatal_errors, _ = split_agent_errors(errors)
+        status = "FAILED" if fatal_errors else "COMPLETED_WITH_WARNINGS"
     elif total_code_issues > 0:
         status = "ATTENTION_REQUIRED"
     else:
