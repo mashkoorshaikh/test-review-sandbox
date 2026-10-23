@@ -33,6 +33,7 @@ from langgraph.graph import END, START, StateGraph
 from agents import LinterAgent, SecurityAgent, TestWriterAgent
 from debugging_agent import MAX_DEBUG_ATTEMPTS, DebuggingAgent
 from sandbox_runner import SandboxResult, is_docker_available, run_tests_in_sandbox
+from semantic_analyzer import run_semantic_analysis
 from state import (
     ReviewState,
     create_initial_state,
@@ -103,6 +104,7 @@ def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
     target = state.get("target_path", "")
     ruff_issues = state.get("ruff_findings", [])
     bandit_issues = state.get("bandit_findings", [])
+    semantic_issues = state.get("semantic_findings", [])
     ai_explanations = state.get("ai_explanations", {})
     test_suggestions = state.get("generated_test_suggestions", [])
     errors = state.get("agent_errors", [])
@@ -115,7 +117,7 @@ def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
     debug_attempts = state.get("debug_attempts", 0)
     sandbox_skipped = state.get("sandbox_skipped", False)
 
-    total_code_issues = len(ruff_issues) + len(bandit_issues)
+    total_code_issues = len(ruff_issues) + len(bandit_issues) + len(semantic_issues)
 
     # Determine sandbox/test status
     sandbox_passed = any(r.get("passed", False) for r in sandbox_results)
@@ -137,6 +139,7 @@ def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
             "total_issues_found": total_code_issues,
             "ruff_issues_count": len(ruff_issues),
             "bandit_issues_count": len(bandit_issues),
+            "semantic_issues_count": len(semantic_issues),
             "agent_error_count": len(errors),
             # Milestone 3 summary
             "stored_test_files_count": len(stored_test_files),
@@ -150,6 +153,7 @@ def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
         "deterministic_findings": {
             "ruff": ruff_issues,
             "bandit": bandit_issues,
+            "semantic": semantic_issues,
         },
         "ai_explanations": ai_explanations,
         "test_suggestions": test_suggestions,
@@ -164,6 +168,7 @@ def build_review_graph(
     llm: BaseChatModel | None = None,
     ruff_runner: Callable[..., ToolResult] | None = None,
     bandit_runner: Callable[..., ToolResult] | None = None,
+    semantic_runner: Callable[..., ToolResult] | None = None,
     workspace_root: str | None = None,
     enable_sandbox: bool = True,
     enable_debugging: bool = True,
@@ -178,6 +183,7 @@ def build_review_graph(
         llm: Optional language model instance.
         ruff_runner: Callable for executing Ruff (defaults to tools.run_ruff).
         bandit_runner: Callable for executing Bandit (defaults to tools.run_bandit).
+        semantic_runner: Callable for executing semantic AST analysis (defaults to semantic_analyzer.run_semantic_analysis).
         workspace_root: Optional root directory override for workspace sandboxing.
         enable_sandbox: If False, sandbox execution node is bypassed.
         enable_debugging: If False, debugging agent is never invoked.
@@ -188,6 +194,7 @@ def build_review_graph(
     Returns:
         Compiled StateGraph runnable.
     """
+    actual_semantic = semantic_runner or run_semantic_analysis
     linter_agent = LinterAgent(
         llm=llm, ruff_runner=ruff_runner, workspace_root=workspace_root
     )
@@ -220,6 +227,18 @@ def build_review_graph(
     def security_node(state: ReviewState) -> dict[str, Any]:
         target = state.get("target_path", "")
         return security_agent.run(target)
+
+    def semantic_node(state: ReviewState) -> dict[str, Any]:
+        target = state.get("target_path", "")
+        res = actual_semantic(target)
+        findings = [issue_to_dict(i) for i in res.issues]
+        errs: list[str] = []
+        if not res.success and res.error_message:
+            errs.append(f"SemanticAnalyzer: {res.error_message}")
+        return {
+            "semantic_findings": findings,
+            "agent_errors": errs,
+        }
 
     def test_writer_node(state: ReviewState) -> dict[str, Any]:
         target = state.get("target_path", "")
@@ -379,18 +398,21 @@ def build_review_graph(
     # Register nodes
     builder.add_node("linter_agent", linter_node)
     builder.add_node("security_agent", security_node)
+    builder.add_node("semantic_agent", semantic_node)
     builder.add_node("test_writer_agent", test_writer_node)
     builder.add_node("sandbox_runner", sandbox_node)
     builder.add_node("debugging_agent", debugging_node)
     builder.add_node("orchestrator", orchestrator_node)
 
-    # Fan-out: START executes Linter and Security agents in parallel
+    # Fan-out: START executes Linter, Security, and Semantic agents in parallel
     builder.add_edge(START, "linter_agent")
     builder.add_edge(START, "security_agent")
+    builder.add_edge(START, "semantic_agent")
 
-    # Fan-in: Wait for both Linter and Security before running Test-Writer
+    # Fan-in: Wait for Linter, Security, and Semantic before running Test-Writer
     builder.add_edge("linter_agent", "test_writer_agent")
     builder.add_edge("security_agent", "test_writer_agent")
+    builder.add_edge("semantic_agent", "test_writer_agent")
 
     # Conditional: test_writer -> sandbox or orchestrator
     builder.add_conditional_edges(
@@ -423,19 +445,23 @@ def run_deterministic_only(
     target_path: str,
     ruff_runner: Callable[..., ToolResult] | None = None,
     bandit_runner: Callable[..., ToolResult] | None = None,
+    semantic_runner: Callable[..., ToolResult] | None = None,
 ) -> ReviewState:
     """
-    Run purely deterministic scanners (Ruff and Bandit) without AI agents.
+    Run purely deterministic scanners (Ruff, Bandit, and Semantic Analyzer) without AI agents.
     """
     actual_ruff = ruff_runner or run_ruff
     actual_bandit = bandit_runner or run_bandit
+    actual_semantic = semantic_runner or run_semantic_analysis
 
     ruff_res = actual_ruff(target_path)
     bandit_res = actual_bandit(target_path)
+    semantic_res = actual_semantic(target_path)
 
     state = create_initial_state(target_path)
     state["ruff_findings"] = [issue_to_dict(i) for i in ruff_res.issues]
     state["bandit_findings"] = [issue_to_dict(i) for i in bandit_res.issues]
+    state["semantic_findings"] = [issue_to_dict(i) for i in semantic_res.issues]
     state["ai_explanations"] = {
         "linter": "[AI analysis disabled by user (--no-ai).]",
         "security": "[AI analysis disabled by user (--no-ai).]",
@@ -449,6 +475,8 @@ def run_deterministic_only(
         errors.append(f"Ruff: {ruff_res.error_message}")
     if not bandit_res.success:
         errors.append(f"Bandit: {bandit_res.error_message}")
+    if not semantic_res.success and semantic_res.error_message:
+        errors.append(f"SemanticAnalyzer: {semantic_res.error_message}")
     state["agent_errors"] = errors
     state["final_review_report"] = create_orchestrator_report(state)
 
@@ -461,6 +489,7 @@ def run_review_pipeline(
     llm: BaseChatModel | None = None,
     ruff_runner: Callable[..., ToolResult] | None = None,
     bandit_runner: Callable[..., ToolResult] | None = None,
+    semantic_runner: Callable[..., ToolResult] | None = None,
     workspace_root: str | None = None,
     enable_sandbox: bool = True,
     enable_debugging: bool = True,
@@ -479,12 +508,14 @@ def run_review_pipeline(
             target_path=target_path,
             ruff_runner=ruff_runner,
             bandit_runner=bandit_runner,
+            semantic_runner=semantic_runner,
         )
 
     app = build_review_graph(
         llm=llm,
         ruff_runner=ruff_runner,
         bandit_runner=bandit_runner,
+        semantic_runner=semantic_runner,
         workspace_root=workspace_root,
         enable_sandbox=enable_sandbox,
         enable_debugging=enable_debugging,

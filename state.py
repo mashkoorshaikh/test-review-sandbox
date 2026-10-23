@@ -62,6 +62,7 @@ class ReviewState(TypedDict, total=False):
     patch_verified: bool                   # Did any proposed patch pass sandbox tests?
     debug_attempts: int                    # Number of debugging attempts used
     sandbox_skipped: bool                  # Was sandbox skipped (Docker unavailable)?
+    semantic_findings: list[dict[str, Any]]  # Milestone 5: AST semantic bug findings
 
 
 def issue_to_dict(issue: Issue) -> dict[str, Any]:
@@ -80,6 +81,9 @@ def dict_to_issue(data: dict[str, Any]) -> Issue:
         severity=data.get("severity", "WARNING"),
         tool=data.get("tool", "unknown"),
         fixable=data.get("fixable", False),
+        confidence=data.get("confidence", "HIGH"),
+        explanation=data.get("explanation", ""),
+        suggested_fix=data.get("suggested_fix", ""),
     )
 
 
@@ -89,6 +93,7 @@ def create_initial_state(target_path: str) -> ReviewState:
         "target_path": target_path,
         "ruff_findings": [],
         "bandit_findings": [],
+        "semantic_findings": [],
         "ai_explanations": {},
         "generated_test_suggestions": [],
         "agent_errors": [],

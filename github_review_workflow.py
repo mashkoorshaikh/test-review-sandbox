@@ -312,6 +312,13 @@ def build_inline_comments(
             body_parts.append(f"\n**Linter Context:**\n{explanations['linter']}")
         elif tool.lower() == "bandit" and "security" in explanations:
             body_parts.append(f"\n**Security Threat Assessment:**\n{explanations['security']}")
+        elif tool.lower() == "semantic_analyzer":
+            exp = issue.get("explanation")
+            fix = issue.get("suggested_fix")
+            if exp:
+                body_parts.append(f"\n**Analysis:**\n{exp}")
+            if fix:
+                body_parts.append(f"\n**Suggested Fix:**\n{fix}")
 
         body_parts.append(
             "\n> *Advisory Notice:* Automated analysis findings and AI explanations represent hypotheses. "
@@ -1171,6 +1178,7 @@ def run_pr_review_workflow(
     clock: Callable[[], float] | None = None,
     ruff_runner: Callable[..., ToolResult] | None = None,
     bandit_runner: Callable[..., ToolResult] | None = None,
+    semantic_runner: Callable[..., ToolResult] | None = None,
     sandbox_runner_fn: Callable[..., Any] | None = None,
 ) -> PRReviewResult:
     """
@@ -1260,6 +1268,7 @@ def run_pr_review_workflow(
             llm=llm,
             ruff_runner=ruff_runner,
             bandit_runner=bandit_runner,
+            semantic_runner=semantic_runner,
             workspace_root=str(workspace_dir),
             enable_sandbox=enable_sandbox,
             enable_debugging=enable_debugging,
@@ -1270,7 +1279,8 @@ def run_pr_review_workflow(
         # 7. Collect all deterministic findings from pipeline state
         ruff_findings = workflow_state.get("ruff_findings", [])
         bandit_findings = workflow_state.get("bandit_findings", [])
-        all_issues = ruff_findings + bandit_findings
+        semantic_findings = workflow_state.get("semantic_findings", [])
+        all_issues = ruff_findings + bandit_findings + semantic_findings
         ai_explanations = workflow_state.get("ai_explanations", {})
         agent_errors = workflow_state.get("agent_errors", [])
 

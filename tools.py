@@ -49,6 +49,9 @@ class Issue:
     severity: str = "WARNING"
     tool: str = "unknown"
     fixable: bool = False
+    confidence: str = "HIGH"
+    explanation: str = ""
+    suggested_fix: str = ""
 
 
 @dataclass

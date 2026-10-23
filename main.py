@@ -28,6 +28,7 @@ from langchain_core.language_models import BaseChatModel
 
 from llm_config import is_api_key_configured
 from sandbox_runner import is_docker_available
+from semantic_analyzer import run_semantic_analysis
 from tools import ToolResult, run_bandit, run_ruff
 from workflow import run_review_pipeline
 
@@ -338,17 +339,22 @@ def run_pipeline(
         print()
 
     # Step 1: Run deterministic Ruff linter
-    print("[1/2] Running Ruff Linter...")
+    print("[1/3] Running Ruff Linter...")
     ruff_result = run_ruff(normalized_path)
 
     # Step 2: Run deterministic Bandit security scanner
-    print("[2/2] Running Bandit Security Scanner...")
+    print("[2/3] Running Bandit Security Scanner...")
     bandit_result = run_bandit(normalized_path)
+
+    # Step 3: Run deterministic Semantic Bug Analyzer
+    print("[3/3] Running Semantic Bug Analyzer...")
+    semantic_result = run_semantic_analysis(normalized_path)
     print()
 
     results: dict[str, ToolResult] = {
         "Ruff": ruff_result,
         "Bandit": bandit_result,
+        "Semantic": semantic_result,
     }
 
     # Display Deterministic Summary & Detailed Findings
