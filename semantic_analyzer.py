@@ -7,6 +7,9 @@ Provides pure AST-based inspection of Python source code to detect runtime hazar
   - SEM002: Potential or definite unhandled None dereference (AttributeError / TypeError)
             on literal None, variables known to be None, None-defaulted parameters,
             or unvalidated regex match chaining.
+  - SEM003: Provably out-of-bounds constant integer sequence indexing (IndexError)
+            on locally known literal lists and tuples, or provably missing constant-key
+            access (KeyError) on locally known literal dictionaries.
 
 Guarantees:
   - Deterministic: 100% reproducible results with zero random or heuristic variation.
@@ -20,6 +23,10 @@ Confidence Classification:
       * SEM002: Direct dereference of literal None ('None.attr', 'None[k]', 'None()'),
                 variables in branches where explicitly known to be None ('if x is None: x.attr'),
                 or local variables assigned None without reassignment.
+      * SEM003: Direct literal sequence out-of-bounds indexing ('[1, 2][5]', '()[0]'),
+                direct literal dictionary missing key ('{"a": 1}["b"]'),
+                or local variables assigned literal collections accessed out of bounds /
+                with missing key without intervening mutation or reassignment.
   - MEDIUM:
       * SEM001: Variable or dynamic expression divisors without non-zero guards.
       * SEM002: None-defaulted function parameters accessed without an effective guard,
@@ -30,14 +37,17 @@ Exception-Handling Policy:
       * SEM001: ZeroDivisionError, ArithmeticError, Exception, BaseException, or bare except.
       * SEM002: AttributeError (for attribute access), TypeError (for subscript/call),
                 Exception, BaseException, or bare except.
-  - Unrelated handlers (e.g. KeyError, ValueError) do NOT suppress findings.
+      * SEM003: IndexError (for sequence indexing), KeyError (for dictionary key lookup),
+                LookupError, Exception, BaseException, or bare except.
+  - Unrelated handlers (e.g. KeyError for SEM002 subscript, ValueError for SEM003) do NOT suppress findings.
   - Operations outside the try body are NOT suppressed.
 
 Unsupported Control-Flow Cases (Analyzer Limitations):
-  - Interprocedural invariants (caller guaranteeing parameter values).
+  - Interprocedural invariants (caller guaranteeing parameter values or collection bounds).
   - External validation helpers (e.g. 'if is_valid(b): ...').
   - Dynamic loop modifications (e.g. 'while b is None: ...').
   - Aliasing and object attributes modified outside local scope.
+  - Dynamic indices, non-constant keys, or collections with dynamic unpacking.
 """
 
 from __future__ import annotations
@@ -45,7 +55,9 @@ from __future__ import annotations
 import ast
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from tools import Issue, ToolResult
 
@@ -146,6 +158,42 @@ def _catches_type_error(handler: ast.ExceptHandler) -> bool:
             return expr.id in ("TypeError", "Exception", "BaseException")
         if isinstance(expr, ast.Attribute):
             return expr.attr in ("TypeError", "Exception", "BaseException")
+        return False
+
+    if isinstance(handler.type, ast.Tuple):
+        return any(_type_matches(elt) for elt in handler.type.elts)
+
+    return _type_matches(handler.type)
+
+
+def _catches_index_error(handler: ast.ExceptHandler) -> bool:
+    """Check if an except handler catches IndexError or its base classes."""
+    if handler.type is None:
+        return True
+
+    def _type_matches(expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in ("IndexError", "LookupError", "Exception", "BaseException")
+        if isinstance(expr, ast.Attribute):
+            return expr.attr in ("IndexError", "LookupError", "Exception", "BaseException")
+        return False
+
+    if isinstance(handler.type, ast.Tuple):
+        return any(_type_matches(elt) for elt in handler.type.elts)
+
+    return _type_matches(handler.type)
+
+
+def _catches_key_error(handler: ast.ExceptHandler) -> bool:
+    """Check if an except handler catches KeyError or its base classes."""
+    if handler.type is None:
+        return True
+
+    def _type_matches(expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in ("KeyError", "LookupError", "Exception", "BaseException")
+        if isinstance(expr, ast.Attribute):
+            return expr.attr in ("KeyError", "LookupError", "Exception", "BaseException")
         return False
 
     if isinstance(handler.type, ast.Tuple):
@@ -323,6 +371,133 @@ def _is_regex_match_call(node: ast.AST) -> tuple[bool, str]:
         ):
             return True, f"re.{func.attr}()"
     return False, ""
+
+
+# Dedicated sentinel object representing an unknown/unsupported literal value
+_UNKNOWN_KEY = object()
+
+
+def _extract_constant_value(node: ast.AST) -> Any:
+    """Extract constant value from AST node, or _UNKNOWN_KEY if dynamic/unsupported."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        val = _extract_constant_value(node.operand)
+        if isinstance(val, (int, float, complex)) and not isinstance(val, bool):
+            return -val
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+        val = _extract_constant_value(node.operand)
+        if isinstance(val, (int, float, complex)) and not isinstance(val, bool):
+            return +val
+    if isinstance(node, ast.Tuple):
+        elts: list[Any] = []
+        for elt in node.elts:
+            v = _extract_constant_value(elt)
+            if v is _UNKNOWN_KEY:
+                return _UNKNOWN_KEY
+            elts.append(v)
+        try:
+            return tuple(elts)
+        except Exception:  # noqa: BLE001
+            return _UNKNOWN_KEY
+    return _UNKNOWN_KEY
+
+
+def _extract_sequence_length(node: ast.List | ast.Tuple) -> int | None:
+    """Extract length of literal list or tuple, or None if any element is starred unpacking."""
+    for elt in node.elts:
+        if isinstance(elt, ast.Starred):
+            return None
+    return len(node.elts)
+
+
+def _extract_dict_literal_keys(node: ast.Dict) -> set[Any] | None:
+    """Extract set of constant keys from an ast.Dict, or None if any key/unpacking is dynamic."""
+    keys: set[Any] = set()
+    for k in node.keys:
+        if k is None:
+            # **other unpacking
+            return None
+        val = _extract_constant_value(k)
+        if val is _UNKNOWN_KEY:
+            return None
+        try:
+            keys.add(val)
+        except TypeError:
+            # unhashable key
+            return None
+    return keys
+
+
+def _extract_membership_guard(test: ast.AST) -> tuple[str, Any, bool] | None:
+    """
+    Check if test expression is 'key in dict_var' or 'key not in dict_var'.
+    Returns (var_name, key_value, is_in_operator) or None.
+    """
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        op = test.ops[0]
+        if isinstance(op, ast.In):
+            key_val = _extract_constant_value(test.left)
+            if key_val is not _UNKNOWN_KEY and isinstance(test.comparators[0], ast.Name):
+                return test.comparators[0].id, key_val, True
+        elif isinstance(op, ast.NotIn):
+            key_val = _extract_constant_value(test.left)
+            if key_val is not _UNKNOWN_KEY and isinstance(test.comparators[0], ast.Name):
+                return test.comparators[0].id, key_val, False
+    return None
+
+
+def _extract_all_modified_names(node: ast.AST) -> set[str]:
+    """Extract all variable names that are modified, assigned, deleted, or called in an AST subtree."""
+    names: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Assign):
+            for t in child.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+                elif isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
+                    names.add(t.value.id)
+                elif isinstance(t, (ast.Tuple, ast.List)):
+                    for elt in ast.walk(t):
+                        if isinstance(elt, ast.Name):
+                            names.add(elt.id)
+        elif isinstance(child, (ast.AnnAssign, ast.AugAssign)):
+            if isinstance(child.target, ast.Name):
+                names.add(child.target.id)
+            elif isinstance(child.target, ast.Subscript) and isinstance(child.target.value, ast.Name):
+                names.add(child.target.value.id)
+        elif isinstance(child, ast.Delete):
+            for t in child.targets:
+                if isinstance(t, ast.Name):
+                    names.add(t.id)
+                elif isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name):
+                    names.add(t.value.id)
+        elif isinstance(child, ast.Call):
+            if isinstance(child.func, ast.Attribute) and isinstance(child.func.value, ast.Name):
+                names.add(child.func.value.id)
+            for arg in child.args:
+                if isinstance(arg, ast.Name):
+                    names.add(arg.id)
+            for kw in child.keywords:
+                if isinstance(kw.value, ast.Name):
+                    names.add(kw.value.id)
+    return names
+
+
+@dataclass
+class CollectionLiteralState:
+    kind: str  # "LIST", "TUPLE", "DICT"
+    length: int | None = None
+    known_keys: set[Any] | None = None
+    guarded_keys: set[Any] = field(default_factory=set)
+
+    def copy(self) -> CollectionLiteralState:
+        return CollectionLiteralState(
+            kind=self.kind,
+            length=self.length,
+            known_keys=set(self.known_keys) if self.known_keys is not None else None,
+            guarded_keys=set(self.guarded_keys),
+        )
 
 
 class DivisionByZeroDetector(ast.NodeVisitor):
@@ -1003,9 +1178,377 @@ class NoneDereferenceDetector(ast.NodeVisitor):
             )
 
 
+class IndexAndKeyAccessDetector(ast.NodeVisitor):
+    """
+    AST visitor that scans for provably out-of-bounds constant integer sequence
+    indexing or provably missing constant dictionary keys (SEM003):
+      - Direct out-of-bounds index on literal list or tuple [HIGH confidence]
+      - Direct missing key on literal dictionary [HIGH confidence]
+      - Local variable assigned literal list/tuple accessed out-of-bounds without mutation [HIGH confidence]
+      - Local variable assigned literal dictionary accessed with absent key without mutation [HIGH confidence]
+    """
+
+    def __init__(self, file_path: str = "<string>") -> None:
+        self.file_path = file_path
+        self.issues: list[Issue] = []
+        self._try_handlers_stack: list[list[ast.ExceptHandler]] = []
+        self._collection_stack: list[dict[str, CollectionLiteralState]] = [{}]
+
+    @property
+    def _current_collections(self) -> dict[str, CollectionLiteralState]:
+        return self._collection_stack[-1]
+
+    def _is_enclosed_in_index_error_handler(self) -> bool:
+        for handlers in self._try_handlers_stack:
+            if any(_catches_index_error(h) for h in handlers):
+                return True
+        return False
+
+    def _is_enclosed_in_key_error_handler(self) -> bool:
+        for handlers in self._try_handlers_stack:
+            if any(_catches_key_error(h) for h in handlers):
+                return True
+        return False
+
+    def visit_Try(self, node: ast.Try) -> None:
+        self._try_handlers_stack.append(node.handlers)
+        for stmt in node.body:
+            self.visit(stmt)
+        self._try_handlers_stack.pop()
+
+        for handler in node.handlers:
+            self.visit(handler)
+
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+        for stmt in node.finalbody:
+            self.visit(stmt)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._collection_stack.append({})
+        self._visit_statement_sequence(node.body)
+        self._collection_stack.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._collection_stack.append({})
+        self._visit_statement_sequence(node.body)
+        self._collection_stack.pop()
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._collection_stack.append({})
+        self._visit_statement_sequence(node.body)
+        self._collection_stack.pop()
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+
+        guard = _extract_membership_guard(node.test)
+
+        # 1. Body branch
+        body_collections = {k: v.copy() for k, v in self._current_collections.items()}
+        if guard and guard[2] is True:
+            var_name, key_val, _ = guard
+            if var_name in body_collections:
+                body_collections[var_name].guarded_keys.add(key_val)
+
+        self._collection_stack.append(body_collections)
+        self._visit_statement_sequence(node.body)
+        self._collection_stack.pop()
+
+        # 2. Else branch
+        else_collections = {k: v.copy() for k, v in self._current_collections.items()}
+        if guard and guard[2] is False:
+            var_name, key_val, _ = guard
+            if var_name in else_collections:
+                else_collections[var_name].guarded_keys.add(key_val)
+
+        self._collection_stack.append(else_collections)
+        self._visit_statement_sequence(node.orelse)
+        self._collection_stack.pop()
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        self.generic_visit(node)
+
+        # Slices are always safe in Python (never raise IndexError)
+        if isinstance(node.slice, ast.Slice):
+            return
+
+        # Do not duplicate SEM002 findings for subscripting literal None
+        if _is_none_literal(node.value):
+            return
+
+        # Case 1: Direct literal sequence ([1, 2][5] or (1, 2)[-3])
+        if isinstance(node.value, (ast.List, ast.Tuple)):
+            length = _extract_sequence_length(node.value)
+            if length is not None:
+                idx = _extract_constant_value(node.slice)
+                if isinstance(idx, int) and not isinstance(idx, bool):
+                    is_oob = (length == 0) or (idx >= length) or (idx < -length)
+                    if is_oob:
+                        if self._is_enclosed_in_index_error_handler():
+                            return
+                        kind = "list" if isinstance(node.value, ast.List) else "tuple"
+                        self.issues.append(
+                            Issue(
+                                code="SEM003",
+                                message=(
+                                    f"Sequence index out of range: constant index {idx} is out of bounds for "
+                                    f"literal {kind} of length {length}."
+                                ),
+                                file_path=self.file_path,
+                                line=node.lineno,
+                                column=node.col_offset,
+                                severity="WARNING",
+                                tool="semantic_analyzer",
+                                fixable=False,
+                                confidence="HIGH",
+                                explanation=(
+                                    f"Static AST analysis detected constant index {idx} accessing a literal {kind} "
+                                    f"containing {length} element(s). Valid indices are between "
+                                    f"{-length if length > 0 else 0} and {length - 1 if length > 0 else -1}. "
+                                    f"This subscript access unconditionally raises an unhandled IndexError at runtime."
+                                ),
+                                suggested_fix=(
+                                    f"Use an index within bounds (between {-length if length > 0 else 0} and "
+                                    f"{length - 1 if length > 0 else -1}), or guard with 'if 0 <= idx < len(...):'."
+                                ),
+                            )
+                        )
+                        return
+
+        # Case 2: Direct literal dictionary ({"a": 1}["b"])
+        if isinstance(node.value, ast.Dict):
+            if not isinstance(node.ctx, ast.Load):
+                return
+            keys = _extract_dict_literal_keys(node.value)
+            if keys is not None:
+                key = _extract_constant_value(node.slice)
+                if key is not _UNKNOWN_KEY and key not in keys:
+                    if self._is_enclosed_in_key_error_handler():
+                        return
+                    key_repr = repr(key)
+                    keys_repr = "{" + ", ".join(repr(k) for k in sorted(keys, key=lambda x: str(x))) + "}"
+                    self.issues.append(
+                        Issue(
+                            code="SEM003",
+                            message=(
+                                f"Missing dictionary key: key {key_repr} is provably absent from "
+                                f"literal dictionary."
+                            ),
+                            file_path=self.file_path,
+                            line=node.lineno,
+                            column=node.col_offset,
+                            severity="WARNING",
+                            tool="semantic_analyzer",
+                            fixable=False,
+                            confidence="HIGH",
+                            explanation=(
+                                f"Static AST analysis detected subscript access with key {key_repr} on a literal "
+                                f"dictionary with defined keys {keys_repr}. "
+                                f"This subscript access unconditionally raises an unhandled KeyError at runtime."
+                            ),
+                            suggested_fix=(
+                                f"Verify that key {key_repr} exists in the dictionary, use "
+                                f"'.get({key_repr}, default)' instead of subscripting, or handle KeyError."
+                            ),
+                        )
+                    )
+                    return
+
+        # Case 3: Local variable sequence or dictionary
+        var_name = _get_name_id(node.value)
+        if not var_name:
+            return
+
+        state = self._current_collections.get(var_name)
+        if not state:
+            return
+
+        if state.kind in ("LIST", "TUPLE"):
+            length = state.length
+            if length is not None:
+                idx = _extract_constant_value(node.slice)
+                if isinstance(idx, int) and not isinstance(idx, bool):
+                    is_oob = (length == 0) or (idx >= length) or (idx < -length)
+                    if is_oob:
+                        if self._is_enclosed_in_index_error_handler():
+                            return
+                        kind = state.kind.lower()
+                        self.issues.append(
+                            Issue(
+                                code="SEM003",
+                                message=(
+                                    f"Sequence index out of range: constant index {idx} is out of bounds for "
+                                    f"{kind} '{var_name}' of length {length}."
+                                ),
+                                file_path=self.file_path,
+                                line=node.lineno,
+                                column=node.col_offset,
+                                severity="WARNING",
+                                tool="semantic_analyzer",
+                                fixable=False,
+                                confidence="HIGH",
+                                explanation=(
+                                    f"Static AST analysis detected constant index {idx} on variable '{var_name}' "
+                                    f"known to be a {kind} of length {length}. Valid indices are between "
+                                    f"{-length if length > 0 else 0} and {length - 1 if length > 0 else -1}. "
+                                    f"This access unconditionally raises an unhandled IndexError at runtime."
+                                ),
+                                suggested_fix=(
+                                    f"Use an index within bounds (between {-length if length > 0 else 0} and "
+                                    f"{length - 1 if length > 0 else -1}), or guard with 'if 0 <= idx < len({var_name}):'."
+                                ),
+                            )
+                        )
+                        return
+
+        elif state.kind == "DICT":
+            if not isinstance(node.ctx, ast.Load):
+                return
+            keys = state.known_keys
+            if keys is not None:
+                key = _extract_constant_value(node.slice)
+                if key is not _UNKNOWN_KEY:
+                    if key in state.guarded_keys:
+                        return
+                    if key not in keys:
+                        if self._is_enclosed_in_key_error_handler():
+                            return
+                        key_repr = repr(key)
+                        keys_repr = "{" + ", ".join(repr(k) for k in sorted(keys, key=lambda x: str(x))) + "}"
+                        self.issues.append(
+                            Issue(
+                                code="SEM003",
+                                message=(
+                                    f"Missing dictionary key: key {key_repr} is provably absent from "
+                                    f"dictionary '{var_name}'."
+                                ),
+                                file_path=self.file_path,
+                                line=node.lineno,
+                                column=node.col_offset,
+                                severity="WARNING",
+                                tool="semantic_analyzer",
+                                fixable=False,
+                                confidence="HIGH",
+                                explanation=(
+                                    f"Static AST analysis detected subscript access for key {key_repr} on variable "
+                                    f"'{var_name}' known to be a dictionary with keys {keys_repr}. "
+                                    f"This access unconditionally raises an unhandled KeyError at runtime."
+                                ),
+                                suggested_fix=(
+                                    f"Verify that key {key_repr} exists before accessing, use 'if {key_repr} in {var_name}:', "
+                                    f"or use '{var_name}.get({key_repr}, default)' instead of subscripting."
+                                ),
+                            )
+                        )
+                        return
+
+    def _visit_statement_sequence(self, stmts: list[ast.stmt]) -> None:
+        current_collections = {k: v.copy() for k, v in self._current_collections.items()}
+
+        for stmt in stmts:
+            self._collection_stack.append({k: v.copy() for k, v in current_collections.items()})
+            self.visit(stmt)
+            self._collection_stack.pop()
+
+            # 1. Check for subscript writes (e.g. d['k'] = v, lst[0] = v)
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                        current_collections.pop(target.value.id, None)
+
+                # Check for alias creation (e.g. y = x, where x is in current_collections)
+                if isinstance(stmt.value, ast.Name) and stmt.value.id in current_collections:
+                    current_collections.pop(stmt.value.id, None)
+
+                # Clear previous tracking for any target variable being assigned to
+                for target in stmt.targets:
+                    for child_target in ast.walk(target):
+                        if isinstance(child_target, ast.Name):
+                            current_collections.pop(child_target.id, None)
+
+                # Process direct collection assignments to single names
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        var_name = target.id
+                        if isinstance(stmt.value, (ast.List, ast.Tuple)):
+                            length = _extract_sequence_length(stmt.value)
+                            if length is not None:
+                                kind = "LIST" if isinstance(stmt.value, ast.List) else "TUPLE"
+                                current_collections[var_name] = CollectionLiteralState(kind=kind, length=length)
+                        elif isinstance(stmt.value, ast.Dict):
+                            keys = _extract_dict_literal_keys(stmt.value)
+                            if keys is not None:
+                                current_collections[var_name] = CollectionLiteralState(kind="DICT", known_keys=keys)
+
+            elif isinstance(stmt, ast.AnnAssign):
+                if isinstance(stmt.target, ast.Subscript) and isinstance(stmt.target.value, ast.Name):
+                    current_collections.pop(stmt.target.value.id, None)
+
+                if isinstance(stmt.target, ast.Name):
+                    var_name = stmt.target.id
+                    current_collections.pop(var_name, None)
+
+                    if stmt.value and isinstance(stmt.value, ast.Name) and stmt.value.id in current_collections:
+                        current_collections.pop(stmt.value.id, None)
+
+                    if stmt.value and isinstance(stmt.value, (ast.List, ast.Tuple)):
+                        length = _extract_sequence_length(stmt.value)
+                        if length is not None:
+                            kind = "LIST" if isinstance(stmt.value, ast.List) else "TUPLE"
+                            current_collections[var_name] = CollectionLiteralState(kind=kind, length=length)
+                    elif stmt.value and isinstance(stmt.value, ast.Dict):
+                        keys = _extract_dict_literal_keys(stmt.value)
+                        if keys is not None:
+                            current_collections[var_name] = CollectionLiteralState(kind="DICT", known_keys=keys)
+
+            elif isinstance(stmt, ast.AugAssign):
+                if isinstance(stmt.target, ast.Name):
+                    current_collections.pop(stmt.target.id, None)
+                elif isinstance(stmt.target, ast.Subscript) and isinstance(stmt.target.value, ast.Name):
+                    current_collections.pop(stmt.target.value.id, None)
+
+            elif isinstance(stmt, ast.Delete):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        current_collections.pop(target.id, None)
+                    elif isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                        current_collections.pop(target.value.id, None)
+
+            # 2. Invalidate on method calls and call escapes
+            for child in ast.walk(stmt):
+                if isinstance(child, ast.Call):
+                    if isinstance(child.func, ast.Attribute) and isinstance(child.func.value, ast.Name):
+                        current_collections.pop(child.func.value.id, None)
+                    for arg in child.args:
+                        if isinstance(arg, ast.Name):
+                            current_collections.pop(arg.id, None)
+                    for kw in child.keywords:
+                        if isinstance(kw.value, ast.Name):
+                            current_collections.pop(kw.value.id, None)
+
+            # 3. Handle If statements and branch merging
+            if isinstance(stmt, ast.If):
+                guard = _extract_membership_guard(stmt.test)
+                body_exits = any(_statement_always_exits(s) for s in stmt.body)
+
+                if guard and not guard[2] and body_exits:
+                    var_name, key_val, _ = guard
+                    if var_name in current_collections:
+                        current_collections[var_name].guarded_keys.add(key_val)
+
+                if body_exits and not stmt.orelse:
+                    pass
+                else:
+                    modified = _extract_all_modified_names(stmt)
+                    for m in modified:
+                        current_collections.pop(m, None)
+
+
 def analyze_python_source(source_code: str, file_path: str = "<string>") -> list[Issue]:
     """
-    Analyze Python source code string for semantic bug hazards (SEM001 and SEM002).
+    Analyze Python source code string for semantic bug hazards (SEM001, SEM002, SEM003).
 
     Args:
         source_code: Python code content.
@@ -1026,7 +1569,10 @@ def analyze_python_source(source_code: str, file_path: str = "<string>") -> list
     none_detector = NoneDereferenceDetector(file_path=file_path)
     none_detector.visit(tree)
 
-    all_issues = div_detector.issues + none_detector.issues
+    index_key_detector = IndexAndKeyAccessDetector(file_path=file_path)
+    index_key_detector.visit(tree)
+
+    all_issues = div_detector.issues + none_detector.issues + index_key_detector.issues
     all_issues.sort(key=lambda i: (i.line or 0, i.column or 0))
     return all_issues
 

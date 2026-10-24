@@ -1082,3 +1082,610 @@ class TestSEM002WorkflowAndGitHub:
 
             # 4. Action plan remains dry_run
             assert result.action_plan.dry_run is True
+
+
+# ============================================================================
+# 18. Literal Sequence Index Out-Of-Bounds Tests (SEM003 HIGH Confidence)
+# ============================================================================
+
+
+class TestLiteralSequenceIndexOutOfBounds:
+    def test_direct_list_literal_positive_oob(self):
+        source = "val = [10, 20, 30][5]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].severity == "WARNING"
+        assert "Sequence index out of range" in issues[0].message
+        assert "constant index 5 is out of bounds for literal list of length 3" in issues[0].message
+
+    def test_direct_tuple_literal_negative_oob(self):
+        source = "val = (10, 20)[-3]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+        assert "constant index -3 is out of bounds for literal tuple of length 2" in issues[0].message
+
+    def test_direct_empty_list_literal_oob(self):
+        source = "val = [][0]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+        assert "length 0" in issues[0].message
+
+    def test_direct_empty_tuple_literal_oob(self):
+        source = "val = ()[-1]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+
+    def test_direct_valid_positive_index_clean(self):
+        source = "x = [1, 2, 3][0]\ny = (10, 20)[1]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_direct_valid_negative_index_clean(self):
+        source = "x = [1, 2, 3][-1]\ny = (10, 20)[-2]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_direct_slice_subscript_clean(self):
+        # Slices in Python never raise IndexError
+        source = "x = [1, 2, 3][0:10]\ny = [1, 2][5:]\nz = (10, 20)[:]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_starred_unpacking_sequence_clean(self):
+        source = "x = [1, *other, 2][5]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+
+# ============================================================================
+# 19. Local Variable Sequence Index Out-Of-Bounds Tests
+# ============================================================================
+
+
+class TestLocalVariableSequenceIndexOutOfBounds:
+    def test_local_list_variable_oob(self):
+        source = "items = ['a', 'b']\nv = items[2]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "HIGH"
+        assert "items" in issues[0].message
+        assert "length 2" in issues[0].message
+
+    def test_local_tuple_variable_negative_oob(self):
+        source = "t = (1, 2, 3)\nv = t[-4]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "HIGH"
+
+    def test_local_empty_list_variable_oob(self):
+        source = "items = []\nv = items[0]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "HIGH"
+
+    def test_local_valid_indexes_clean(self):
+        source = "items = ['a', 'b']\nx = items[0]\ny = items[1]\nz = items[-1]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_local_slice_access_clean(self):
+        source = "items = ['a', 'b']\nx = items[10:20]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_local_dynamic_index_clean(self):
+        source = "items = ['a', 'b']\nv = items[idx]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_function_parameter_sequence_clean(self):
+        source = "def f(items):\n    return items[5]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+
+# ============================================================================
+# 20. Literal Dictionary Missing Key Tests (SEM003 HIGH Confidence)
+# ============================================================================
+
+
+class TestLiteralDictionaryMissingKey:
+    def test_direct_dict_literal_missing_key(self):
+        source = "v = {'a': 1}['b']\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].severity == "WARNING"
+        assert "Missing dictionary key: key 'b' is provably absent from literal dictionary" in issues[0].message
+
+    def test_direct_empty_dict_literal_missing_key(self):
+        source = "v = {}[0]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+
+    def test_direct_dict_literal_valid_key_clean(self):
+        source = "v = {'a': 1, 'b': 2}['a']\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_local_dict_variable_missing_key(self):
+        source = "d = {'host': 'localhost'}\np = d['port']\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "HIGH"
+        assert "dictionary 'd'" in issues[0].message
+
+    def test_local_dict_variable_valid_key_clean(self):
+        source = "d = {'host': 'localhost'}\nh = d['host']\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_local_dict_variable_none_key_supported(self):
+        source = (
+            "d = {None: 'null_val', 'key': 1}\n"
+            "v1 = d[None]\n"
+            "v2 = d['missing']\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 3
+        assert "'missing'" in issues[0].message
+
+    def test_local_dict_integer_and_negative_keys(self):
+        source = (
+            "d = {1: 'one', -1: 'neg_one'}\n"
+            "v1 = d[1]\n"
+            "v2 = d[-1]\n"
+            "v3 = d[2]\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 4
+        assert "2" in issues[0].message
+
+    def test_dict_unpacking_clean(self):
+        source = "d = {'a': 1, **extra}\nv = d['b']\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_dynamic_key_clean(self):
+        source = "d = {'a': 1, dynamic_var: 2}\nv = d['b']\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_dynamic_lookup_key_clean(self):
+        source = "d = {'a': 1}\nv = d[user_input]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+
+# ============================================================================
+# 21. Membership Guards & Branch State Merging
+# ============================================================================
+
+
+class TestMembershipGuardsAndBranchState:
+    def test_dict_key_guarded_by_in_check(self):
+        source = (
+            "d = {'a': 1}\n"
+            "if 'b' in d:\n"
+            "    v = d['b']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_dict_key_unguarded_in_else_branch(self):
+        source = (
+            "d = {'a': 1}\n"
+            "if 'b' in d:\n"
+            "    pass\n"
+            "else:\n"
+            "    v = d['b']\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 5
+
+    def test_dict_key_guarded_after_not_in_early_return(self):
+        source = (
+            "def fn():\n"
+            "    d = {'a': 1}\n"
+            "    if 'b' not in d:\n"
+            "        return None\n"
+            "    return d['b']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_dict_key_guarded_after_not_in_early_raise(self):
+        source = (
+            "d = {'a': 1}\n"
+            "if 'b' not in d:\n"
+            "    raise KeyError('b missing')\n"
+            "v = d['b']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_branch_mutation_invalidates_collection_after_if(self):
+        source = (
+            "d = {'a': 1}\n"
+            "if cond:\n"
+            "    d['b'] = 2\n"
+            "v = d['b']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_branch_unmodified_collection_preserved_after_if(self):
+        source = (
+            "d = {'a': 1}\n"
+            "if cond:\n"
+            "    x = 10\n"
+            "v = d['b']\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 4
+
+
+# ============================================================================
+# 22. Mutation, Aliasing, Call Escapes & Scope Isolation
+# ============================================================================
+
+
+class TestMutationAliasingAndScope:
+    def test_list_append_invalidates(self):
+        source = "lst = [1, 2]\nlst.append(3)\nv = lst[2]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_list_extend_invalidates(self):
+        source = "lst = [1, 2]\nlst.extend([3, 4])\nv = lst[3]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_dict_update_invalidates(self):
+        source = "d = {'a': 1}\nd.update({'b': 2})\nv = d['b']\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_subscript_write_invalidates_dict(self):
+        source = "d = {'a': 1}\nd['b'] = 2\nv = d['b']\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_subscript_write_invalidates_list(self):
+        source = "lst = [1, 2]\nlst[0] = 99\nv = lst[1]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_delete_subscript_invalidates(self):
+        source = "d = {'a': 1, 'b': 2}\ndel d['a']\nv = d['c']\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_call_escape_invalidates(self):
+        source = "items = [1, 2]\nprocess(items)\nv = items[2]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_alias_escape_invalidates(self):
+        source = "items = [1, 2]\nalias = items\nv = items[2]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_reassignment_updates_metadata(self):
+        source = (
+            "items = [1, 2]\n"
+            "items = [1, 2, 3, 4]\n"
+            "v = items[3]\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_reassignment_to_smaller_collection_flags(self):
+        source = (
+            "items = [1, 2, 3, 4]\n"
+            "items = [10]\n"
+            "v = items[1]\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 3
+
+    def test_reassignment_to_non_literal_clears_tracking(self):
+        source = "items = [1, 2]\nitems = get_items()\nv = items[5]\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_function_scope_isolation_and_shadowing(self):
+        source = (
+            "items = [1, 2]\n"
+            "def fn():\n"
+            "    items = [1, 2, 3, 4]\n"
+            "    return items[3]\n"
+            "val = items[3]\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 5
+        assert "length 2" in issues[0].message
+
+
+# ============================================================================
+# 23. Exception Handling Scope (IndexError & KeyError)
+# ============================================================================
+
+
+class TestSEM003ExceptionHandlingScope:
+    def test_index_error_suppressed_by_index_error(self):
+        source = (
+            "try:\n"
+            "    x = [1, 2][5]\n"
+            "except IndexError:\n"
+            "    x = None\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_index_error_suppressed_by_lookup_error(self):
+        source = (
+            "try:\n"
+            "    x = [1, 2][5]\n"
+            "except LookupError:\n"
+            "    x = None\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_key_error_suppressed_by_key_error(self):
+        source = (
+            "try:\n"
+            "    x = {'a': 1}['b']\n"
+            "except KeyError:\n"
+            "    x = None\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_key_error_suppressed_by_lookup_error(self):
+        source = (
+            "try:\n"
+            "    x = {'a': 1}['b']\n"
+            "except LookupError:\n"
+            "    x = None\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_suppressed_by_exception_and_bare_except(self):
+        source = (
+            "try:\n"
+            "    x = [1, 2][5]\n"
+            "except Exception:\n"
+            "    x = None\n"
+            "try:\n"
+            "    y = {'a': 1}['b']\n"
+            "except:\n"
+            "    y = None\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_not_suppressed_by_unrelated_exception(self):
+        source = (
+            "try:\n"
+            "    x = [1, 2][5]\n"
+            "except KeyError:\n"
+            "    x = None\n"
+            "try:\n"
+            "    y = {'a': 1}['b']\n"
+            "except IndexError:\n"
+            "    y = None\n"
+            "try:\n"
+            "    z = [1, 2][5]\n"
+            "except ValueError:\n"
+            "    z = None\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 3
+        assert all(i.code == "SEM003" for i in issues)
+
+    def test_nested_try_blocks_outer_catches(self):
+        source = (
+            "try:\n"
+            "    try:\n"
+            "        x = [1, 2][5]\n"
+            "    except ValueError:\n"
+            "        x = 0\n"
+            "except IndexError:\n"
+            "    x = -1\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_nested_try_unrelated_not_suppressed(self):
+        source = (
+            "try:\n"
+            "    try:\n"
+            "        x = [1, 2][5]\n"
+            "    except ValueError:\n"
+            "        x = 0\n"
+            "except KeyError:\n"
+            "    x = -1\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].line == 3
+
+
+# ============================================================================
+# 24. Combined SEM001 + SEM002 + SEM003 Regression Tests
+# ============================================================================
+
+
+class TestCombinedSEM001SEM002SEM003:
+    def test_all_three_detectors_in_single_analysis(self):
+        source = (
+            "def compute(user=None):\n"
+            "    div_zero = 10 / 0\n"
+            "    deref_none = user.name\n"
+            "    bad_index = [1, 2][5]\n"
+            "    missing_key = {'a': 1}['x']\n"
+            "    return div_zero\n"
+        )
+        issues = analyze_python_source(source, "src/calc.py")
+        assert len(issues) == 4
+        # Verify ordering strictly by line and column
+        assert issues[0].code == "SEM001"
+        assert issues[0].line == 2
+        assert issues[0].file_path == "src/calc.py"
+
+        assert issues[1].code == "SEM002"
+        assert issues[1].line == 3
+        assert issues[1].file_path == "src/calc.py"
+
+        assert issues[2].code == "SEM003"
+        assert issues[2].line == 4
+        assert issues[2].file_path == "src/calc.py"
+
+        assert issues[3].code == "SEM003"
+        assert issues[3].line == 5
+        assert issues[3].file_path == "src/calc.py"
+
+    def test_subscript_none_does_not_duplicate_sem003(self):
+        # In Python, val = None; val[0] raises TypeError, handled by SEM002, not SEM003
+        source = "val = None\nx = val[0]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+        assert "TypeError" in issues[0].message
+
+
+# ============================================================================
+# 25. GitHub PR Review Diff Anchoring & Verdict Policy for SEM003
+# ============================================================================
+
+
+class TestSEM003WorkflowAndGitHub:
+    def test_sem003_anchors_to_diff_hunk_as_inline_comment(self, tmp_path):
+        diff_text = (
+            "--- a/config.py\n"
+            "+++ b/config.py\n"
+            "@@ -1,2 +1,4 @@\n"
+            " def get_port():\n"
+            "-    return 8080\n"
+            "+    d = {'host': 'localhost'}\n"
+            "+    return d['port']\n"
+        )
+        diff_files = parse_diff_hunks(diff_text, strict=False)
+        diff_map = {df.path: df for df in diff_files}
+
+        issues = [
+            {
+                "code": "SEM003",
+                "message": "Missing dictionary key: key 'port' is provably absent from dictionary 'd'.",
+                "file_path": "config.py",
+                "line": 3,
+                "severity": "WARNING",
+                "tool": "semantic_analyzer",
+                "confidence": "HIGH",
+                "explanation": "Static AST analysis detected missing key 'port'.",
+                "suggested_fix": "Add 'port' to dictionary or use d.get('port').",
+            }
+        ]
+
+        comments, unmapped = build_inline_comments(
+            issues=issues,
+            diff_map=diff_map,
+            workspace_root=tmp_path,
+        )
+
+        assert len(comments) == 1
+        assert len(unmapped) == 0
+        assert comments[0].path == "config.py"
+        assert comments[0].line == 3
+        assert "[Semantic_analyzer - SEM003]" in comments[0].body
+        assert "Suggested Fix:" in comments[0].body
+
+    def test_sem003_alone_preserves_milestone_4_verdict_policy(self):
+        """SEM003 alone has severity WARNING; verdict must be COMMENT, never REQUEST_CHANGES or APPROVE."""
+        sem003_issue = {
+            "code": "SEM003",
+            "severity": "WARNING",
+            "confidence": "HIGH",
+            "tool": "semantic_analyzer",
+        }
+        verdict = determine_review_verdict([sem003_issue], [])
+        assert verdict == "COMMENT"
+        assert verdict != "REQUEST_CHANGES"
+        assert verdict != "APPROVE"
+
+    def test_pr_workflow_detects_sem003_with_zero_writes(self, tmp_path):
+        """End-to-end read-only PR review workflow detects SEM003 with 0 GitHub write calls."""
+        config_content = "def get_port():\n    d = {'host': 'localhost'}\n    return d['port']\n"
+        diff_text = (
+            "--- a/config.py\n"
+            "+++ b/config.py\n"
+            "@@ -0,0 +1,3 @@\n"
+            "+def get_port():\n"
+            "+    d = {'host': 'localhost'}\n"
+            "+    return d['port']\n"
+        )
+        meta = PRMetadata(
+            owner="octocat",
+            repo="Hello-World",
+            pr_number=60,
+            title="Add port configuration",
+            body="Configures service port.",
+            state="open",
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            base_sha="0000000000000000000000000000000000000000",
+            head_branch="feature/port",
+            base_branch="main",
+            author="alice",
+            html_url="https://github.com/octocat/Hello-World/pull/60",
+        )
+
+        mock_client = MagicMock(spec=GitHubClient)
+        mock_client.get_pr_metadata.return_value = meta
+        mock_client.get_pr_diff.return_value = diff_text
+
+        ws_mock = MagicMock()
+        ws_mock.__enter__.return_value = ws_mock
+        ws_mock.workspace_path = tmp_path
+        (tmp_path / "config.py").write_text(config_content, encoding="utf-8")
+
+        with patch("requests.Session.post") as mock_post, \
+             patch("requests.Session.patch") as mock_patch, \
+             patch("requests.Session.put") as mock_put, \
+             patch("requests.Session.delete") as mock_delete, \
+             patch("github_review_workflow.prepare_pr_workspace", return_value=ws_mock):
+
+            result = run_pr_review_workflow(
+                repo_or_url="octocat/Hello-World#60",
+                client=mock_client,
+                enable_ai=False,
+                enable_sandbox=False,
+                display_preview=False,
+                ruff_runner=lambda p: ToolResult("Ruff", p, True, False, 0, []),
+                bandit_runner=lambda p: ToolResult("Bandit", p, True, False, 0, []),
+            )
+
+            # 1. Assert SEM003 was found and formulated into an inline comment
+            assert any(c.line == 3 and "SEM003" in c.body for c in result.review_comments)
+
+            # 2. Assert verdict is COMMENT
+            assert result.action_plan.verdict == "COMMENT"
+            assert result.action_plan.verdict != "APPROVE"
+            assert result.action_plan.verdict != "REQUEST_CHANGES"
+
+            # 3. Assert zero write calls were made to GitHub API
+            assert mock_post.call_count == 0
+            assert mock_patch.call_count == 0
+            assert mock_put.call_count == 0
+            assert mock_delete.call_count == 0
+
+            # 4. Action plan remains dry_run
+            assert result.action_plan.dry_run is True
