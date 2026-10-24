@@ -517,3 +517,568 @@ class TestGitHubReviewWorkflowIntegration:
 
             # 4. Action plan remains dry_run
             assert result.action_plan.dry_run is True
+
+
+# ============================================================================
+# 9. Literal None Dereference Tests (SEM002 HIGH Confidence)
+# ============================================================================
+
+
+class TestLiteralNoneDereference:
+    def test_direct_attribute_on_literal_none(self):
+        source = "res = None.strip()\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].severity == "WARNING"
+        assert "attribute 'strip' access will raise AttributeError" in issues[0].message
+
+    def test_direct_subscript_on_literal_none(self):
+        source = "item = None[0]\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+        assert "Direct subscript on literal None will raise TypeError" in issues[0].message
+
+    def test_direct_call_on_literal_none(self):
+        source = "val = None()\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 1
+        assert issues[0].confidence == "HIGH"
+        assert "Calling literal None will raise TypeError" in issues[0].message
+
+
+# ============================================================================
+# 10. Known None In Branch / Inverted Guard Tests (SEM002 HIGH Confidence)
+# ============================================================================
+
+
+class TestBranchKnownNoneDereference:
+    def test_dereference_in_if_is_none_branch(self):
+        source = (
+            "def fn(x):\n"
+            "    if x is None:\n"
+            "        return x.strip()\n"
+            "    return 'ok'\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 3
+        assert issues[0].confidence == "HIGH"
+        assert "known to be None" in issues[0].message
+
+    def test_dereference_in_else_of_if_is_not_none(self):
+        source = (
+            "def fn(x):\n"
+            "    if x is not None:\n"
+            "        pass\n"
+            "    else:\n"
+            "        return x.lower()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 5
+        assert issues[0].confidence == "HIGH"
+
+    def test_safe_in_else_of_if_is_none(self):
+        source = (
+            "def fn(x):\n"
+            "    if x is None:\n"
+            "        return 0\n"
+            "    else:\n"
+            "        return x.strip()\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_safe_in_body_of_if_is_not_none(self):
+        source = (
+            "def fn(x):\n"
+            "    if x is not None:\n"
+            "        return x.strip()\n"
+            "    return ''\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_safe_in_body_of_truthy_check(self):
+        source = (
+            "def fn(x):\n"
+            "    if x:\n"
+            "        return x.strip()\n"
+            "    return ''\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+
+# ============================================================================
+# 11. Local Variables Assigned None (SEM002 HIGH Confidence)
+# ============================================================================
+
+
+class TestLocalVariableAssignedNone:
+    def test_local_variable_assigned_none_and_dereferenced(self):
+        source = "val = None\nres = val.strip()\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "HIGH"
+        assert "val" in issues[0].message
+
+    def test_local_variable_assigned_none_and_subscripted(self):
+        source = "val = None\nitem = val['key']\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "HIGH"
+
+    def test_local_variable_assigned_none_and_called(self):
+        source = "func = None\nfunc()\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "HIGH"
+
+    def test_local_variable_reassigned_to_non_none_is_safe(self):
+        source = "val = None\nval = 'hello'\nres = val.strip()\n"
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_reassignment_to_none_invalidates_clean_state(self):
+        source = "val = 'hello'\nval = None\nres = val.strip()\n"
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 3
+        assert issues[0].confidence == "HIGH"
+
+
+# ============================================================================
+# 12. None-Defaulted Function Parameters (SEM002 MEDIUM Confidence)
+# ============================================================================
+
+
+class TestNoneDefaultedParameters:
+    def test_none_defaulted_param_attribute_dereference_medium_confidence(self):
+        source = (
+            "def fn(data=None):\n"
+            "    return data.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "MEDIUM"
+        assert "defaults to None" in issues[0].message
+
+    def test_none_defaulted_param_subscript_medium_confidence(self):
+        source = (
+            "def fn(data=None):\n"
+            "    return data[0]\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "MEDIUM"
+
+    def test_none_defaulted_param_call_medium_confidence(self):
+        source = (
+            "def fn(callback=None):\n"
+            "    return callback()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "MEDIUM"
+
+    def test_none_defaulted_keyword_only_param(self):
+        source = (
+            "def fn(*, config=None):\n"
+            "    return config['timeout']\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "MEDIUM"
+
+    def test_non_none_defaults_not_flagged(self):
+        source = (
+            "def fn(data='default', count=0, items=[]):\n"
+            "    return data.strip() + str(count) + str(len(items))\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_parameter_without_default_not_flagged(self):
+        source = (
+            "def fn(data):\n"
+            "    return data.strip()\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+
+# ============================================================================
+# 13. Guard Handling, Branch Sensitivity & Exits
+# ============================================================================
+
+
+class TestGuardsAndBranchSensitivity:
+    def test_guarded_by_is_none_raise(self):
+        source = (
+            "def fn(data=None):\n"
+            "    if data is None:\n"
+            "        raise ValueError('data required')\n"
+            "    return data['key']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_guarded_by_is_none_return(self):
+        source = (
+            "def fn(data=None):\n"
+            "    if data is None:\n"
+            "        return {}\n"
+            "    return data['key']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_guarded_by_default_assignment(self):
+        source = (
+            "def fn(data=None):\n"
+            "    if data is None:\n"
+            "        data = {}\n"
+            "    return data['key']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_guarded_by_falsy_check_exit(self):
+        source = (
+            "def fn(data=None):\n"
+            "    if not data:\n"
+            "        return None\n"
+            "    return data.strip()\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_ineffective_guard_without_exit_still_flags(self):
+        source = (
+            "def fn(data=None):\n"
+            "    if data is None:\n"
+            "        print('Warning: data is None')\n"
+            "    return data.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 4
+        assert issues[0].confidence == "MEDIUM"
+
+    def test_guard_on_different_variable_does_not_suppress(self):
+        source = (
+            "def fn(data=None, other=None):\n"
+            "    if other is None:\n"
+            "        raise ValueError()\n"
+            "    return data.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].line == 4
+        assert "data" in issues[0].message
+
+
+# ============================================================================
+# 14. Immediate Regex Match Chaining (SEM002 MEDIUM Confidence)
+# ============================================================================
+
+
+class TestRegexMatchChaining:
+    def test_regex_search_group_chaining_flagged(self):
+        source = (
+            "import re\n"
+            "def parse_id(s):\n"
+            "    return re.search(r'\\d+', s).group(0)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 3
+        assert issues[0].confidence == "MEDIUM"
+        assert "re.search()" in issues[0].message
+
+    def test_regex_match_group_chaining_flagged(self):
+        source = (
+            "import re\n"
+            "def parse_name(s):\n"
+            "    return re.match(r'\\w+', s).group()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 3
+        assert issues[0].confidence == "MEDIUM"
+        assert "re.match()" in issues[0].message
+
+    def test_regex_fullmatch_groups_chaining_flagged(self):
+        source = (
+            "import re\n"
+            "def parse_tokens(s):\n"
+            "    return re.fullmatch(r'(\\w+)', s).groups()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 3
+        assert issues[0].confidence == "MEDIUM"
+
+    def test_regex_stored_and_guarded_not_flagged(self):
+        source = (
+            "import re\n"
+            "def parse_id(s):\n"
+            "    m = re.search(r'\\d+', s)\n"
+            "    if m:\n"
+            "        return m.group(0)\n"
+            "    return None\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+
+# ============================================================================
+# 15. Exception-Handling Scope Tests (Policy & Non-Coverage)
+# ============================================================================
+
+
+class TestExceptionHandlingScope:
+    def test_attribute_dereference_suppressed_by_attribute_error(self):
+        source = (
+            "try:\n"
+            "    x = None.strip()\n"
+            "except AttributeError:\n"
+            "    x = ''\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_subscript_suppressed_by_type_error(self):
+        source = (
+            "try:\n"
+            "    x = None[0]\n"
+            "except TypeError:\n"
+            "    x = None\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_call_suppressed_by_type_error(self):
+        source = (
+            "try:\n"
+            "    None()\n"
+            "except TypeError:\n"
+            "    pass\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_suppressed_by_exception_and_bare_except(self):
+        source = (
+            "try:\n"
+            "    x = None.strip()\n"
+            "except Exception:\n"
+            "    x = ''\n"
+            "try:\n"
+            "    y = None[0]\n"
+            "except:\n"
+            "    y = 0\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_attribute_dereference_not_suppressed_by_unrelated_exception(self):
+        source = (
+            "try:\n"
+            "    x = None.strip()\n"
+            "except KeyError:\n"
+            "    x = ''\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+
+    def test_subscript_not_suppressed_by_key_error(self):
+        # In Python, None[0] raises TypeError, not KeyError!
+        source = (
+            "try:\n"
+            "    x = None[0]\n"
+            "except KeyError:\n"
+            "    x = None\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 2
+
+    def test_dereference_outside_try_not_suppressed(self):
+        source = (
+            "try:\n"
+            "    pass\n"
+            "except AttributeError:\n"
+            "    pass\n"
+            "x = None.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].line == 5
+
+
+# ============================================================================
+# 16. Combined SEM001 and SEM002 Regression Tests
+# ============================================================================
+
+
+class TestCombinedSEM001AndSEM002:
+    def test_file_with_both_sem001_and_sem002(self):
+        source = (
+            "def calculate(a, b=None):\n"
+            "    div_result = 10 / 0\n"
+            "    return div_result + b.total\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 2
+        assert issues[0].code == "SEM001"
+        assert issues[0].line == 2
+        assert issues[0].confidence == "HIGH"
+        assert issues[1].code == "SEM002"
+        assert issues[1].line == 3
+        assert issues[1].confidence == "MEDIUM"
+
+
+# ============================================================================
+# 17. GitHub PR Review Diff Anchoring & Verdict Preservation for SEM002
+# ============================================================================
+
+
+class TestSEM002WorkflowAndGitHub:
+    def test_sem002_anchors_to_diff_hunk_as_inline_comment(self, tmp_path):
+        diff_text = (
+            "--- a/handler.py\n"
+            "+++ b/handler.py\n"
+            "@@ -1,2 +1,4 @@\n"
+            " def process(user=None):\n"
+            "-    return None\n"
+            "+    return user.name\n"
+        )
+        diff_files = parse_diff_hunks(diff_text, strict=False)
+        diff_map = {df.path: df for df in diff_files}
+
+        issues = [
+            {
+                "code": "SEM002",
+                "message": "Possible None dereference: parameter 'user' defaults to None and is accessed via attribute 'name'.",
+                "file_path": "handler.py",
+                "line": 2,
+                "severity": "WARNING",
+                "tool": "semantic_analyzer",
+                "confidence": "MEDIUM",
+                "explanation": "Parameter 'user' defaults to None without guard.",
+                "suggested_fix": "Add a check 'if user is None: ...'.",
+            }
+        ]
+
+        comments, unmapped = build_inline_comments(
+            issues=issues,
+            diff_map=diff_map,
+            workspace_root=tmp_path,
+        )
+
+        assert len(comments) == 1
+        assert len(unmapped) == 0
+        assert comments[0].path == "handler.py"
+        assert comments[0].line == 2
+        assert "[Semantic_analyzer - SEM002]" in comments[0].body
+        assert "Suggested Fix:" in comments[0].body
+
+    def test_sem002_alone_preserves_milestone_4_verdict_policy(self):
+        """SEM002 alone has severity WARNING; verdict must be COMMENT, never REQUEST_CHANGES or APPROVE."""
+        sem002_issue = {
+            "code": "SEM002",
+            "severity": "WARNING",
+            "confidence": "HIGH",
+            "tool": "semantic_analyzer",
+        }
+        verdict = determine_review_verdict([sem002_issue], [])
+        assert verdict == "COMMENT"
+        assert verdict != "REQUEST_CHANGES"
+        assert verdict != "APPROVE"
+
+    def test_pr_workflow_detects_none_dereference_with_zero_writes(self, tmp_path):
+        """End-to-end read-only PR review workflow detects SEM002 with 0 GitHub write calls."""
+        handler_content = "def process(user=None):\n    return user.name\n"
+        diff_text = (
+            "--- a/handler.py\n"
+            "+++ b/handler.py\n"
+            "@@ -0,0 +1,2 @@\n"
+            "+def process(user=None):\n"
+            "+    return user.name\n"
+        )
+        meta = PRMetadata(
+            owner="octocat",
+            repo="Hello-World",
+            pr_number=50,
+            title="Add user process handler",
+            body="Implements user processing.",
+            state="open",
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            base_sha="0000000000000000000000000000000000000000",
+            head_branch="feature/handler",
+            base_branch="main",
+            author="alice",
+            html_url="https://github.com/octocat/Hello-World/pull/50",
+        )
+
+        mock_client = MagicMock(spec=GitHubClient)
+        mock_client.get_pr_metadata.return_value = meta
+        mock_client.get_pr_diff.return_value = diff_text
+
+        ws_mock = MagicMock()
+        ws_mock.__enter__.return_value = ws_mock
+        ws_mock.workspace_path = tmp_path
+        (tmp_path / "handler.py").write_text(handler_content, encoding="utf-8")
+
+        with patch("requests.Session.post") as mock_post, \
+             patch("requests.Session.patch") as mock_patch, \
+             patch("requests.Session.put") as mock_put, \
+             patch("requests.Session.delete") as mock_delete, \
+             patch("github_review_workflow.prepare_pr_workspace", return_value=ws_mock):
+
+            result = run_pr_review_workflow(
+                repo_or_url="octocat/Hello-World#50",
+                client=mock_client,
+                enable_ai=False,
+                enable_sandbox=False,
+                display_preview=False,
+                ruff_runner=lambda p: ToolResult("Ruff", p, True, False, 0, []),
+                bandit_runner=lambda p: ToolResult("Bandit", p, True, False, 0, []),
+            )
+
+            # 1. Assert SEM002 was found and formulated into an inline comment
+            assert any(c.line == 2 and "SEM002" in c.body for c in result.review_comments)
+
+            # 2. Assert verdict is COMMENT
+            assert result.action_plan.verdict == "COMMENT"
+            assert result.action_plan.verdict != "APPROVE"
+            assert result.action_plan.verdict != "REQUEST_CHANGES"
+
+            # 3. Assert zero write calls were made to GitHub API
+            assert mock_post.call_count == 0
+            assert mock_patch.call_count == 0
+            assert mock_put.call_count == 0
+            assert mock_delete.call_count == 0
+
+            # 4. Action plan remains dry_run
+            assert result.action_plan.dry_run is True

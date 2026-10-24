@@ -1,8 +1,12 @@
 """
 semantic_analyzer.py - Deterministic AST Semantic Bug Analysis Module.
 
-Provides pure AST-based inspection of Python source code to detect runtime hazards
-such as division-by-zero (SEM001).
+Provides pure AST-based inspection of Python source code to detect runtime hazards:
+  - SEM001: Potential or definite unhandled ZeroDivisionError in arithmetic division ('/'),
+            floor division ('//'), or modulo ('%').
+  - SEM002: Potential or definite unhandled None dereference (AttributeError / TypeError)
+            on literal None, variables known to be None, None-defaulted parameters,
+            or unvalidated regex match chaining.
 
 Guarantees:
   - Deterministic: 100% reproducible results with zero random or heuristic variation.
@@ -10,20 +14,29 @@ Guarantees:
   - Offline: Operates entirely locally using Python standard library 'ast'. No LLM required.
   - Fail-Safe: Gracefully handles syntax errors, unsupported files, and empty directories.
 
-Supported Rules:
-  - SEM001: Potential or definite unhandled ZeroDivisionError in arithmetic division ('/'),
-            floor division ('//'), or modulo ('%').
-
 Confidence Classification:
-  - HIGH: Direct literal-zero divisors (e.g. 'x / 0', 'x // 0', 'x % 0').
-  - MEDIUM: Variable or dynamic expression divisors where the divisor cannot be
-            proven non-zero and is not enclosed in a ZeroDivisionError handler.
+  - HIGH:
+      * SEM001: Direct literal-zero divisors (e.g. 'x / 0', 'x // 0', 'x % 0').
+      * SEM002: Direct dereference of literal None ('None.attr', 'None[k]', 'None()'),
+                variables in branches where explicitly known to be None ('if x is None: x.attr'),
+                or local variables assigned None without reassignment.
+  - MEDIUM:
+      * SEM001: Variable or dynamic expression divisors without non-zero guards.
+      * SEM002: None-defaulted function parameters accessed without an effective guard,
+                or immediate '.group()' chaining on re.match() / re.search() results.
+
+Exception-Handling Policy:
+  - Findings are suppressed ONLY if the enclosing try-block catches the specific runtime exception:
+      * SEM001: ZeroDivisionError, ArithmeticError, Exception, BaseException, or bare except.
+      * SEM002: AttributeError (for attribute access), TypeError (for subscript/call),
+                Exception, BaseException, or bare except.
+  - Unrelated handlers (e.g. KeyError, ValueError) do NOT suppress findings.
+  - Operations outside the try body are NOT suppressed.
 
 Unsupported Control-Flow Cases (Analyzer Limitations):
   - Interprocedural invariants (caller guaranteeing parameter values).
   - External validation helpers (e.g. 'if is_valid(b): ...').
-  - Dynamic loop modifications (e.g. 'while b == 0: ...').
-  - Complex mathematical invariants (e.g. 'n**2 + 1').
+  - Dynamic loop modifications (e.g. 'while b is None: ...').
   - Aliasing and object attributes modified outside local scope.
 """
 
@@ -35,6 +48,11 @@ import time
 from pathlib import Path
 
 from tools import Issue, ToolResult
+
+
+def _is_none_literal(node: ast.AST) -> bool:
+    """Check if node is literal None (ast.Constant(value=None))."""
+    return isinstance(node, ast.Constant) and node.value is None
 
 
 def _is_zero_literal(node: ast.AST) -> bool:
@@ -90,6 +108,44 @@ def _catches_zero_division(handler: ast.ExceptHandler) -> bool:
             return expr.id in ("ZeroDivisionError", "ArithmeticError", "Exception", "BaseException")
         if isinstance(expr, ast.Attribute):
             return expr.attr in ("ZeroDivisionError", "ArithmeticError", "Exception", "BaseException")
+        return False
+
+    if isinstance(handler.type, ast.Tuple):
+        return any(_type_matches(elt) for elt in handler.type.elts)
+
+    return _type_matches(handler.type)
+
+
+def _catches_attribute_error(handler: ast.ExceptHandler) -> bool:
+    """Check if an except handler catches AttributeError or its base classes."""
+    if handler.type is None:
+        # Bare 'except:' catches everything
+        return True
+
+    def _type_matches(expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in ("AttributeError", "Exception", "BaseException")
+        if isinstance(expr, ast.Attribute):
+            return expr.attr in ("AttributeError", "Exception", "BaseException")
+        return False
+
+    if isinstance(handler.type, ast.Tuple):
+        return any(_type_matches(elt) for elt in handler.type.elts)
+
+    return _type_matches(handler.type)
+
+
+def _catches_type_error(handler: ast.ExceptHandler) -> bool:
+    """Check if an except handler catches TypeError or its base classes."""
+    if handler.type is None:
+        # Bare 'except:' catches everything
+        return True
+
+    def _type_matches(expr: ast.AST) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in ("TypeError", "Exception", "BaseException")
+        if isinstance(expr, ast.Attribute):
+            return expr.attr in ("TypeError", "Exception", "BaseException")
         return False
 
     if isinstance(handler.type, ast.Tuple):
@@ -182,6 +238,91 @@ def _is_test_checking_nonzero(test: ast.AST, var_name: str) -> bool:
     elif isinstance(test, ast.Name) and test.id == var_name:
         return True
     return False
+
+
+def _is_test_checking_is_none(test: ast.AST, var_name: str) -> bool:
+    """Check if test checks if var_name is None (is None / == None)."""
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        op = test.ops[0]
+        if isinstance(op, (ast.Is, ast.Eq)):
+            if (
+                isinstance(test.left, ast.Name)
+                and test.left.id == var_name
+                and _is_none_literal(test.comparators[0])
+            ):
+                return True
+            if (
+                _is_none_literal(test.left)
+                and isinstance(test.comparators[0], ast.Name)
+                and test.comparators[0].id == var_name
+            ):
+                return True
+    return False
+
+
+def _is_test_checking_is_not_none(test: ast.AST, var_name: str) -> bool:
+    """Check if test checks if var_name is not None (is not None / != None)."""
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        op = test.ops[0]
+        if isinstance(op, (ast.IsNot, ast.NotEq)):
+            if (
+                isinstance(test.left, ast.Name)
+                and test.left.id == var_name
+                and _is_none_literal(test.comparators[0])
+            ):
+                return True
+            if (
+                _is_none_literal(test.left)
+                and isinstance(test.comparators[0], ast.Name)
+                and test.comparators[0].id == var_name
+            ):
+                return True
+    return False
+
+
+def _is_test_checking_truthy(test: ast.AST, var_name: str) -> bool:
+    """Check if test directly tests truthiness of var_name ('if x:')."""
+    return isinstance(test, ast.Name) and test.id == var_name
+
+
+def _is_test_checking_falsy(test: ast.AST, var_name: str) -> bool:
+    """Check if test directly tests falsiness of var_name ('if not x:')."""
+    return (
+        isinstance(test, ast.UnaryOp)
+        and isinstance(test.op, ast.Not)
+        and isinstance(test.operand, ast.Name)
+        and test.operand.id == var_name
+    )
+
+
+def _body_always_assigns_non_none(body: list[ast.stmt], var_name: str) -> bool:
+    """Check if statement sequence unconditionally assigns var_name a non-None value."""
+    assigned_non_none = False
+    for stmt in body:
+        if isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name) and t.id == var_name:
+                    assigned_non_none = not _is_none_literal(stmt.value)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == var_name:
+            if stmt.value and not _is_none_literal(stmt.value):
+                assigned_non_none = True
+            else:
+                assigned_non_none = False
+    return assigned_non_none
+
+
+def _is_regex_match_call(node: ast.AST) -> tuple[bool, str]:
+    """Check if node is a call to re.match, re.search, or re.fullmatch."""
+    if isinstance(node, ast.Call):
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("match", "search", "fullmatch")
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "re"
+        ):
+            return True, f"re.{func.attr}()"
+    return False, ""
 
 
 class DivisionByZeroDetector(ast.NodeVisitor):
@@ -391,16 +532,487 @@ class DivisionByZeroDetector(ast.NodeVisitor):
         )
 
 
+class NoneDereferenceDetector(ast.NodeVisitor):
+    """
+    AST visitor that scans for possible or definite None dereferences (SEM002):
+      - Direct dereference of literal None (AttributeError / TypeError) [HIGH confidence]
+      - Dereference of variable in branches where known to be None [HIGH confidence]
+      - Local variables assigned None without reassignment or guard [HIGH confidence]
+      - None-defaulted parameters dereferenced without effective guard [MEDIUM confidence]
+      - Immediate .group() chaining on re.match() / re.search() [MEDIUM confidence]
+    """
+
+    def __init__(self, file_path: str = "<string>") -> None:
+        self.file_path = file_path
+        self.issues: list[Issue] = []
+        self._try_handlers_stack: list[list[ast.ExceptHandler]] = []
+        # Stack of variable state dicts: var_name -> "DEFINITELY_NONE" | "MAYBE_NONE" | "KNOWN_NOT_NONE"
+        self._var_state_stack: list[dict[str, str]] = [{}]
+
+    @property
+    def _current_var_state(self) -> dict[str, str]:
+        return self._var_state_stack[-1]
+
+    def _is_enclosed_in_attribute_error_handler(self) -> bool:
+        for handlers in self._try_handlers_stack:
+            if any(_catches_attribute_error(h) for h in handlers):
+                return True
+        return False
+
+    def _is_enclosed_in_type_error_handler(self) -> bool:
+        for handlers in self._try_handlers_stack:
+            if any(_catches_type_error(h) for h in handlers):
+                return True
+        return False
+
+    def visit_Try(self, node: ast.Try) -> None:
+        # 1. Visit try body with its handlers on the try stack
+        self._try_handlers_stack.append(node.handlers)
+        for stmt in node.body:
+            self.visit(stmt)
+        self._try_handlers_stack.pop()
+
+        # 2. Visit handlers (exceptions inside handlers are not protected by themselves)
+        for handler in node.handlers:
+            self.visit(handler)
+
+        # 3. Visit orelse (runs if no exception was raised in try)
+        for stmt in node.orelse:
+            self.visit(stmt)
+
+        # 4. Visit finalbody
+        for stmt in node.finalbody:
+            self.visit(stmt)
+
+    def _extract_names_from_test(self, test: ast.AST) -> set[str]:
+        names: set[str] = set()
+        for node in ast.walk(test):
+            if isinstance(node, ast.Name):
+                names.add(node.id)
+        return names
+
+    def _visit_statement_sequence(self, stmts: list[ast.stmt]) -> None:
+        """Visit a sequence of statements while tracking variable None states and guards."""
+        current_vars = dict(self._current_var_state)
+
+        for stmt in stmts:
+            self._var_state_stack.append(dict(current_vars))
+            self.visit(stmt)
+            self._var_state_stack.pop()
+
+            # 1. Assignment handling
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        if _is_none_literal(stmt.value):
+                            current_vars[target.id] = "DEFINITELY_NONE"
+                        else:
+                            current_vars[target.id] = "KNOWN_NOT_NONE"
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                if stmt.value and _is_none_literal(stmt.value):
+                    current_vars[stmt.target.id] = "DEFINITELY_NONE"
+                elif stmt.value:
+                    current_vars[stmt.target.id] = "KNOWN_NOT_NONE"
+            elif isinstance(stmt, ast.AugAssign) and isinstance(stmt.target, ast.Name):
+                current_vars[stmt.target.id] = "KNOWN_NOT_NONE"
+
+            # 2. If guards with exit or assignment
+            if isinstance(stmt, ast.If):
+                body_exits = any(_statement_always_exits(s) for s in stmt.body)
+                orelse_exits = bool(stmt.orelse) and any(_statement_always_exits(s) for s in stmt.orelse)
+
+                for var in self._extract_names_from_test(stmt.test):
+                    if _is_test_checking_is_none(stmt.test, var) or _is_test_checking_falsy(stmt.test, var):
+                        if (body_exits and (not stmt.orelse or orelse_exits)) or (
+                            not stmt.orelse and _body_always_assigns_non_none(stmt.body, var)
+                        ):
+                            current_vars[var] = "KNOWN_NOT_NONE"
+                    elif (
+                        _is_test_checking_is_not_none(stmt.test, var) or _is_test_checking_truthy(stmt.test, var)
+                    ) and orelse_exits:
+                        current_vars[var] = "KNOWN_NOT_NONE"
+
+    def _extract_function_params(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, str]:
+        """Extract function parameters and determine if any default to None."""
+        var_state: dict[str, str] = {}
+        # Positional arguments
+        args = node.args.args
+        defaults = node.args.defaults
+        num_no_defaults = len(args) - len(defaults)
+        for i, default in enumerate(defaults):
+            arg = args[num_no_defaults + i]
+            if _is_none_literal(default):
+                var_state[arg.arg] = "MAYBE_NONE"
+
+        # Keyword-only arguments
+        for kwarg, kw_default in zip(node.args.kwonlyargs, node.args.kw_defaults):
+            if kw_default is not None and _is_none_literal(kw_default):
+                var_state[kwarg.arg] = "MAYBE_NONE"
+
+        return var_state
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        params_state = self._extract_function_params(node)
+        self._var_state_stack.append(params_state)
+        self._visit_statement_sequence(node.body)
+        self._var_state_stack.pop()
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        params_state = self._extract_function_params(node)
+        self._var_state_stack.append(params_state)
+        self._visit_statement_sequence(node.body)
+        self._var_state_stack.pop()
+
+    def visit_Module(self, node: ast.Module) -> None:
+        self._var_state_stack.append({})
+        self._visit_statement_sequence(node.body)
+        self._var_state_stack.pop()
+
+    def visit_If(self, node: ast.If) -> None:
+        # Visit condition expression first
+        self.visit(node.test)
+
+        # 1. Body branch
+        body_vars = dict(self._current_var_state)
+        for var in self._extract_names_from_test(node.test):
+            if _is_test_checking_is_none(node.test, var):
+                body_vars[var] = "DEFINITELY_NONE"
+            elif _is_test_checking_is_not_none(node.test, var) or _is_test_checking_truthy(node.test, var):
+                body_vars[var] = "KNOWN_NOT_NONE"
+
+        self._var_state_stack.append(body_vars)
+        self._visit_statement_sequence(node.body)
+        self._var_state_stack.pop()
+
+        # 2. Else branch
+        else_vars = dict(self._current_var_state)
+        for var in self._extract_names_from_test(node.test):
+            if _is_test_checking_is_none(node.test, var):
+                else_vars[var] = "KNOWN_NOT_NONE"
+            elif _is_test_checking_is_not_none(node.test, var):
+                else_vars[var] = "DEFINITELY_NONE"
+
+        self._var_state_stack.append(else_vars)
+        self._visit_statement_sequence(node.orelse)
+        self._var_state_stack.pop()
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        # Recurse into children first
+        self.generic_visit(node)
+
+        # Case 1: Direct literal None attribute dereference (e.g. 'None.attr')
+        if _is_none_literal(node.value):
+            if self._is_enclosed_in_attribute_error_handler():
+                return
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message=f"Direct dereference of literal None: attribute '{node.attr}' access will raise AttributeError.",
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="HIGH",
+                    explanation=(
+                        f"Accessing attribute '{node.attr}' directly on literal None unconditionally "
+                        f"raises an unhandled AttributeError exception when reached."
+                    ),
+                    suggested_fix="Do not access attributes on None; ensure the object is initialized to a valid instance.",
+                )
+            )
+            return
+
+        # Case 2: Immediate regex match chaining (e.g. 're.match(...).group()')
+        if node.attr in ("group", "groups", "groupdict"):
+            is_regex, regex_call_str = _is_regex_match_call(node.value)
+            if is_regex:
+                if self._is_enclosed_in_attribute_error_handler():
+                    return
+                self.issues.append(
+                    Issue(
+                        code="SEM002",
+                        message=(
+                            f"Immediate '{node.attr}()' call on '{regex_call_str}' may dereference "
+                            f"None if no match is found."
+                        ),
+                        file_path=self.file_path,
+                        line=node.lineno,
+                        column=node.col_offset,
+                        severity="WARNING",
+                        tool="semantic_analyzer",
+                        fixable=False,
+                        confidence="MEDIUM",
+                        explanation=(
+                            f"Static AST analysis detected immediate '.{node.attr}()' chaining on '{regex_call_str}'. "
+                            f"When no regex match is found, '{regex_call_str}' returns None, causing an unhandled "
+                            f"AttributeError at runtime."
+                        ),
+                        suggested_fix=(
+                            f"Store the regex match in a variable and verify it is not None before calling '.{node.attr}()', "
+                            f"or handle AttributeError."
+                        ),
+                    )
+                )
+                return
+
+        # Case 3: Variable attribute dereference ('x.attr')
+        var_name = _get_name_id(node.value)
+        if not var_name:
+            return
+
+        var_state = self._current_var_state.get(var_name)
+        if not var_state or var_state == "KNOWN_NOT_NONE":
+            return
+
+        if self._is_enclosed_in_attribute_error_handler():
+            return
+
+        if var_state == "DEFINITELY_NONE":
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message=(
+                        f"Dereference of variable '{var_name}' which is known to be None: "
+                        f"attribute '{node.attr}' access will raise AttributeError."
+                    ),
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="HIGH",
+                    explanation=(
+                        f"Variable '{var_name}' is proven to evaluate to None in this execution path. "
+                        f"Accessing attribute '{node.attr}' on None unconditionally raises AttributeError."
+                    ),
+                    suggested_fix=(
+                        f"Verify that '{var_name}' is not None prior to accessing '{node.attr}', "
+                        f"or provide a valid non-None assignment."
+                    ),
+                )
+            )
+        elif var_state == "MAYBE_NONE":
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message=(
+                        f"Possible None dereference: parameter '{var_name}' defaults to None "
+                        f"and is accessed via attribute '{node.attr}' without an effective guard."
+                    ),
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="MEDIUM",
+                    explanation=(
+                        f"Parameter '{var_name}' has a default value of None and is dereferenced "
+                        f"via '.{node.attr}' without a preceding None-check or early return guard. "
+                        f"If the caller relies on the default or passes None, AttributeError will occur."
+                    ),
+                    suggested_fix=(
+                        f"Add a guard such as 'if {var_name} is None: raise ValueError(...)' or "
+                        f"'if {var_name} is not None: ...' before accessing '.{node.attr}'."
+                    ),
+                )
+            )
+
+    def visit_Subscript(self, node: ast.Subscript) -> None:
+        # Recurse into children first
+        self.generic_visit(node)
+
+        # Case 1: Direct literal None subscript ('None[k]')
+        if _is_none_literal(node.value):
+            if self._is_enclosed_in_type_error_handler():
+                return
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message="Direct subscript on literal None will raise TypeError.",
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="HIGH",
+                    explanation=(
+                        "Subscripting literal None ('None[...]') unconditionally raises TypeError: "
+                        "'NoneType' object is not subscriptable."
+                    ),
+                    suggested_fix="Do not subscript None; ensure the object is initialized to a valid container (dict, list, etc.).",
+                )
+            )
+            return
+
+        # Case 2: Variable subscript ('x[k]')
+        var_name = _get_name_id(node.value)
+        if not var_name:
+            return
+
+        var_state = self._current_var_state.get(var_name)
+        if not var_state or var_state == "KNOWN_NOT_NONE":
+            return
+
+        if self._is_enclosed_in_type_error_handler():
+            return
+
+        if var_state == "DEFINITELY_NONE":
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message=(
+                        f"Subscript on variable '{var_name}' which is known to be None: "
+                        f"subscript access will raise TypeError."
+                    ),
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="HIGH",
+                    explanation=(
+                        f"Variable '{var_name}' is proven to evaluate to None in this execution path. "
+                        f"Subscripting None raises TypeError: 'NoneType' object is not subscriptable."
+                    ),
+                    suggested_fix=(
+                        f"Verify that '{var_name}' is not None prior to indexing, "
+                        f"or assign a valid container default."
+                    ),
+                )
+            )
+        elif var_state == "MAYBE_NONE":
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message=(
+                        f"Possible None dereference: parameter '{var_name}' defaults to None "
+                        f"and is subscripted without an effective guard."
+                    ),
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="MEDIUM",
+                    explanation=(
+                        f"Parameter '{var_name}' has a default value of None and is subscripted "
+                        f"without a preceding None-check or early return guard. "
+                        f"If the caller relies on the default or passes None, TypeError will occur."
+                    ),
+                    suggested_fix=(
+                        f"Add a guard such as 'if {var_name} is None: raise ValueError(...)' or "
+                        f"'if {var_name} is None: {var_name} = {{}}' before subscripting."
+                    ),
+                )
+            )
+
+    def visit_Call(self, node: ast.Call) -> None:
+        # Recurse into children first
+        self.generic_visit(node)
+
+        # Case 1: Direct literal None call ('None()')
+        if _is_none_literal(node.func):
+            if self._is_enclosed_in_type_error_handler():
+                return
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message="Calling literal None will raise TypeError.",
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="HIGH",
+                    explanation="Calling literal None unconditionally raises TypeError: 'NoneType' object is not callable.",
+                    suggested_fix="Do not invoke None; ensure a valid callable is provided.",
+                )
+            )
+            return
+
+        # Case 2: Variable call ('x()')
+        var_name = _get_name_id(node.func)
+        if not var_name:
+            return
+
+        var_state = self._current_var_state.get(var_name)
+        if not var_state or var_state == "KNOWN_NOT_NONE":
+            return
+
+        if self._is_enclosed_in_type_error_handler():
+            return
+
+        if var_state == "DEFINITELY_NONE":
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message=(
+                        f"Calling variable '{var_name}' which is known to be None: "
+                        f"invocation will raise TypeError."
+                    ),
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="HIGH",
+                    explanation=(
+                        f"Variable '{var_name}' is proven to evaluate to None in this execution path. "
+                        f"Calling None raises TypeError: 'NoneType' object is not callable."
+                    ),
+                    suggested_fix=(
+                        f"Verify that '{var_name}' is callable before invoking, "
+                        f"e.g. 'if callable({var_name}): {var_name}()'."
+                    ),
+                )
+            )
+        elif var_state == "MAYBE_NONE":
+            self.issues.append(
+                Issue(
+                    code="SEM002",
+                    message=(
+                        f"Possible None dereference: parameter '{var_name}' defaults to None "
+                        f"and is called without an effective guard."
+                    ),
+                    file_path=self.file_path,
+                    line=node.lineno,
+                    column=node.col_offset,
+                    severity="WARNING",
+                    tool="semantic_analyzer",
+                    fixable=False,
+                    confidence="MEDIUM",
+                    explanation=(
+                        f"Parameter '{var_name}' has a default value of None and is invoked directly "
+                        f"without a preceding None or callable check. "
+                        f"If the caller relies on the default or passes None, TypeError will occur."
+                    ),
+                    suggested_fix=(
+                        f"Add a guard such as 'if {var_name} is not None: {var_name}()' or "
+                        f"'if callable({var_name}): {var_name}()'."
+                    ),
+                )
+            )
+
+
 def analyze_python_source(source_code: str, file_path: str = "<string>") -> list[Issue]:
     """
-    Analyze Python source code string for semantic bug hazards.
+    Analyze Python source code string for semantic bug hazards (SEM001 and SEM002).
 
     Args:
         source_code: Python code content.
         file_path: Relative or absolute path for location reporting.
 
     Returns:
-        List of parsed Issue objects.
+        List of parsed Issue objects, sorted by line and column.
     """
     try:
         tree = ast.parse(source_code, filename=file_path)
@@ -408,9 +1020,15 @@ def analyze_python_source(source_code: str, file_path: str = "<string>") -> list
         # Gracefully handle syntax errors without crashing
         return []
 
-    detector = DivisionByZeroDetector(file_path=file_path)
-    detector.visit(tree)
-    return detector.issues
+    div_detector = DivisionByZeroDetector(file_path=file_path)
+    div_detector.visit(tree)
+
+    none_detector = NoneDereferenceDetector(file_path=file_path)
+    none_detector.visit(tree)
+
+    all_issues = div_detector.issues + none_detector.issues
+    all_issues.sort(key=lambda i: (i.line or 0, i.column or 0))
+    return all_issues
 
 
 def run_semantic_analysis(target_path: str) -> ToolResult:
