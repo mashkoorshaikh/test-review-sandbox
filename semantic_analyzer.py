@@ -202,9 +202,11 @@ def _catches_key_error(handler: ast.ExceptHandler) -> bool:
     return _type_matches(handler.type)
 
 
-def _statement_always_exits(stmt: ast.stmt) -> bool:
+def _statement_always_exits(stmt: ast.stmt, in_loop: bool = False) -> bool:
     """Check if a statement unconditionally exits the current block."""
     if isinstance(stmt, (ast.Raise, ast.Return)):
+        return True
+    if in_loop and isinstance(stmt, (ast.Break, ast.Continue)):
         return True
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
         func = stmt.value.func
@@ -220,157 +222,9 @@ def _statement_always_exits(stmt: ast.stmt) -> bool:
     return bool(
         isinstance(stmt, ast.If)
         and stmt.orelse
-        and all(_statement_always_exits(s) for s in stmt.body)
-        and all(_statement_always_exits(s) for s in stmt.orelse)
+        and all(_statement_always_exits(s, in_loop=in_loop) for s in stmt.body)
+        and all(_statement_always_exits(s, in_loop=in_loop) for s in stmt.orelse)
     )
-
-
-def _is_test_checking_zero(test: ast.AST, var_name: str) -> bool:
-    """
-    Check if a test expression tests if var_name is zero:
-      - 'var == 0' or '0 == var'
-      - 'not var'
-    """
-    if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):
-        if (
-            isinstance(test.left, ast.Name)
-            and test.left.id == var_name
-            and _is_zero_literal(test.comparators[0])
-        ):
-            return True
-        if (
-            _is_zero_literal(test.left)
-            and isinstance(test.comparators[0], ast.Name)
-            and test.comparators[0].id == var_name
-        ):
-            return True
-    elif (
-        isinstance(test, ast.UnaryOp)
-        and isinstance(test.op, ast.Not)
-        and isinstance(test.operand, ast.Name)
-        and test.operand.id == var_name
-    ):
-        return True
-    return False
-
-
-def _is_test_checking_nonzero(test: ast.AST, var_name: str) -> bool:
-    """
-    Check if a test expression tests if var_name is non-zero:
-      - 'var != 0' or '0 != var'
-      - 'var > 0' or 'var < 0'
-      - 'var' (truthy)
-    """
-    if isinstance(test, ast.Compare):
-        if len(test.ops) == 1 and isinstance(test.ops[0], ast.NotEq):
-            if (
-                isinstance(test.left, ast.Name)
-                and test.left.id == var_name
-                and _is_zero_literal(test.comparators[0])
-            ):
-                return True
-            if (
-                _is_zero_literal(test.left)
-                and isinstance(test.comparators[0], ast.Name)
-                and test.comparators[0].id == var_name
-            ):
-                return True
-        elif (
-            len(test.ops) == 1
-            and isinstance(test.ops[0], (ast.Gt, ast.Lt))
-            and isinstance(test.left, ast.Name)
-            and test.left.id == var_name
-            and _is_zero_literal(test.comparators[0])
-        ):
-            return True
-    elif isinstance(test, ast.Name) and test.id == var_name:
-        return True
-    return False
-
-
-def _is_test_checking_is_none(test: ast.AST, var_name: str) -> bool:
-    """Check if test checks if var_name is None (is None / == None)."""
-    if isinstance(test, ast.Compare) and len(test.ops) == 1:
-        op = test.ops[0]
-        if isinstance(op, (ast.Is, ast.Eq)):
-            if (
-                isinstance(test.left, ast.Name)
-                and test.left.id == var_name
-                and _is_none_literal(test.comparators[0])
-            ):
-                return True
-            if (
-                _is_none_literal(test.left)
-                and isinstance(test.comparators[0], ast.Name)
-                and test.comparators[0].id == var_name
-            ):
-                return True
-    return False
-
-
-def _is_test_checking_is_not_none(test: ast.AST, var_name: str) -> bool:
-    """Check if test checks if var_name is not None (is not None / != None)."""
-    if isinstance(test, ast.Compare) and len(test.ops) == 1:
-        op = test.ops[0]
-        if isinstance(op, (ast.IsNot, ast.NotEq)):
-            if (
-                isinstance(test.left, ast.Name)
-                and test.left.id == var_name
-                and _is_none_literal(test.comparators[0])
-            ):
-                return True
-            if (
-                _is_none_literal(test.left)
-                and isinstance(test.comparators[0], ast.Name)
-                and test.comparators[0].id == var_name
-            ):
-                return True
-    return False
-
-
-def _is_test_checking_truthy(test: ast.AST, var_name: str) -> bool:
-    """Check if test directly tests truthiness of var_name ('if x:')."""
-    return isinstance(test, ast.Name) and test.id == var_name
-
-
-def _is_test_checking_falsy(test: ast.AST, var_name: str) -> bool:
-    """Check if test directly tests falsiness of var_name ('if not x:')."""
-    return (
-        isinstance(test, ast.UnaryOp)
-        and isinstance(test.op, ast.Not)
-        and isinstance(test.operand, ast.Name)
-        and test.operand.id == var_name
-    )
-
-
-def _body_always_assigns_non_none(body: list[ast.stmt], var_name: str) -> bool:
-    """Check if statement sequence unconditionally assigns var_name a non-None value."""
-    assigned_non_none = False
-    for stmt in body:
-        if isinstance(stmt, ast.Assign):
-            for t in stmt.targets:
-                if isinstance(t, ast.Name) and t.id == var_name:
-                    assigned_non_none = not _is_none_literal(stmt.value)
-        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == var_name:
-            if stmt.value and not _is_none_literal(stmt.value):
-                assigned_non_none = True
-            else:
-                assigned_non_none = False
-    return assigned_non_none
-
-
-def _is_regex_match_call(node: ast.AST) -> tuple[bool, str]:
-    """Check if node is a call to re.match, re.search, or re.fullmatch."""
-    if isinstance(node, ast.Call):
-        func = node.func
-        if (
-            isinstance(func, ast.Attribute)
-            and func.attr in ("match", "search", "fullmatch")
-            and isinstance(func.value, ast.Name)
-            and func.value.id == "re"
-        ):
-            return True, f"re.{func.attr}()"
-    return False, ""
 
 
 # Dedicated sentinel object representing an unknown/unsupported literal value
@@ -401,6 +255,201 @@ def _extract_constant_value(node: ast.AST) -> Any:
         except Exception:  # noqa: BLE001
             return _UNKNOWN_KEY
     return _UNKNOWN_KEY
+
+
+@dataclass(frozen=True)
+class BranchFacts:
+    """Facts established along a single execution path."""
+
+    nonzero_vars: frozenset[str] = frozenset()
+    zero_vars: frozenset[str] = frozenset()
+    known_not_none_vars: frozenset[str] = frozenset()
+    definitely_none_vars: frozenset[str] = frozenset()
+    guarded_keys: frozenset[tuple[str, Any]] = frozenset()
+    lacking_keys: frozenset[tuple[str, Any]] = frozenset()
+
+    def merge_conjunction(self, other: BranchFacts) -> BranchFacts:
+        """Combine facts when both conditions must hold simultaneously."""
+        new_nonzero = self.nonzero_vars | other.nonzero_vars
+        new_zero = (self.zero_vars | other.zero_vars) - new_nonzero
+
+        new_not_none = self.known_not_none_vars | other.known_not_none_vars
+        new_def_none = (self.definitely_none_vars | other.definitely_none_vars) - new_not_none
+
+        return BranchFacts(
+            nonzero_vars=new_nonzero,
+            zero_vars=new_zero,
+            known_not_none_vars=new_not_none,
+            definitely_none_vars=new_def_none,
+            guarded_keys=self.guarded_keys | other.guarded_keys,
+            lacking_keys=self.lacking_keys | other.lacking_keys,
+        )
+
+
+def _extract_branch_facts(test: ast.AST) -> tuple[BranchFacts, BranchFacts]:
+    """
+    Extract facts that hold when `test` evaluates to True vs False.
+    Returns (true_facts, false_facts).
+    """
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        tf, ff = _extract_branch_facts(test.operand)
+        return ff, tf
+
+    if isinstance(test, ast.BoolOp):
+        if isinstance(test.op, ast.And):
+            tf = BranchFacts()
+            for v in test.values:
+                v_tf, _ = _extract_branch_facts(v)
+                tf = tf.merge_conjunction(v_tf)
+            return tf, BranchFacts()
+        if isinstance(test.op, ast.Or):
+            ff = BranchFacts()
+            for v in test.values:
+                _, v_ff = _extract_branch_facts(v)
+                ff = ff.merge_conjunction(v_ff)
+            return BranchFacts(), ff
+
+    if isinstance(test, ast.Compare) and len(test.ops) == 1:
+        op = test.ops[0]
+        left = test.left
+        right = test.comparators[0]
+
+        left_name = left.target.id if isinstance(left, ast.NamedExpr) and isinstance(left.target, ast.Name) else _get_name_id(left)
+        right_name = right.target.id if isinstance(right, ast.NamedExpr) and isinstance(right.target, ast.Name) else _get_name_id(right)
+
+        if isinstance(op, ast.Eq):
+            if left_name and _is_zero_literal(right):
+                return BranchFacts(zero_vars=frozenset({left_name})), BranchFacts(nonzero_vars=frozenset({left_name}))
+            if right_name and _is_zero_literal(left):
+                return BranchFacts(zero_vars=frozenset({right_name})), BranchFacts(nonzero_vars=frozenset({right_name}))
+            if left_name and _is_none_literal(right):
+                return BranchFacts(definitely_none_vars=frozenset({left_name})), BranchFacts(known_not_none_vars=frozenset({left_name}))
+            if right_name and _is_none_literal(left):
+                return BranchFacts(definitely_none_vars=frozenset({right_name})), BranchFacts(known_not_none_vars=frozenset({right_name}))
+
+        elif isinstance(op, ast.NotEq):
+            if left_name and _is_zero_literal(right):
+                return BranchFacts(nonzero_vars=frozenset({left_name})), BranchFacts(zero_vars=frozenset({left_name}))
+            if right_name and _is_zero_literal(left):
+                return BranchFacts(nonzero_vars=frozenset({right_name})), BranchFacts(zero_vars=frozenset({right_name}))
+            if left_name and _is_none_literal(right):
+                return BranchFacts(known_not_none_vars=frozenset({left_name})), BranchFacts(definitely_none_vars=frozenset({left_name}))
+            if right_name and _is_none_literal(left):
+                return BranchFacts(known_not_none_vars=frozenset({right_name})), BranchFacts(definitely_none_vars=frozenset({right_name}))
+
+        elif isinstance(op, ast.Is):
+            if left_name and _is_none_literal(right):
+                return BranchFacts(definitely_none_vars=frozenset({left_name})), BranchFacts(known_not_none_vars=frozenset({left_name}))
+            if right_name and _is_none_literal(left):
+                return BranchFacts(definitely_none_vars=frozenset({right_name})), BranchFacts(known_not_none_vars=frozenset({right_name}))
+
+        elif isinstance(op, ast.IsNot):
+            if left_name and _is_none_literal(right):
+                return BranchFacts(known_not_none_vars=frozenset({left_name})), BranchFacts(definitely_none_vars=frozenset({left_name}))
+            if right_name and _is_none_literal(left):
+                return BranchFacts(known_not_none_vars=frozenset({right_name})), BranchFacts(definitely_none_vars=frozenset({right_name}))
+
+        elif isinstance(op, (ast.Gt, ast.Lt)):
+            if left_name and _is_zero_literal(right):
+                return BranchFacts(nonzero_vars=frozenset({left_name})), BranchFacts()
+            if right_name and _is_zero_literal(left):
+                return BranchFacts(nonzero_vars=frozenset({right_name})), BranchFacts()
+
+        elif isinstance(op, ast.In):
+            key_val = _extract_constant_value(left)
+            if key_val is not _UNKNOWN_KEY and right_name:
+                return BranchFacts(guarded_keys=frozenset({(right_name, key_val)})), BranchFacts(lacking_keys=frozenset({(right_name, key_val)}))
+
+        elif isinstance(op, ast.NotIn):
+            key_val = _extract_constant_value(left)
+            if key_val is not _UNKNOWN_KEY and right_name:
+                return BranchFacts(lacking_keys=frozenset({(right_name, key_val)})), BranchFacts(guarded_keys=frozenset({(right_name, key_val)}))
+
+    if isinstance(test, ast.Name):
+        var = test.id
+        return BranchFacts(nonzero_vars=frozenset({var}), known_not_none_vars=frozenset({var})), BranchFacts(zero_vars=frozenset({var}))
+
+    if isinstance(test, ast.NamedExpr) and isinstance(test.target, ast.Name):
+        var = test.target.id
+        val_tf, val_ff = _extract_branch_facts(test.value)
+        tf = val_tf.merge_conjunction(BranchFacts(nonzero_vars=frozenset({var}), known_not_none_vars=frozenset({var})))
+        ff = val_ff.merge_conjunction(BranchFacts(zero_vars=frozenset({var})))
+        return tf, ff
+
+    return BranchFacts(), BranchFacts()
+
+
+def _is_test_checking_zero(test: ast.AST, var_name: str) -> bool:
+    """Check if test implies var_name is zero when true."""
+    tf, _ = _extract_branch_facts(test)
+    return var_name in tf.zero_vars
+
+
+def _is_test_checking_nonzero(test: ast.AST, var_name: str) -> bool:
+    """Check if test implies var_name is non-zero when true."""
+    tf, _ = _extract_branch_facts(test)
+    return var_name in tf.nonzero_vars
+
+
+def _is_test_checking_is_none(test: ast.AST, var_name: str) -> bool:
+    """Check if test implies var_name is None when true."""
+    tf, _ = _extract_branch_facts(test)
+    return var_name in tf.definitely_none_vars
+
+
+def _is_test_checking_is_not_none(test: ast.AST, var_name: str) -> bool:
+    """Check if test implies var_name is not None when true."""
+    tf, _ = _extract_branch_facts(test)
+    return var_name in tf.known_not_none_vars
+
+
+def _is_test_checking_truthy(test: ast.AST, var_name: str) -> bool:
+    """Check if test directly tests truthiness of var_name."""
+    tf, _ = _extract_branch_facts(test)
+    return var_name in tf.known_not_none_vars and var_name in tf.nonzero_vars
+
+
+def _is_test_checking_falsy(test: ast.AST, var_name: str) -> bool:
+    """Check if test implies falsiness of var_name when true."""
+    tf, _ = _extract_branch_facts(test)
+    return var_name in tf.zero_vars or (isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not) and isinstance(test.operand, ast.Name) and test.operand.id == var_name)
+
+
+def _body_always_assigns_non_none(body: list[ast.stmt], var_name: str) -> bool:
+    """Check if statement sequence unconditionally assigns var_name a non-None value."""
+    assigned_non_none = False
+    for stmt in body:
+        if isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                if isinstance(t, ast.Name) and t.id == var_name:
+                    assigned_non_none = not _is_none_literal(stmt.value)
+        elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name) and stmt.target.id == var_name:
+            if stmt.value and not _is_none_literal(stmt.value):
+                assigned_non_none = True
+            else:
+                assigned_non_none = False
+        elif (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.NamedExpr)
+            and isinstance(stmt.value.target, ast.Name)
+            and stmt.value.target.id == var_name
+        ):
+            assigned_non_none = not _is_none_literal(stmt.value.value)
+    return assigned_non_none
+
+
+def _is_regex_match_call(node: ast.AST) -> tuple[bool, str]:
+    """Check if node is a call to re.match, re.search, or re.fullmatch."""
+    if isinstance(node, ast.Call):
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("match", "search", "fullmatch")
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "re"
+        ):
+            return True, f"re.{func.attr}()"
+    return False, ""
 
 
 def _extract_sequence_length(node: ast.List | ast.Tuple) -> int | None:
@@ -520,6 +569,9 @@ def _extract_all_modified_names(node: ast.AST) -> set[str]:
             for kw in child.keywords:
                 if isinstance(kw.value, ast.Name):
                     names.add(kw.value.id)
+        elif isinstance(child, ast.NamedExpr):
+            if isinstance(child.target, ast.Name):
+                names.add(child.target.id)
         elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or (
             isinstance(child, ast.ExceptHandler) and child.name
         ):
@@ -540,6 +592,9 @@ def _extract_assigned_names_in_subtree(node: ast.AST) -> set[str]:
             for n in ast.walk(child.target):
                 if isinstance(n, ast.Name):
                     names.add(n.id)
+        elif isinstance(child, ast.NamedExpr):
+            if isinstance(child.target, ast.Name):
+                names.add(child.target.id)
         elif isinstance(child, ast.Delete):
             for t in child.targets:
                 for n in ast.walk(t):
@@ -591,10 +646,16 @@ class DivisionByZeroDetector(ast.NodeVisitor):
         self._try_handlers_stack: list[list[ast.ExceptHandler]] = []
         # Stack of sets of variables currently known to be non-zero in the active branch
         self._guarded_vars_stack: list[set[str]] = [set()]
+        # Loop context stack tracking whether execution is inside a loop iteration
+        self._in_loop_stack: list[bool] = [False]
 
     @property
     def _current_guarded_vars(self) -> set[str]:
         return self._guarded_vars_stack[-1]
+
+    @property
+    def _in_loop(self) -> bool:
+        return self._in_loop_stack[-1]
 
     def _is_enclosed_in_zero_division_handler(self) -> bool:
         """Check if current execution is protected by a try block catching ZeroDivisionError."""
@@ -648,7 +709,9 @@ class DivisionByZeroDetector(ast.NodeVisitor):
             if isinstance(t, ast.Name):
                 loop_guards.discard(t.id)
         self._guarded_vars_stack.append(loop_guards)
+        self._in_loop_stack.append(True)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._guarded_vars_stack.pop()
 
         self._guarded_vars_stack.append(set(self._current_guarded_vars))
@@ -663,7 +726,9 @@ class DivisionByZeroDetector(ast.NodeVisitor):
             if isinstance(t, ast.Name):
                 loop_guards.discard(t.id)
         self._guarded_vars_stack.append(loop_guards)
+        self._in_loop_stack.append(True)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._guarded_vars_stack.pop()
 
         self._guarded_vars_stack.append(set(self._current_guarded_vars))
@@ -672,13 +737,14 @@ class DivisionByZeroDetector(ast.NodeVisitor):
 
     def visit_While(self, node: ast.While) -> None:
         self.visit(node.test)
+        tf, _ = _extract_branch_facts(node.test)
         loop_guards = set(self._current_guarded_vars)
-        for var in self._extract_names_from_test(node.test):
-            if _is_test_checking_nonzero(node.test, var):
-                loop_guards.add(var)
+        loop_guards.update(tf.nonzero_vars)
 
         self._guarded_vars_stack.append(loop_guards)
+        self._in_loop_stack.append(True)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._guarded_vars_stack.pop()
 
         self._guarded_vars_stack.append(set(self._current_guarded_vars))
@@ -690,7 +756,6 @@ class DivisionByZeroDetector(ast.NodeVisitor):
 
     def _visit_statement_sequence(self, stmts: list[ast.stmt]) -> None:
         """Visit a sequence of statements while tracking variable guards and exits."""
-        # Inherit current guarded vars
         current_guards = set(self._current_guarded_vars)
 
         for stmt in stmts:
@@ -698,15 +763,23 @@ class DivisionByZeroDetector(ast.NodeVisitor):
             self.visit(stmt)
             self._guarded_vars_stack.pop()
 
-            # Check if this statement is an 'if <var> == 0: exit' guard
+            # Check if this statement is an exit guard
             if isinstance(stmt, ast.If):
-                body_exits = any(_statement_always_exits(s) for s in stmt.body)
-                orelse_exits = (not stmt.orelse) or any(_statement_always_exits(s) for s in stmt.orelse)
+                body_exits = any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.body)
+                orelse_exits = (not stmt.orelse) or any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.orelse)
                 promoted: set[str] = set()
 
-                # Check for zero test on variables
-                for var in self._extract_names_from_test(stmt.test):
-                    if _is_test_checking_zero(stmt.test, var) and body_exits and orelse_exits:
+                tf, ff = _extract_branch_facts(stmt.test)
+
+                # If body exits, subsequent statements continue only if condition was FALSE
+                if body_exits and orelse_exits:
+                    for var in ff.nonzero_vars:
+                        current_guards.add(var)
+                        promoted.add(var)
+
+                # If orelse exits, subsequent statements continue only if condition was TRUE
+                if bool(stmt.orelse) and any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.orelse) and not body_exits:
+                    for var in tf.nonzero_vars:
                         current_guards.add(var)
                         promoted.add(var)
 
@@ -733,48 +806,113 @@ class DivisionByZeroDetector(ast.NodeVisitor):
 
     def _extract_assigned_names(self, stmt: ast.stmt) -> set[str]:
         names: set[str] = set()
-        if isinstance(stmt, ast.Assign):
-            for target in stmt.targets:
-                if isinstance(target, ast.Name):
-                    names.add(target.id)
-        elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)) and isinstance(stmt.target, ast.Name):
-            names.add(stmt.target.id)
-        elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(stmt.name)
+        for child in _walk_enclosing_scope(stmt):
+            if isinstance(child, ast.Assign):
+                for target in child.targets:
+                    for n in ast.walk(target):
+                        if isinstance(n, ast.Name):
+                            names.add(n.id)
+            elif isinstance(child, (ast.AugAssign, ast.AnnAssign)):
+                for n in ast.walk(child.target):
+                    if isinstance(n, ast.Name):
+                        names.add(n.id)
+            elif isinstance(child, ast.NamedExpr):
+                if isinstance(child.target, ast.Name):
+                    names.add(child.target.id)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(child.name)
         return names
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._guarded_vars_stack.append(set())
+        self._in_loop_stack.append(False)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._guarded_vars_stack.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._guarded_vars_stack.append(set())
+        self._in_loop_stack.append(False)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._guarded_vars_stack.pop()
 
     def visit_Module(self, node: ast.Module) -> None:
         self._visit_statement_sequence(node.body)
 
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            self._current_guarded_vars.discard(node.target.id)
+        self.visit(node.target)
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        if isinstance(node.op, ast.And):
+            accumulated_tf = BranchFacts()
+            orig_guards = set(self._current_guarded_vars)
+            for val in node.values:
+                step_guards = set(orig_guards)
+                step_guards.update(accumulated_tf.nonzero_vars)
+                self._guarded_vars_stack.append(step_guards)
+                self.visit(val)
+                self._guarded_vars_stack.pop()
+
+                for name in _extract_all_modified_names(val):
+                    orig_guards.discard(name)
+
+                val_tf, _ = _extract_branch_facts(val)
+                accumulated_tf = accumulated_tf.merge_conjunction(val_tf)
+
+        elif isinstance(node.op, ast.Or):
+            accumulated_ff = BranchFacts()
+            orig_guards = set(self._current_guarded_vars)
+            for val in node.values:
+                step_guards = set(orig_guards)
+                step_guards.update(accumulated_ff.nonzero_vars)
+                self._guarded_vars_stack.append(step_guards)
+                self.visit(val)
+                self._guarded_vars_stack.pop()
+
+                for name in _extract_all_modified_names(val):
+                    orig_guards.discard(name)
+
+                _, val_ff = _extract_branch_facts(val)
+                accumulated_ff = accumulated_ff.merge_conjunction(val_ff)
+        else:
+            self.generic_visit(node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self.visit(node.test)
+        tf, ff = _extract_branch_facts(node.test)
+
+        body_guards = set(self._current_guarded_vars)
+        body_guards.update(tf.nonzero_vars)
+        self._guarded_vars_stack.append(body_guards)
+        self.visit(node.body)
+        self._guarded_vars_stack.pop()
+
+        else_guards = set(self._current_guarded_vars)
+        else_guards.update(ff.nonzero_vars)
+        self._guarded_vars_stack.append(else_guards)
+        self.visit(node.orelse)
+        self._guarded_vars_stack.pop()
+
     def visit_If(self, node: ast.If) -> None:
         # Visit condition
         self.visit(node.test)
+        tf, ff = _extract_branch_facts(node.test)
 
         # 1. Body branch: check if test guarantees non-zero
         body_guards = set(self._current_guarded_vars)
-        for var in self._extract_names_from_test(node.test):
-            if _is_test_checking_nonzero(node.test, var):
-                body_guards.add(var)
+        body_guards.update(tf.nonzero_vars)
 
         self._guarded_vars_stack.append(body_guards)
         self._visit_statement_sequence(node.body)
         self._guarded_vars_stack.pop()
 
-        # 2. Else branch: check if test was checking zero ('if b == 0: ... else: return a / b')
+        # 2. Else branch: check if test being false guarantees non-zero
         else_guards = set(self._current_guarded_vars)
-        for var in self._extract_names_from_test(node.test):
-            if _is_test_checking_zero(node.test, var):
-                else_guards.add(var)
+        else_guards.update(ff.nonzero_vars)
 
         self._guarded_vars_stack.append(else_guards)
         self._visit_statement_sequence(node.orelse)
@@ -881,10 +1019,15 @@ class NoneDereferenceDetector(ast.NodeVisitor):
         self._try_handlers_stack: list[list[ast.ExceptHandler]] = []
         # Stack of variable state dicts: var_name -> "DEFINITELY_NONE" | "MAYBE_NONE" | "KNOWN_NOT_NONE"
         self._var_state_stack: list[dict[str, str]] = [{}]
+        self._in_loop_stack: list[bool] = [False]
 
     @property
     def _current_var_state(self) -> dict[str, str]:
         return self._var_state_stack[-1]
+
+    @property
+    def _in_loop(self) -> bool:
+        return self._in_loop_stack[-1]
 
     def _is_enclosed_in_attribute_error_handler(self) -> bool:
         for handlers in self._try_handlers_stack:
@@ -946,7 +1089,9 @@ class NoneDereferenceDetector(ast.NodeVisitor):
             if isinstance(t, ast.Name):
                 loop_vars[t.id] = "KNOWN_NOT_NONE"
         self._var_state_stack.append(loop_vars)
+        self._in_loop_stack.append(True)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._var_state_stack.pop()
 
         self._var_state_stack.append(dict(self._current_var_state))
@@ -961,7 +1106,9 @@ class NoneDereferenceDetector(ast.NodeVisitor):
             if isinstance(t, ast.Name):
                 loop_vars[t.id] = "KNOWN_NOT_NONE"
         self._var_state_stack.append(loop_vars)
+        self._in_loop_stack.append(True)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._var_state_stack.pop()
 
         self._var_state_stack.append(dict(self._current_var_state))
@@ -970,15 +1117,17 @@ class NoneDereferenceDetector(ast.NodeVisitor):
 
     def visit_While(self, node: ast.While) -> None:
         self.visit(node.test)
+        tf, _ = _extract_branch_facts(node.test)
         loop_vars = dict(self._current_var_state)
-        for var in self._extract_names_from_test(node.test):
-            if _is_test_checking_is_not_none(node.test, var) or _is_test_checking_truthy(node.test, var):
-                loop_vars[var] = "KNOWN_NOT_NONE"
-            elif _is_test_checking_is_none(node.test, var):
-                loop_vars[var] = "DEFINITELY_NONE"
+        for var in tf.known_not_none_vars:
+            loop_vars[var] = "KNOWN_NOT_NONE"
+        for var in tf.definitely_none_vars:
+            loop_vars[var] = "DEFINITELY_NONE"
 
         self._var_state_stack.append(loop_vars)
+        self._in_loop_stack.append(True)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._var_state_stack.pop()
 
         self._var_state_stack.append(dict(self._current_var_state))
@@ -1026,23 +1175,42 @@ class NoneDereferenceDetector(ast.NodeVisitor):
             elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 current_vars[stmt.name] = "KNOWN_NOT_NONE"
 
+            # 1b. NamedExpr assignment tracking
+            if not isinstance(stmt, (ast.If, ast.Try, ast.For, ast.AsyncFor, ast.While)):
+                for child in _walk_enclosing_scope(stmt):
+                    if isinstance(child, ast.NamedExpr) and isinstance(child.target, ast.Name):
+                        if _is_none_literal(child.value):
+                            current_vars[child.target.id] = "DEFINITELY_NONE"
+                        else:
+                            current_vars[child.target.id] = "KNOWN_NOT_NONE"
+
             # 2. If guards with exit or assignment
             if isinstance(stmt, ast.If):
-                body_exits = any(_statement_always_exits(s) for s in stmt.body)
-                orelse_exits = bool(stmt.orelse) and any(_statement_always_exits(s) for s in stmt.orelse)
+                body_exits = any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.body)
+                orelse_exits = bool(stmt.orelse) and any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.orelse)
                 promoted_guards: set[str] = set()
 
-                for var in self._extract_names_from_test(stmt.test):
-                    if _is_test_checking_is_none(stmt.test, var) or _is_test_checking_falsy(stmt.test, var):
-                        if (body_exits and (not stmt.orelse or orelse_exits)) or (
-                            not stmt.orelse and _body_always_assigns_non_none(stmt.body, var)
-                        ):
+                tf, ff = _extract_branch_facts(stmt.test)
+
+                if body_exits and (not stmt.orelse or orelse_exits):
+                    for var in ff.known_not_none_vars:
+                        current_vars[var] = "KNOWN_NOT_NONE"
+                        promoted_guards.add(var)
+                    for var in ff.definitely_none_vars:
+                        current_vars[var] = "DEFINITELY_NONE"
+                        promoted_guards.add(var)
+                elif not stmt.orelse:
+                    for var in self._extract_names_from_test(stmt.test):
+                        if (_is_test_checking_is_none(stmt.test, var) or _is_test_checking_falsy(stmt.test, var)) and _body_always_assigns_non_none(stmt.body, var):
                             current_vars[var] = "KNOWN_NOT_NONE"
                             promoted_guards.add(var)
-                    elif (
-                        _is_test_checking_is_not_none(stmt.test, var) or _is_test_checking_truthy(stmt.test, var)
-                    ) and orelse_exits:
+
+                if orelse_exits and not body_exits:
+                    for var in tf.known_not_none_vars:
                         current_vars[var] = "KNOWN_NOT_NONE"
+                        promoted_guards.add(var)
+                    for var in tf.definitely_none_vars:
+                        current_vars[var] = "DEFINITELY_NONE"
                         promoted_guards.add(var)
 
                 # Invalidate variables modified in branches if execution can continue through them
@@ -1076,13 +1244,17 @@ class NoneDereferenceDetector(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         params_state = self._extract_function_params(node)
         self._var_state_stack.append(params_state)
+        self._in_loop_stack.append(False)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._var_state_stack.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         params_state = self._extract_function_params(node)
         self._var_state_stack.append(params_state)
+        self._in_loop_stack.append(False)
         self._visit_statement_sequence(node.body)
+        self._in_loop_stack.pop()
         self._var_state_stack.pop()
 
     def visit_Module(self, node: ast.Module) -> None:
@@ -1090,17 +1262,89 @@ class NoneDereferenceDetector(ast.NodeVisitor):
         self._visit_statement_sequence(node.body)
         self._var_state_stack.pop()
 
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        if isinstance(node.target, ast.Name):
+            if _is_none_literal(node.value):
+                self._current_var_state[node.target.id] = "DEFINITELY_NONE"
+            else:
+                self._current_var_state[node.target.id] = "KNOWN_NOT_NONE"
+        self.visit(node.target)
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        if isinstance(node.op, ast.And):
+            accumulated_tf = BranchFacts()
+            orig_vars = dict(self._current_var_state)
+            for val in node.values:
+                step_vars = dict(orig_vars)
+                for v in accumulated_tf.known_not_none_vars:
+                    step_vars[v] = "KNOWN_NOT_NONE"
+                for v in accumulated_tf.definitely_none_vars:
+                    step_vars[v] = "DEFINITELY_NONE"
+                self._var_state_stack.append(step_vars)
+                self.visit(val)
+                self._var_state_stack.pop()
+
+                for name in _extract_all_modified_names(val):
+                    orig_vars.pop(name, None)
+
+                val_tf, _ = _extract_branch_facts(val)
+                accumulated_tf = accumulated_tf.merge_conjunction(val_tf)
+
+        elif isinstance(node.op, ast.Or):
+            accumulated_ff = BranchFacts()
+            orig_vars = dict(self._current_var_state)
+            for val in node.values:
+                step_vars = dict(orig_vars)
+                for v in accumulated_ff.known_not_none_vars:
+                    step_vars[v] = "KNOWN_NOT_NONE"
+                for v in accumulated_ff.definitely_none_vars:
+                    step_vars[v] = "DEFINITELY_NONE"
+                self._var_state_stack.append(step_vars)
+                self.visit(val)
+                self._var_state_stack.pop()
+
+                for name in _extract_all_modified_names(val):
+                    orig_vars.pop(name, None)
+
+                _, val_ff = _extract_branch_facts(val)
+                accumulated_ff = accumulated_ff.merge_conjunction(val_ff)
+        else:
+            self.generic_visit(node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self.visit(node.test)
+        tf, ff = _extract_branch_facts(node.test)
+
+        body_vars = dict(self._current_var_state)
+        for v in tf.known_not_none_vars:
+            body_vars[v] = "KNOWN_NOT_NONE"
+        for v in tf.definitely_none_vars:
+            body_vars[v] = "DEFINITELY_NONE"
+        self._var_state_stack.append(body_vars)
+        self.visit(node.body)
+        self._var_state_stack.pop()
+
+        else_vars = dict(self._current_var_state)
+        for v in ff.known_not_none_vars:
+            else_vars[v] = "KNOWN_NOT_NONE"
+        for v in ff.definitely_none_vars:
+            else_vars[v] = "DEFINITELY_NONE"
+        self._var_state_stack.append(else_vars)
+        self.visit(node.orelse)
+        self._var_state_stack.pop()
+
     def visit_If(self, node: ast.If) -> None:
         # Visit condition expression first
         self.visit(node.test)
+        tf, ff = _extract_branch_facts(node.test)
 
         # 1. Body branch
         body_vars = dict(self._current_var_state)
-        for var in self._extract_names_from_test(node.test):
-            if _is_test_checking_is_none(node.test, var):
-                body_vars[var] = "DEFINITELY_NONE"
-            elif _is_test_checking_is_not_none(node.test, var) or _is_test_checking_truthy(node.test, var):
-                body_vars[var] = "KNOWN_NOT_NONE"
+        for var in tf.known_not_none_vars:
+            body_vars[var] = "KNOWN_NOT_NONE"
+        for var in tf.definitely_none_vars:
+            body_vars[var] = "DEFINITELY_NONE"
 
         self._var_state_stack.append(body_vars)
         self._visit_statement_sequence(node.body)
@@ -1108,11 +1352,10 @@ class NoneDereferenceDetector(ast.NodeVisitor):
 
         # 2. Else branch
         else_vars = dict(self._current_var_state)
-        for var in self._extract_names_from_test(node.test):
-            if _is_test_checking_is_none(node.test, var):
-                else_vars[var] = "KNOWN_NOT_NONE"
-            elif _is_test_checking_is_not_none(node.test, var):
-                else_vars[var] = "DEFINITELY_NONE"
+        for var in ff.known_not_none_vars:
+            else_vars[var] = "KNOWN_NOT_NONE"
+        for var in ff.definitely_none_vars:
+            else_vars[var] = "DEFINITELY_NONE"
 
         self._var_state_stack.append(else_vars)
         self._visit_statement_sequence(node.orelse)
@@ -1440,6 +1683,11 @@ class IndexAndKeyAccessDetector(ast.NodeVisitor):
         self.issues: list[Issue] = []
         self._try_handlers_stack: list[list[ast.ExceptHandler]] = []
         self._collection_stack: list[dict[str, CollectionLiteralState]] = [{}]
+        self._in_loop_stack: list[bool] = [False]
+
+    @property
+    def _in_loop(self) -> bool:
+        return self._in_loop_stack[-1]
 
     @property
     def _current_collections(self) -> dict[str, CollectionLiteralState]:
@@ -1501,9 +1749,11 @@ class IndexAndKeyAccessDetector(ast.NodeVisitor):
         for t in ast.walk(node.target):
             if isinstance(t, ast.Name):
                 loop_collections.pop(t.id, None)
+        self._in_loop_stack.append(True)
         self._collection_stack.append(loop_collections)
         self._visit_statement_sequence(node.body)
         self._collection_stack.pop()
+        self._in_loop_stack.pop()
 
         self._collection_stack.append({k: v.copy() for k, v in self._current_collections.items()})
         self._visit_statement_sequence(node.orelse)
@@ -1516,9 +1766,11 @@ class IndexAndKeyAccessDetector(ast.NodeVisitor):
         for t in ast.walk(node.target):
             if isinstance(t, ast.Name):
                 loop_collections.pop(t.id, None)
+        self._in_loop_stack.append(True)
         self._collection_stack.append(loop_collections)
         self._visit_statement_sequence(node.body)
         self._collection_stack.pop()
+        self._in_loop_stack.pop()
 
         self._collection_stack.append({k: v.copy() for k, v in self._current_collections.items()})
         self._visit_statement_sequence(node.orelse)
@@ -1526,16 +1778,17 @@ class IndexAndKeyAccessDetector(ast.NodeVisitor):
 
     def visit_While(self, node: ast.While) -> None:
         self.visit(node.test)
-        guard = _extract_membership_guard(node.test)
+        tf, _ = _extract_branch_facts(node.test)
         loop_collections = {k: v.copy() for k, v in self._current_collections.items()}
-        if guard and guard[2] is True:
-            var_name, key_val, _ = guard
+        for var_name, key_val in tf.guarded_keys:
             if var_name in loop_collections:
                 loop_collections[var_name].guarded_keys.add(key_val)
 
+        self._in_loop_stack.append(True)
         self._collection_stack.append(loop_collections)
         self._visit_statement_sequence(node.body)
         self._collection_stack.pop()
+        self._in_loop_stack.pop()
 
         self._collection_stack.append({k: v.copy() for k, v in self._current_collections.items()})
         self._visit_statement_sequence(node.orelse)
@@ -1545,14 +1798,18 @@ class IndexAndKeyAccessDetector(ast.NodeVisitor):
         visit_TryStar = visit_Try
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._in_loop_stack.append(False)
         self._collection_stack.append({})
         self._visit_statement_sequence(node.body)
         self._collection_stack.pop()
+        self._in_loop_stack.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._in_loop_stack.append(False)
         self._collection_stack.append({})
         self._visit_statement_sequence(node.body)
         self._collection_stack.pop()
+        self._in_loop_stack.pop()
 
     def visit_Module(self, node: ast.Module) -> None:
         self._collection_stack.append({})
@@ -1562,12 +1819,11 @@ class IndexAndKeyAccessDetector(ast.NodeVisitor):
     def visit_If(self, node: ast.If) -> None:
         self.visit(node.test)
 
-        guard = _extract_membership_guard(node.test)
+        tf, ff = _extract_branch_facts(node.test)
 
         # 1. Body branch
         body_collections = {k: v.copy() for k, v in self._current_collections.items()}
-        if guard and guard[2] is True:
-            var_name, key_val, _ = guard
+        for var_name, key_val in tf.guarded_keys:
             if var_name in body_collections:
                 body_collections[var_name].guarded_keys.add(key_val)
 
@@ -1577,14 +1833,108 @@ class IndexAndKeyAccessDetector(ast.NodeVisitor):
 
         # 2. Else branch
         else_collections = {k: v.copy() for k, v in self._current_collections.items()}
-        if guard and guard[2] is False:
-            var_name, key_val, _ = guard
+        for var_name, key_val in ff.guarded_keys:
             if var_name in else_collections:
                 else_collections[var_name].guarded_keys.add(key_val)
 
         self._collection_stack.append(else_collections)
         self._visit_statement_sequence(node.orelse)
         self._collection_stack.pop()
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        if isinstance(node.op, ast.And):
+            accumulated_tf = BranchFacts()
+            for value in node.values:
+                saved_guarded: dict[str, set[Any]] = {
+                    k: set(v.guarded_keys) for k, v in self._current_collections.items()
+                }
+                for var, key in accumulated_tf.guarded_keys:
+                    if var in self._current_collections:
+                        self._current_collections[var].guarded_keys.add(key)
+                self.visit(value)
+                for var, keys in saved_guarded.items():
+                    if var in self._current_collections:
+                        self._current_collections[var].guarded_keys = set(keys)
+
+                val_tf, _ = _extract_branch_facts(value)
+                accumulated_tf = accumulated_tf.merge_conjunction(val_tf)
+
+        elif isinstance(node.op, ast.Or):
+            accumulated_ff = BranchFacts()
+            for value in node.values:
+                saved_guarded = {
+                    k: set(v.guarded_keys) for k, v in self._current_collections.items()
+                }
+                for var, key in accumulated_ff.guarded_keys:
+                    if var in self._current_collections:
+                        self._current_collections[var].guarded_keys.add(key)
+                self.visit(value)
+                for var, keys in saved_guarded.items():
+                    if var in self._current_collections:
+                        self._current_collections[var].guarded_keys = set(keys)
+
+                _, val_ff = _extract_branch_facts(value)
+                accumulated_ff = accumulated_ff.merge_conjunction(val_ff)
+        else:
+            self.generic_visit(node)
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self.visit(node.test)
+        tf, ff = _extract_branch_facts(node.test)
+
+        # Body under True facts
+        saved_guarded = {
+            k: set(v.guarded_keys) for k, v in self._current_collections.items()
+        }
+        for var, key in tf.guarded_keys:
+            if var in self._current_collections:
+                self._current_collections[var].guarded_keys.add(key)
+        self.visit(node.body)
+        for var, keys in saved_guarded.items():
+            if var in self._current_collections:
+                self._current_collections[var].guarded_keys = set(keys)
+
+        # Orelse under False facts
+        saved_guarded = {
+            k: set(v.guarded_keys) for k, v in self._current_collections.items()
+        }
+        for var, key in ff.guarded_keys:
+            if var in self._current_collections:
+                self._current_collections[var].guarded_keys.add(key)
+        self.visit(node.orelse)
+        for var, keys in saved_guarded.items():
+            if var in self._current_collections:
+                self._current_collections[var].guarded_keys = set(keys)
+
+        for m in _extract_assigned_names_in_subtree(node.body) | _extract_assigned_names_in_subtree(node.orelse):
+            self._current_collections.pop(m, None)
+
+    def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
+        self.visit(node.value)
+        target_name = _get_name_id(node.target)
+        if target_name:
+            self._current_collections.pop(target_name, None)
+            if isinstance(node.value, (ast.List, ast.Tuple)):
+                length = _extract_sequence_length(node.value)
+                if length is not None:
+                    kind = "LIST" if isinstance(node.value, ast.List) else "TUPLE"
+                    self._current_collections[target_name] = CollectionLiteralState(kind=kind, length=length)
+            elif isinstance(node.value, ast.Dict):
+                keys = _extract_dict_literal_keys(node.value)
+                if keys is not None:
+                    self._current_collections[target_name] = CollectionLiteralState(kind="DICT", known_keys=keys)
+        self.visit(node.target)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            self._current_collections.pop(node.func.value.id, None)
+        for arg in node.args:
+            if isinstance(arg, ast.Name):
+                self._current_collections.pop(arg.id, None)
+        for kw in node.keywords:
+            if isinstance(kw.value, ast.Name):
+                self._current_collections.pop(kw.value.id, None)
+        self.generic_visit(node)
 
     def visit_Subscript(self, node: ast.Subscript) -> None:
         self.generic_visit(node)
@@ -1849,15 +2199,38 @@ class IndexAndKeyAccessDetector(ast.NodeVisitor):
                         if isinstance(kw.value, ast.Name):
                             current_collections.pop(kw.value.id, None)
 
+            # 2b. Invalidate/update from NamedExpr within stmt
+            if not isinstance(stmt, (ast.If, ast.Try, ast.For, ast.AsyncFor, ast.While)):
+                for child in _walk_enclosing_scope(stmt):
+                    if isinstance(child, ast.NamedExpr):
+                        for target_name in _extract_all_modified_names(child):
+                            current_collections.pop(target_name, None)
+                        if isinstance(child.target, ast.Name):
+                            var_name = child.target.id
+                            if isinstance(child.value, (ast.List, ast.Tuple)):
+                                length = _extract_sequence_length(child.value)
+                                if length is not None:
+                                    kind = "LIST" if isinstance(child.value, ast.List) else "TUPLE"
+                                    current_collections[var_name] = CollectionLiteralState(kind=kind, length=length)
+                            elif isinstance(child.value, ast.Dict):
+                                keys = _extract_dict_literal_keys(child.value)
+                                if keys is not None:
+                                    current_collections[var_name] = CollectionLiteralState(kind="DICT", known_keys=keys)
+
             # 3. Handle If statements and branch merging
             if isinstance(stmt, ast.If):
-                guard = _extract_membership_guard(stmt.test)
-                body_exits = any(_statement_always_exits(s) for s in stmt.body)
+                tf, ff = _extract_branch_facts(stmt.test)
+                body_exits = any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.body)
+                orelse_exits = bool(stmt.orelse) and any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.orelse)
 
-                if guard and not guard[2] and body_exits:
-                    var_name, key_val, _ = guard
-                    if var_name in current_collections:
-                        current_collections[var_name].guarded_keys.add(key_val)
+                if body_exits:
+                    for var_name, key_val in ff.guarded_keys:
+                        if var_name in current_collections:
+                            current_collections[var_name].guarded_keys.add(key_val)
+                elif orelse_exits:
+                    for var_name, key_val in tf.guarded_keys:
+                        if var_name in current_collections:
+                            current_collections[var_name].guarded_keys.add(key_val)
 
                 if body_exits and not stmt.orelse:
                     pass

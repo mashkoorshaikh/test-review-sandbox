@@ -2356,3 +2356,418 @@ class TestScopeAwareFunctionClassBindings:
             "        return 10 / b\n"
         )
         assert analyze_python_source(source, "calc.py") == []
+
+
+# ============================================================================
+# 28. Phase 5A Batch 2: Compound Boolean Guards
+# ============================================================================
+
+
+class TestCompoundBooleanGuards:
+    def test_compound_and_nonzero_guard(self):
+        source = (
+            "def calc(divisor: int, value: int):\n"
+            "    if divisor != 0 and value > 0:\n"
+            "        result = value / divisor\n"
+            "        return result\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_compound_and_none_guard(self):
+        source = (
+            "def process(x):\n"
+            "    if x is not None and x.attr:\n"
+            "        return x.attr\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_compound_and_dict_guard(self):
+        source = (
+            "def check_config(d):\n"
+            "    if 'k' in d and d['k'] > 0:\n"
+            "        return d['k']\n"
+        )
+        assert analyze_python_source(source, "config.py") == []
+
+    def test_compound_and_definite_none_dereference_detected(self):
+        source = (
+            "def handler(flag: bool):\n"
+            "    x = None\n"
+            "    if x is None and flag:\n"
+            "        print(x.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 4
+        assert "known to be None" in issues[0].message
+
+    def test_nested_parenthesized_boolean_expressions_safe(self):
+        source = (
+            "def run(divisor: int, flag: bool, x, d: dict):\n"
+            "    if (divisor != 0 and (flag or not flag)) and True:\n"
+            "        res = 10 / divisor\n"
+            "    if ((x is not None and flag) and True):\n"
+            "        val = x.attr\n"
+            "    if ('k' in d and (flag or True)):\n"
+            "        item = d['k']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_nested_parenthesized_boolean_expressions_definite_none(self):
+        source = (
+            "def run(flag: bool):\n"
+            "    x = None\n"
+            "    if (x is None and (flag and True)):\n"
+            "        print(x.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 4
+
+    def test_multiple_independent_facts_in_single_condition(self):
+        source = (
+            "def process(divisor: int, x, d: dict):\n"
+            "    if divisor != 0 and x is not None and 'k' in d:\n"
+            "        return (100 / divisor) + len(x.attr) + d['k']\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+
+# ============================================================================
+# 29. Phase 5A Batch 2: Compound Exits and Loop Guards
+# ============================================================================
+
+
+class TestCompoundExitsAndLoopGuards:
+    def test_compound_or_exit_nonzero(self):
+        source = (
+            "def compute(divisor: int, error: bool):\n"
+            "    if divisor == 0 or error:\n"
+            "        return\n"
+            "    result = 10 / divisor\n"
+            "    return result\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_compound_or_exit_none(self):
+        source = (
+            "def process(x, error: bool):\n"
+            "    if x is None or error:\n"
+            "        return\n"
+            "    return x.attr\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_compound_or_exit_dict(self):
+        source = (
+            "def get_val(d: dict, error: bool):\n"
+            "    if 'k' not in d or error:\n"
+            "        return\n"
+            "    return d['k']\n"
+        )
+        assert analyze_python_source(source, "dict_app.py") == []
+
+    def test_negative_control_and_exit_does_not_establish_safe_exit_nonzero(self):
+        source = (
+            "def compute(error: bool):\n"
+            "    divisor = 0\n"
+            "    if divisor == 0 and error:\n"
+            "        return\n"
+            "    return 10 / divisor\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 5
+
+    def test_negative_control_and_exit_does_not_establish_safe_exit_none(self):
+        source = (
+            "def process(error: bool):\n"
+            "    x = None\n"
+            "    if x is None and error:\n"
+            "        return\n"
+            "    return x.attr\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 5
+
+    def test_negative_control_and_exit_does_not_establish_safe_exit_dict(self):
+        source = (
+            "def get_val(error: bool):\n"
+            "    d = {'other': 1}\n"
+            "    if 'k' not in d and error:\n"
+            "        return\n"
+            "    return d['k']\n"
+        )
+        issues = analyze_python_source(source, "dict_app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 5
+
+    def test_loop_guard_clause_continue_nonzero(self):
+        source = (
+            "def run(items, divisor: int):\n"
+            "    for item in items:\n"
+            "        if divisor == 0:\n"
+            "            continue\n"
+            "        result = 10 / divisor\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_loop_guard_clause_break_nonzero(self):
+        source = (
+            "def run(items, divisor: int):\n"
+            "    for item in items:\n"
+            "        if divisor == 0:\n"
+            "            break\n"
+            "        result = 10 / divisor\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_loop_guard_clause_continue_none(self):
+        source = (
+            "def run(items, x):\n"
+            "    for item in items:\n"
+            "        if x is None:\n"
+            "            continue\n"
+            "        print(x.attr)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_loop_guard_clause_continue_dict(self):
+        source = (
+            "def run(items, d: dict):\n"
+            "    for item in items:\n"
+            "        if 'k' not in d:\n"
+            "            continue\n"
+            "        val = d['k']\n"
+        )
+        assert analyze_python_source(source, "dict_app.py") == []
+
+    def test_loop_guard_clause_does_not_leak_after_loop_termination_nonzero(self):
+        source = (
+            "def run(items):\n"
+            "    divisor = 0\n"
+            "    for item in items:\n"
+            "        if divisor == 0:\n"
+            "            break\n"
+            "        val = 10 / divisor\n"
+            "    return 10 / divisor\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 7
+
+    def test_loop_guard_clause_does_not_leak_after_loop_termination_none(self):
+        source = (
+            "def run(items):\n"
+            "    x = None\n"
+            "    for item in items:\n"
+            "        if x is None:\n"
+            "            continue\n"
+            "        print(x.attr)\n"
+            "    print(x.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 7
+
+
+# ============================================================================
+# 30. Phase 5A Batch 2: Short-Circuit Expressions
+# ============================================================================
+
+
+class TestShortCircuitExpressions:
+    def test_short_circuit_and_nonzero(self):
+        source = (
+            "def check(divisor: int):\n"
+            "    return divisor != 0 and (10 / divisor > 1)\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_short_circuit_or_nonzero(self):
+        source = (
+            "def check(divisor: int):\n"
+            "    return divisor == 0 or (10 / divisor > 1)\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_short_circuit_and_none(self):
+        source = (
+            "def check(x):\n"
+            "    return x is not None and x.attr\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_short_circuit_or_none(self):
+        source = (
+            "def check(x):\n"
+            "    return x is None or x.attr\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_short_circuit_and_dict(self):
+        source = (
+            "def check(d: dict):\n"
+            "    return 'k' in d and d['k']\n"
+        )
+        assert analyze_python_source(source, "dict_app.py") == []
+
+    def test_short_circuit_or_dict(self):
+        source = (
+            "def check(d: dict):\n"
+            "    return 'k' not in d or d['k']\n"
+        )
+        assert analyze_python_source(source, "dict_app.py") == []
+
+    def test_short_circuit_negative_and_nonzero(self):
+        source = (
+            "def run():\n"
+            "    b = 0\n"
+            "    return b == 0 and (10 / b > 1)\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 3
+
+    def test_short_circuit_negative_or_none(self):
+        source = (
+            "def run():\n"
+            "    x = None\n"
+            "    return x is not None or x.attr\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+
+    def test_conditional_ifexp_safe(self):
+        source = (
+            "def run(d: int, x, dct: dict):\n"
+            "    res1 = 10 / d if d != 0 else 0\n"
+            "    res2 = x.attr if x is not None else ''\n"
+            "    res3 = dct['k'] if 'k' in dct else None\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_conditional_ifexp_unsafe_nonzero(self):
+        source = (
+            "def run():\n"
+            "    d = 0\n"
+            "    return 0 if d != 0 else 10 / d\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 3
+
+    def test_conditional_ifexp_unsafe_none(self):
+        source = (
+            "def run():\n"
+            "    x = None\n"
+            "    return 'empty' if x is not None else x.attr\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+
+    def test_conditional_ifexp_unsafe_dict(self):
+        source = (
+            "def run():\n"
+            "    d = {'a': 1}\n"
+            "    return 'present' if 'missing' in d else d['missing']\n"
+        )
+        issues = analyze_python_source(source, "dict_app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+
+    def test_temporary_facts_do_not_leak_to_next_statement(self):
+        source = (
+            "def run():\n"
+            "    d = 0\n"
+            "    flag = (d != 0 and (10 / d > 1))\n"
+            "    return 10 / d\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 4
+
+
+# ============================================================================
+# 31. Phase 5A Batch 2: State Invalidation
+# ============================================================================
+
+
+class TestStateInvalidationCompoundAndShortCircuit:
+    def test_tuple_unpacking_reassigns_guarded_divisor(self):
+        source = (
+            "def run(d: int):\n"
+            "    if d != 0:\n"
+            "        d, c = 0, 1\n"
+            "        return 10 / d\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 4
+
+    def test_walrus_assignment_reassigns_guarded_divisor(self):
+        source = (
+            "def run(d: int):\n"
+            "    if d != 0:\n"
+            "        val = (d := 0) + 1\n"
+            "        return 10 / d\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 4
+
+    def test_walrus_assignment_reassigns_guarded_none(self):
+        source = (
+            "def run(x):\n"
+            "    if x is not None:\n"
+            "        val = (x := None)\n"
+            "        print(x.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 4
+
+    def test_dict_mutation_within_compound_condition(self):
+        source = (
+            "def run():\n"
+            "    d = {'a': 1}\n"
+            "    if 'k' in d and (d.clear() or d['a']):\n"
+            "        pass\n"
+        )
+        # d.clear() mutates d, invalidating tracking, so no KeyError is incorrectly flagged
+        assert analyze_python_source(source, "app.py") == []
