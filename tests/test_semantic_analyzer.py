@@ -1689,3 +1689,670 @@ class TestSEM003WorkflowAndGitHub:
 
             # 4. Action plan remains dry_run
             assert result.action_plan.dry_run is True
+
+
+# ============================================================================
+# 26. Batch 1 Accuracy Regression Tests (Try/Loop Scoping & Literal Zero Handler Suppression)
+# ============================================================================
+
+
+class TestSEM001LiteralZeroTrySuppression:
+    def test_literal_zero_suppressed_by_zerodivisionerror(self):
+        source = (
+            "try:\n"
+            "    x = 10 / 0\n"
+            "except ZeroDivisionError:\n"
+            "    x = 0\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_literal_zero_suppressed_by_arithmeticerror_and_exception(self):
+        source = (
+            "try:\n"
+            "    a = 10 // 0\n"
+            "except ArithmeticError:\n"
+            "    a = 0\n"
+            "try:\n"
+            "    b = 10 % 0\n"
+            "except Exception:\n"
+            "    b = 0\n"
+            "try:\n"
+            "    c = 10 / 0.0\n"
+            "except:\n"
+            "    c = 0\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_unhandled_literal_zero_produces_high_confidence_sem001(self):
+        source = "x = 10 / 0\n"
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].severity == "WARNING"
+        assert issues[0].line == 1
+
+    def test_literal_zero_not_suppressed_by_unrelated_exception_handler(self):
+        source = (
+            "try:\n"
+            "    x = 10 / 0\n"
+            "except KeyError:\n"
+            "    x = 0\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 2
+
+    def test_literal_zero_in_except_handler_not_suppressed(self):
+        source = (
+            "try:\n"
+            "    pass\n"
+            "except Exception:\n"
+            "    val = 10 / 0\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 4
+
+    def test_literal_zero_nested_try_blocks(self):
+        source = (
+            "try:\n"
+            "    try:\n"
+            "        val = 1 / 0\n"
+            "    except KeyError:\n"
+            "        pass\n"
+            "except ZeroDivisionError:\n"
+            "    val = 0\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+
+class TestSEM002TryAndLoopAssignmentTracking:
+    def test_local_none_assigned_in_try_body_and_dereferenced(self):
+        source = (
+            "try:\n"
+            "    val = None\n"
+            "    print(val.strip())\n"
+            "except ValueError:\n"
+            "    pass\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+        assert "known to be None" in issues[0].message
+
+    def test_local_none_assigned_in_try_body_suppressed_when_attribute_error_caught(self):
+        source = (
+            "try:\n"
+            "    val = None\n"
+            "    print(val.strip())\n"
+            "except AttributeError:\n"
+            "    pass\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_local_none_assigned_in_for_loop_and_dereferenced(self):
+        source = (
+            "for item in [1, 2, 3]:\n"
+            "    node = None\n"
+            "    print(node.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+        assert "known to be None" in issues[0].message
+
+    def test_local_none_assigned_in_while_loop_and_dereferenced(self):
+        source = (
+            "while True:\n"
+            "    handler = None\n"
+            "    handler()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+        assert "known to be None" in issues[0].message
+
+    def test_loop_target_variable_not_falsely_flagged_from_outer_scope(self):
+        source = (
+            "x = None\n"
+            "for x in [1, 2]:\n"
+            "    print(x.name)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+
+class TestSEM003TryAndLoopCollectionTracking:
+    def test_literal_dict_missing_key_in_try_body(self):
+        source = (
+            "try:\n"
+            "    mapping = {'alpha': 1}\n"
+            "    print(mapping['beta'])\n"
+            "except ValueError:\n"
+            "    pass\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+        assert "provably absent" in issues[0].message
+
+    def test_literal_dict_missing_key_in_try_body_suppressed_by_keyerror(self):
+        source = (
+            "try:\n"
+            "    mapping = {'alpha': 1}\n"
+            "    print(mapping['beta'])\n"
+            "except KeyError:\n"
+            "    pass\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_local_sequence_index_oob_in_for_loop(self):
+        source = (
+            "for item in [1, 2]:\n"
+            "    items_list = [10, 20]\n"
+            "    print(items_list[5])\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+        assert "constant index 5 is out of bounds" in issues[0].message
+
+    def test_local_dict_missing_key_in_while_loop(self):
+        source = (
+            "while True:\n"
+            "    d = {'id': 100}\n"
+            "    print(d['unknown'])\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+        assert "provably absent" in issues[0].message
+
+    def test_no_duplicate_findings_on_complex_nested_blocks(self):
+        source = (
+            "for i in [1]:\n"
+            "    try:\n"
+            "        while True:\n"
+            "            d = {'k': 1}\n"
+            "            print(d['missing'])\n"
+            "            break\n"
+            "    except KeyError:\n"
+            "        pass\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+
+# ============================================================================
+# 27. Batch 1.1 Edge-Case Regression Tests (Scope-Aware Walk, Finally Invalidation, If-Branch Symmetry, While Guards)
+# ============================================================================
+
+
+class TestScopeAwareAssignmentExtraction:
+    def test_outer_none_retained_when_nested_function_assigns_same_name(self):
+        source = (
+            "def outer():\n"
+            "    x = None\n"
+            "    for item in [1, 2]:\n"
+            "        def helper():\n"
+            "            x = 10\n"
+            "    print(x.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+        assert "known to be None" in issues[0].message
+
+    def test_outer_guard_not_invalidated_by_nested_function_assignment(self):
+        source = (
+            "def compute(b: float):\n"
+            "    if b != 0:\n"
+            "        for item in [1, 2]:\n"
+            "            def helper():\n"
+            "                b = 0\n"
+            "        return 10 / b\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_nested_async_function_and_class_scopes_do_not_leak_assignments(self):
+        source = (
+            "def outer():\n"
+            "    x = None\n"
+            "    try:\n"
+            "        async def async_helper():\n"
+            "            x = 20\n"
+            "        class Inner:\n"
+            "            x = 30\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    print(x.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 10
+
+
+class TestFinallyStatePropagation:
+    def test_dict_reassigned_in_try_does_not_falsely_flag_in_finally(self):
+        source = (
+            "def f():\n"
+            "    d = {'a': 1}\n"
+            "    try:\n"
+            "        d = {'b': 2}\n"
+            "    finally:\n"
+            "        print(d['b'])\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_none_reassigned_in_try_does_not_report_high_confidence_in_finally(self):
+        source = (
+            "def g():\n"
+            "    x = None\n"
+            "    try:\n"
+            "        x = 'valid'\n"
+            "    finally:\n"
+            "        print(x.upper())\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_dict_reassigned_in_except_handler_invalidated_in_finally(self):
+        source = (
+            "def h():\n"
+            "    d = {'a': 1}\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Exception:\n"
+            "        d = {'c': 3}\n"
+            "    finally:\n"
+            "        print(d['c'])\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_nested_try_finally_invalidates_modified_collections(self):
+        source = (
+            "def nested():\n"
+            "    m = {'k1': 10}\n"
+            "    try:\n"
+            "        try:\n"
+            "            m = {'k2': 20}\n"
+            "        finally:\n"
+            "            pass\n"
+            "    finally:\n"
+            "        print(m['k2'])\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_valid_findings_in_finally_preserved(self):
+        source = (
+            "def genuine():\n"
+            "    x = None\n"
+            "    try:\n"
+            "        pass\n"
+            "    finally:\n"
+            "        print(x.strip())\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+    def test_unmodified_collection_in_try_preserves_missing_key_finding_in_finally(self):
+        source = (
+            "def genuine_dict():\n"
+            "    d = {'a': 1}\n"
+            "    try:\n"
+            "        pass\n"
+            "    finally:\n"
+            "        print(d['missing'])\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+
+class TestSymmetricIfBranchInvalidation:
+    def test_conditional_reassignment_does_not_report_definite_none_in_sem002(self):
+        source = (
+            "def f(flag):\n"
+            "    x = None\n"
+            "    if flag:\n"
+            "        x = 'initialized'\n"
+            "    print(x.upper())\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_nested_conditional_zero_assignment_invalidates_guard_in_sem001(self):
+        source = (
+            "def calc(b: float, flag: bool):\n"
+            "    if b != 0:\n"
+            "        if flag:\n"
+            "            b = 0\n"
+            "        return 10 / b\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 5
+
+    def test_unconditional_exit_in_if_preserves_guard_and_state(self):
+        source = (
+            "def early_exit(b: float, x=None):\n"
+            "    if b == 0:\n"
+            "        return 0\n"
+            "    if x is None:\n"
+            "        return 1\n"
+            "    return (10 / b) + len(x.attr)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+
+class TestWhileConditionGuards:
+    def test_while_condition_guards_nonzero_divisor(self):
+        source = (
+            "def drain(divisor: float):\n"
+            "    while divisor != 0:\n"
+            "        return 10 / divisor\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_while_condition_guards_greater_than_zero(self):
+        source = (
+            "def drain_gt(divisor: float):\n"
+            "    while divisor > 0:\n"
+            "        return 10 / divisor\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_while_condition_guards_not_none(self):
+        source = (
+            "def iterate(x=None):\n"
+            "    while x is not None:\n"
+            "        print(x.attr)\n"
+            "        break\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_while_condition_truthiness_guards_not_none(self):
+        source = (
+            "def iterate_truthy(x=None):\n"
+            "    while x:\n"
+            "        print(x.attr)\n"
+            "        break\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_while_condition_guards_membership_in_dict(self):
+        source = (
+            "def check_dict():\n"
+            "    d = {'a': 1}\n"
+            "    while 'b' in d:\n"
+            "        print(d['b'])\n"
+            "        break\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_while_guard_restored_after_loop_exit(self):
+        source = (
+            "def after_while(x=None):\n"
+            "    while x is not None:\n"
+            "        break\n"
+            "    print(x.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 4
+
+
+class TestFinallyElsePathInvalidation:
+    def test_try_else_zero_assignment_invalidates_guard_in_finally_sem001(self):
+        source = (
+            "def compute(b: float):\n"
+            "    if b != 0:\n"
+            "        try:\n"
+            "            pass\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "        else:\n"
+            "            b = 0\n"
+            "        finally:\n"
+            "            return 10 / b\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 10
+
+    def test_try_else_literal_zero_reassignment_in_finally_sem001(self):
+        source = (
+            "def compute(b: float):\n"
+            "    if b != 0:\n"
+            "        try:\n"
+            "            pass\n"
+            "        except Exception:\n"
+            "            pass\n"
+            "        else:\n"
+            "            b = 0\n"
+            "        finally:\n"
+            "            print(100 // b)\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+
+    def test_try_else_none_reassigned_not_flagged_in_finally_sem002(self):
+        source = (
+            "def process():\n"
+            "    x = None\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    else:\n"
+            "        x = 'valid_string'\n"
+            "    finally:\n"
+            "        print(x.upper())\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_try_else_dict_subscript_mutation_not_flagged_in_finally_sem003(self):
+        source = (
+            "def lookup():\n"
+            "    d = {'a': 1}\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    else:\n"
+            "        d['b'] = 2\n"
+            "    finally:\n"
+            "        print(d['b'])\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_try_else_dict_method_mutation_not_flagged_in_finally_sem003(self):
+        source = (
+            "def lookup():\n"
+            "    d = {'a': 1}\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    else:\n"
+            "        d.update({'b': 2})\n"
+            "    finally:\n"
+            "        print(d['b'])\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_finally_positive_control_unmodified_zero_division_sem001(self):
+        source = (
+            "def genuine_div():\n"
+            "    z = 0\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    else:\n"
+            "        other = 1\n"
+            "    finally:\n"
+            "        print(10 / z)\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 10
+
+    def test_finally_positive_control_unmodified_none_dereference_sem002(self):
+        source = (
+            "def genuine_none():\n"
+            "    x = None\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    else:\n"
+            "        other = 1\n"
+            "    finally:\n"
+            "        print(x.strip())\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 10
+
+    def test_finally_positive_control_unmodified_missing_key_sem003(self):
+        source = (
+            "def genuine_key():\n"
+            "    d = {'a': 1}\n"
+            "    try:\n"
+            "        pass\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    else:\n"
+            "        other = 1\n"
+            "    finally:\n"
+            "        print(d['missing'])\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 10
+
+
+class TestScopeAwareFunctionClassBindings:
+    def test_none_rebound_to_function_def_in_branch_clears_definite_none(self):
+        source = (
+            "def worker(flag: bool):\n"
+            "    handler = None\n"
+            "    if flag:\n"
+            "        def handler():\n"
+            "            return 42\n"
+            "    print(handler.attribute)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_none_rebound_to_async_function_def_in_branch_clears_definite_none(self):
+        source = (
+            "def worker(flag: bool):\n"
+            "    handler = None\n"
+            "    if flag:\n"
+            "        async def handler():\n"
+            "            return 42\n"
+            "    print(handler.attribute)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_none_rebound_to_function_def_in_loop_clears_definite_none(self):
+        source = (
+            "def worker():\n"
+            "    handler = None\n"
+            "    for _ in [1, 2]:\n"
+            "        def handler():\n"
+            "            return 10\n"
+            "    print(handler.attribute)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_none_rebound_to_class_def_in_branch_clears_definite_none(self):
+        source = (
+            "def worker(flag: bool):\n"
+            "    cls = None\n"
+            "    if flag:\n"
+            "        class cls:\n"
+            "            val = 1\n"
+            "    print(cls.val)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_none_rebound_to_class_def_in_sequence_clears_definite_none(self):
+        source = (
+            "def worker():\n"
+            "    obj = None\n"
+            "    class obj:\n"
+            "        val = 1\n"
+            "    print(obj.val)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_none_rebound_to_function_def_in_sequence_clears_definite_none(self):
+        source = (
+            "def worker():\n"
+            "    func = None\n"
+            "    def func():\n"
+            "        pass\n"
+            "    print(func.attr)\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_lambda_does_not_act_as_statement_binding_or_leak(self):
+        source = (
+            "def worker(flag: bool):\n"
+            "    x = None\n"
+            "    if flag:\n"
+            "        fn = lambda x=1: x + 10\n"
+            "    print(x.attr)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 5
+
+    def test_nested_class_assignment_does_not_invalidate_outer_guard(self):
+        source = (
+            "def compute(b: float):\n"
+            "    if b != 0:\n"
+            "        class Inner:\n"
+            "            b = 0\n"
+            "        return 10 / b\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
