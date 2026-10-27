@@ -2771,3 +2771,324 @@ class TestStateInvalidationCompoundAndShortCircuit:
         )
         # d.clear() mutates d, invalidating tracking, so no KeyError is incorrectly flagged
         assert analyze_python_source(source, "app.py") == []
+
+
+# ============================================================================
+# 32. Phase 5A Batch 3: Comprehension Scoping and Filter Guards
+# ============================================================================
+
+
+class TestComprehensionScopingAndFilterGuards:
+    def test_listcomp_shadows_outer_zero_divisor(self):
+        source = (
+            "def run(items):\n"
+            "    x = 0\n"
+            "    res = [10 / x for x in items if x != 0]\n"
+            "    return res\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_listcomp_preserves_outer_zero_after_exit(self):
+        source = (
+            "def run(items):\n"
+            "    x = 0\n"
+            "    res = [10 / x for x in items if x != 0]\n"
+            "    return 10 / x\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 4
+
+    def test_listcomp_shadowed_target_does_not_inherit_outer_guard(self):
+        source = (
+            "def run(x, items):\n"
+            "    if x != 0:\n"
+            "        return [10 / x for x in items]\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 3
+
+    def test_setcomp_and_dictcomp_shadowing_outer_none(self):
+        source = (
+            "def run():\n"
+            "    x = None\n"
+            "    s = {x.strip() for x in ['a', 'b']}\n"
+            "    d = {x: x.upper() for x in ['a', 'b']}\n"
+            "    print(x.strip())\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 5
+
+    def test_dictcomp_shadows_outer_dict(self):
+        source = (
+            "def run():\n"
+            "    d = {'a': 1}\n"
+            "    res = {k: d[k] for d in [{'b': 2}] for k in d}\n"
+            "    print(d['missing'])\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM003"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 4
+
+    def test_filter_guarded_nonzero_listcomp(self):
+        source = (
+            "def run(items):\n"
+            "    return [10 / x for x in items if x != 0]\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_filter_guarded_gt_zero_generator(self):
+        source = (
+            "def run(items):\n"
+            "    return list(10 / x for x in items if x > 0)\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_filter_guarded_not_none_comp(self):
+        source = (
+            "def run(items):\n"
+            "    return [x.attr for x in items if x is not None]\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_filter_guarded_dict_key_membership(self):
+        source = (
+            "def run(items):\n"
+            "    d = {'a': 1}\n"
+            "    return [d['b'] for x in items if 'b' in d]\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_nested_comprehensions_with_shadowing_and_guards(self):
+        source = (
+            "def run(matrix):\n"
+            "    return [[10 / x for x in row if x != 0] for row in matrix]\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_generator_expression_walrus_lazy_boundary(self):
+        source = (
+            "def run():\n"
+            "    gen = ((w := None) for _ in [1])\n"
+            "    print(w.strip())\n"
+        )
+        # Deferred generator does not execute walrus at definition time in enclosing scope
+        # w is undefined/dynamic in enclosing scope, not statically confirmed None literal
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_genuine_bugs_inside_comprehensions_detected(self):
+        source = (
+            "def run(items):\n"
+            "    a = [10 / 0 for x in items]\n"
+            "    b = [None.strip() for x in items]\n"
+            "    c = [{'a': 1}['missing'] for x in items]\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 3
+        codes = {iss.code for iss in issues}
+        assert codes == {"SEM001", "SEM002", "SEM003"}
+        for iss in issues:
+            assert iss.confidence == "HIGH"
+            assert iss.severity == "WARNING"
+
+
+# ============================================================================
+# 33. Phase 5A Batch 3: Early-Exit Guard Propagation with Continuing Else
+# ============================================================================
+
+
+class TestEarlyExitGuardPropagationWithContinuingElse:
+    def test_sem001_if_body_exits_else_continues(self):
+        source = (
+            "def f(d):\n"
+            "    if d == 0:\n"
+            "        return 0\n"
+            "    else:\n"
+            "        print('valid divisor')\n"
+            "    return 10 / d\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_sem002_if_body_exits_else_continues(self):
+        source = (
+            "def f(x=None):\n"
+            "    if x is None:\n"
+            "        raise ValueError('x is required')\n"
+            "    else:\n"
+            "        print('valid parameter')\n"
+            "    return x.strip()\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_sem003_if_body_exits_else_continues(self):
+        source = (
+            "def f():\n"
+            "    d = {'a': 1}\n"
+            "    if 'b' not in d:\n"
+            "        raise KeyError('missing b')\n"
+            "    else:\n"
+            "        print('b exists')\n"
+            "    return d['b']\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_negative_control_else_reassigns_zero_invalidates_guard(self):
+        source = (
+            "def f(d):\n"
+            "    if d == 0:\n"
+            "        return 0\n"
+            "    else:\n"
+            "        d = 0\n"
+            "    return 10 / d\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 6
+
+    def test_negative_control_else_reassigns_none_invalidates_guard(self):
+        source = (
+            "def f(x=None):\n"
+            "    if x is None:\n"
+            "        return 0\n"
+            "    else:\n"
+            "        x = None\n"
+            "    return x.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+
+# ============================================================================
+# 34. Phase 5A Batch 3: Loop-Else State and Fact Propagation
+# ============================================================================
+
+
+class TestLoopElseStateAndFactPropagation:
+    def test_while_else_false_condition_establishes_nonzero_fact(self):
+        source = (
+            "def f(d):\n"
+            "    while d == 0:\n"
+            "        d = 5\n"
+            "    else:\n"
+            "        return 10 / d\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+    def test_while_else_false_condition_establishes_none_fact(self):
+        source = (
+            "def f(x):\n"
+            "    while x is not None:\n"
+            "        x = x.next\n"
+            "    else:\n"
+            "        return x.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 5
+
+    def test_while_else_false_condition_establishes_not_none_fact(self):
+        source = (
+            "def f(x):\n"
+            "    while x is None:\n"
+            "        x = 'ready'\n"
+            "    else:\n"
+            "        return x.strip()\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_for_else_loop_body_assignment_invalidates_prior_nonzero_guard(self):
+        source = (
+            "def f(d: int):\n"
+            "    if d != 0:\n"
+            "        for i in [1, 2]:\n"
+            "            d = 0\n"
+            "        else:\n"
+            "            return 10 / d\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM001"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 6
+
+    def test_for_else_loop_body_assignment_invalidates_prior_none_guard(self):
+        source = (
+            "def f(x=None):\n"
+            "    if x is not None:\n"
+            "        for i in [1, 2]:\n"
+            "            x = None\n"
+            "        else:\n"
+            "            return x.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 6
+
+    def test_while_else_loop_body_assignment_invalidates_prior_guard(self):
+        source = (
+            "def f(x=None, flag=True):\n"
+            "    if x is not None:\n"
+            "        while flag:\n"
+            "            x = None\n"
+            "        else:\n"
+            "            return x.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "MEDIUM"
+        assert issues[0].line == 6
+
+    def test_zero_iteration_for_else_preserves_unmodified_guard(self):
+        source = (
+            "def f(d: int):\n"
+            "    if d != 0:\n"
+            "        for i in []:\n"
+            "            pass\n"
+            "        else:\n"
+            "            return 10 / d\n"
+        )
+        assert analyze_python_source(source, "calc.py") == []
+
+
+# ============================================================================
+# 35. Phase 5A Batch 3: Severity and Verdict Policy Verification
+# ============================================================================
+
+
+class TestBatch3SeverityAndVerdictPolicy:
+    def test_batch3_findings_severity_and_verdict(self):
+        source = (
+            "def run():\n"
+            "    a = [10 / 0 for _ in [1]]\n"
+            "    b = [None.strip() for _ in [1]]\n"
+            "    c = [{'k': 1}['missing'] for _ in [1]]\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 3
+        for issue in issues:
+            assert issue.severity == "WARNING"
+            dict_rep = issue_to_dict(issue)
+            verdict = determine_review_verdict([dict_rep], [])
+            assert verdict == "COMMENT"
+            assert verdict != "REQUEST_CHANGES"
+            assert verdict != "APPROVE"
