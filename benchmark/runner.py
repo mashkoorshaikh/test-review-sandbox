@@ -180,6 +180,7 @@ def run_benchmark(
     manifest_path: str = "benchmark/manifest.json",
     category: str | None = None,
     case_id: str | None = None,
+    suite: str | None = None,
     output_dir: str | None = None,
     tolerance: int = 1,
     cwd: str | None = None,
@@ -207,11 +208,13 @@ def run_benchmark(
             continue
         if case_id and c.get("case_id") != case_id:
             continue
+        if suite and suite != "all" and c.get("suite") != suite:
+            continue
         filtered_cases.append(c)
 
     if not filtered_cases:
         if not quiet:
-            print(f"Warning: No benchmark cases matched criteria (category={category}, case_id={case_id}).")
+            print(f"Warning: No benchmark cases matched criteria (category={category}, case_id={case_id}, suite={suite}).")
         empty_summary = compute_benchmark_summary(
             case_results=[],
             timestamp=datetime.datetime.now(datetime.UTC).isoformat(),
@@ -375,11 +378,11 @@ def main() -> None:
         help="Line matching tolerance window (default: 1 line)",
     )
     parser.add_argument(
-        "--no-ai",
-        dest="no_ai",
-        action="store_true",
-        default=True,
-        help="Explicitly run in deterministic mode (default: True)",
+        "--suite",
+        dest="suite",
+        default="all",
+        choices=["all", "baseline", "expanded"],
+        help="Filter benchmark cases by suite ('baseline', 'expanded', or 'all')",
     )
     args = parser.parse_args()
 
@@ -387,6 +390,7 @@ def main() -> None:
         manifest_path=args.manifest,
         category=args.category,
         case_id=args.case_id,
+        suite=args.suite,
         output_dir=args.output_dir,
         tolerance=args.tolerance,
     )

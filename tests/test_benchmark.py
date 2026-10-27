@@ -53,7 +53,13 @@ class TestManifestIntegrity:
 
     def test_manifest_loads_and_has_required_keys(self, manifest_path: str):
         cases = load_manifest(manifest_path)
-        assert len(cases) == 15, f"Expected 15 cases, got {len(cases)}"
+        assert len(cases) == 30, f"Expected 30 total cases, got {len(cases)}"
+
+        baseline_cases = [c for c in cases if c.get("suite") == "baseline"]
+        assert len(baseline_cases) == 15, f"Expected 15 baseline cases, got {len(baseline_cases)}"
+
+        expanded_cases = [c for c in cases if c.get("suite") == "expanded"]
+        assert len(expanded_cases) == 15, f"Expected 15 expanded cases, got {len(expanded_cases)}"
 
         valid_categories = {"clean", "bugs", "security", "multi", "safe_edges"}
         seen_ids: set[str] = set()
@@ -269,12 +275,30 @@ class TestBenchmarkRunnerAndFiltering:
         summary, exit_code = run_benchmark(
             manifest_path=manifest_path,
             category="bugs",
+            suite="baseline",
             quiet=True,
         )
         assert exit_code == 0
         assert summary["overall"]["cases_total"] == 3
         for r in summary["case_results"]:
             assert r["category"] == "bugs"
+
+    def test_filtering_by_suite(self, manifest_path: str):
+        summary_base, exit_code_base = run_benchmark(
+            manifest_path=manifest_path,
+            suite="baseline",
+            quiet=True,
+        )
+        assert exit_code_base == 0
+        assert summary_base["overall"]["cases_total"] == 15
+
+        summary_exp, exit_code_exp = run_benchmark(
+            manifest_path=manifest_path,
+            suite="expanded",
+            quiet=True,
+        )
+        assert exit_code_exp == 0
+        assert summary_exp["overall"]["cases_total"] == 15
 
     def test_filtering_by_case_id(self, manifest_path: str):
         summary, exit_code = run_benchmark(
@@ -419,11 +443,15 @@ class TestNoSourceMutation:
 
 
 class TestFullDeterministicBenchmarkExecution:
-    """Run all 15 cases end-to-end against the deterministic pipeline."""
+    """Run baseline, expanded, and combined 30-case benchmark suites end-to-end."""
 
-    def test_full_benchmark_executes_cleanly(self, manifest_path: str):
-        summary, exit_code = run_benchmark(manifest_path=manifest_path, quiet=True)
-        assert exit_code == 0, "Benchmark run encountered tool failures"
+    def test_baseline_suite_executes_cleanly(self, manifest_path: str):
+        summary, exit_code = run_benchmark(
+            manifest_path=manifest_path,
+            suite="baseline",
+            quiet=True,
+        )
+        assert exit_code == 0, "Baseline suite encountered tool failures"
 
         overall = summary["overall"]
         assert overall["cases_total"] == 15
@@ -437,42 +465,110 @@ class TestFullDeterministicBenchmarkExecution:
         assert overall["unmatched_actual"] == 0
         assert overall["unmatched_expected"] == 0
 
-        # Accuracy checks
-        assert overall["precision"] == 1.0, f"Expected precision 1.0, got {overall['precision']}"
-        assert overall["recall"] == 1.0, f"Expected recall 1.0, got {overall['recall']}"
-        assert overall["f1_score"] == 1.0, f"Expected F1 1.0, got {overall['f1_score']}"
-        assert overall["clean_case_fpr"] == 0.0, f"Expected clean FPR 0.0, got {overall['clean_case_fpr']}"
+        # Baseline accuracy checks (all 15 pass)
+        assert overall["precision"] == 1.0
+        assert overall["recall"] == 1.0
+        assert overall["f1_score"] == 1.0
+        assert overall["clean_case_fpr"] == 0.0
 
-        # Defect metrics check
-        defect = summary["defect_metrics"]
-        assert defect["cases_total"] == 9
-        assert defect["cases_passed"] == 9
-        assert defect["cases_failed"] == 0
-        assert defect["expected_findings"] == 13
-        assert defect["actual_findings"] == 13
-        assert defect["matched_findings"] == 13
-        assert defect["unmatched_actual"] == 0
-        assert defect["unmatched_expected"] == 0
-        assert defect["precision"] == 1.0
-        assert defect["recall"] == 1.0
-        assert defect["f1_score"] == 1.0
+        # Baseline detector breakdown
+        detectors = summary["by_detector"]
+        assert detectors["semantic_analyzer"]["tp"] == 6
+        assert detectors["bandit"]["tp"] == 5
+        assert detectors["ruff"]["tp"] == 2
 
-        # Clean metrics check
+    def test_expanded_suite_exposes_expected_misses(self, manifest_path: str):
+        summary, exit_code = run_benchmark(
+            manifest_path=manifest_path,
+            suite="expanded",
+            quiet=True,
+        )
+        assert exit_code == 0, "Expanded suite encountered tool failures"
+
+        overall = summary["overall"]
+        assert overall["cases_total"] == 15
+        assert overall["cases_passed"] == 12
+        assert overall["cases_mismatched"] == 3
+        assert overall["cases_failed"] == 0
+        assert overall["tool_failures"] == 0
+
+        # Ground truth vs actual findings
+        assert overall["expected_findings"] == 13
+        assert overall["actual_findings"] == 13
+        assert overall["matched_findings"] == 11
+        assert overall["unmatched_actual"] == 2
+        assert overall["unmatched_expected"] == 2
+
+        # Precision & Recall in expanded suite
+        assert overall["precision"] == 0.8462
+        assert overall["recall"] == 0.8462
+        assert overall["f1_score"] == 0.8462
+
+        # Clean/safe FPR in expanded suite (all 5 clean/safe cases pass with 0 FP)
         clean = summary["clean_metrics"]
-        assert clean["cases_total"] == 6
-        assert clean["cases_passed"] == 6
+        assert clean["cases_total"] == 5
+        assert clean["cases_passed"] == 5
+        assert clean["cases_with_fp"] == 0
+        assert clean["clean_case_fpr"] == 0.0
+
+    def test_full_30_case_benchmark_execution(self, manifest_path: str):
+        summary, exit_code = run_benchmark(manifest_path=manifest_path, quiet=True)
+        assert exit_code == 0, "Benchmark run encountered tool failures"
+
+        overall = summary["overall"]
+        assert overall["cases_total"] == 30
+        assert overall["cases_passed"] == 27
+        assert overall["cases_mismatched"] == 3
+        assert overall["cases_failed"] == 0
+        assert overall["tool_failures"] == 0
+
+        # Finding counts across all 30 cases
+        assert overall["expected_findings"] == 26
+        assert overall["actual_findings"] == 26
+        assert overall["matched_findings"] == 24
+        assert overall["unmatched_actual"] == 2
+        assert overall["unmatched_expected"] == 2
+
+        # Aggregate metrics
+        assert overall["precision"] == 0.9231
+        assert overall["recall"] == 0.9231
+        assert overall["f1_score"] == 0.9231
+
+        # Defect metrics
+        defect = summary["defect_metrics"]
+        assert defect["cases_total"] == 19
+        assert defect["cases_passed"] == 16
+        assert defect["cases_mismatched"] == 3
+        assert defect["expected_findings"] == 26
+        assert defect["matched_findings"] == 24
+        assert defect["precision"] == 0.9231
+        assert defect["recall"] == 0.9231
+        assert defect["f1_score"] == 0.9231
+
+        # Clean & safe-edge subset (11 clean/safe cases total, 0 false positives)
+        clean = summary["clean_metrics"]
+        assert clean["cases_total"] == 11
+        assert clean["cases_passed"] == 11
         assert clean["cases_failed"] == 0
         assert clean["cases_with_fp"] == 0
         assert clean["clean_case_fpr"] == 0.0
 
-        # Per-detector checks
+        # Per-detector breakdown across all 30 cases
         detectors = summary["by_detector"]
-        assert detectors["semantic_analyzer"]["tp"] == 6
-        assert detectors["semantic_analyzer"]["expected"] == 6
-        assert detectors["semantic_analyzer"]["actual"] == 6
-        assert detectors["bandit"]["tp"] == 5
-        assert detectors["bandit"]["expected"] == 5
-        assert detectors["bandit"]["actual"] == 5
-        assert detectors["ruff"]["tp"] == 2
-        assert detectors["ruff"]["expected"] == 2
-        assert detectors["ruff"]["actual"] == 2
+        assert detectors["semantic_analyzer"]["tp"] == 9
+        assert detectors["semantic_analyzer"]["fn"] == 2
+        assert detectors["semantic_analyzer"]["fp"] == 0
+        assert detectors["semantic_analyzer"]["recall"] == 0.8182
+        assert detectors["semantic_analyzer"]["precision"] == 1.0000
+
+        assert detectors["bandit"]["tp"] == 10
+        assert detectors["bandit"]["fp"] == 1
+        assert detectors["bandit"]["fn"] == 0
+        assert detectors["bandit"]["recall"] == 1.0000
+        assert detectors["bandit"]["precision"] == 0.9091
+
+        assert detectors["ruff"]["tp"] == 5
+        assert detectors["ruff"]["fp"] == 1
+        assert detectors["ruff"]["fn"] == 0
+        assert detectors["ruff"]["recall"] == 1.0000
+        assert detectors["ruff"]["precision"] == 0.8333
