@@ -3092,3 +3092,111 @@ class TestBatch3SeverityAndVerdictPolicy:
             assert verdict == "COMMENT"
             assert verdict != "REQUEST_CHANGES"
             assert verdict != "APPROVE"
+
+
+# ============================================================================
+# 36. Phase 6 Step 4: Branch-Convergence Fact Merging Analysis
+# ============================================================================
+
+
+class TestBranchConvergenceNoneAnalysis:
+    """Regression tests for branch convergence fact merging in NoneDereferenceDetector."""
+
+    def test_branch_convergence_both_branches_assign_none_detected_len(self):
+        source = (
+            "def process_record(flag: bool) -> int:\n"
+            "    if flag:\n"
+            "        val = None\n"
+            "    else:\n"
+            "        val = None\n"
+            "    return len(val)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+    def test_branch_convergence_both_branches_assign_none_detected_attr(self):
+        source = (
+            "def process_record(flag: bool) -> str:\n"
+            "    if flag:\n"
+            "        val = None\n"
+            "    else:\n"
+            "        val = None\n"
+            "    return val.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+    def test_branch_convergence_one_branch_assigns_none_is_safe(self):
+        source = (
+            "def process_record(flag: bool) -> str:\n"
+            "    if flag:\n"
+            "        val = None\n"
+            "    else:\n"
+            "        val = 'non_none'\n"
+            "    return val.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_branch_convergence_both_branches_assign_non_none_is_safe(self):
+        source = (
+            "def process_record(flag: bool) -> str:\n"
+            "    if flag:\n"
+            "        val = 'first'\n"
+            "    else:\n"
+            "        val = 'second'\n"
+            "    return val.strip()\n"
+        )
+        assert analyze_python_source(source, "app.py") == []
+
+    def test_branch_convergence_terminating_branch_preserves_reachable_state(self):
+        source = (
+            "def process_record(flag: bool) -> str:\n"
+            "    if flag:\n"
+            "        val = None\n"
+            "    else:\n"
+            "        raise ValueError('failed')\n"
+            "    return val.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+    def test_branch_convergence_multi_branch_elif_all_assign_none(self):
+        source = (
+            "def process_record(kind: int) -> str:\n"
+            "    if kind == 1:\n"
+            "        val = None\n"
+            "    elif kind == 2:\n"
+            "        val = None\n"
+            "    else:\n"
+            "        val = None\n"
+            "    return val.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 8
+
+    def test_branch_convergence_try_except_suppresses_sem002(self):
+        source = (
+            "def process_record(flag: bool) -> int:\n"
+            "    if flag:\n"
+            "        val = None\n"
+            "    else:\n"
+            "        val = None\n"
+            "    try:\n"
+            "        return len(val)\n"
+            "    except TypeError:\n"
+            "        return 0\n"
+        )
+        assert analyze_python_source(source, "app.py") == []

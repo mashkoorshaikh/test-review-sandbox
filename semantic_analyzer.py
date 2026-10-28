@@ -202,6 +202,11 @@ def _catches_key_error(handler: ast.ExceptHandler) -> bool:
     return _type_matches(handler.type)
 
 
+def _block_always_exits(stmts: list[ast.stmt], in_loop: bool = False) -> bool:
+    """Check if any statement in the block unconditionally exits."""
+    return any(_statement_always_exits(s, in_loop=in_loop) for s in stmts)
+
+
 def _statement_always_exits(stmt: ast.stmt, in_loop: bool = False) -> bool:
     """Check if a statement unconditionally exits the current block."""
     if isinstance(stmt, (ast.Raise, ast.Return)):
@@ -222,8 +227,8 @@ def _statement_always_exits(stmt: ast.stmt, in_loop: bool = False) -> bool:
     return bool(
         isinstance(stmt, ast.If)
         and stmt.orelse
-        and all(_statement_always_exits(s, in_loop=in_loop) for s in stmt.body)
-        and all(_statement_always_exits(s, in_loop=in_loop) for s in stmt.orelse)
+        and _block_always_exits(stmt.body, in_loop=in_loop)
+        and _block_always_exits(stmt.orelse, in_loop=in_loop)
     )
 
 
@@ -778,8 +783,8 @@ class DivisionByZeroDetector(ast.NodeVisitor):
 
             # Check if this statement is an exit guard
             if isinstance(stmt, ast.If):
-                body_exits = any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.body)
-                orelse_exits = bool(stmt.orelse) and any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.orelse)
+                body_exits = _block_always_exits(stmt.body, in_loop=self._in_loop)
+                orelse_exits = bool(stmt.orelse) and _block_always_exits(stmt.orelse, in_loop=self._in_loop)
                 promoted: set[str] = set()
 
                 tf, ff = _extract_branch_facts(stmt.test)
@@ -1066,6 +1071,7 @@ class NoneDereferenceDetector(ast.NodeVisitor):
         self._var_state_stack: list[dict[str, str]] = [{}]
         self._in_loop_stack: list[bool] = [False]
         self._function_params_stack: list[dict[str, str]] = []
+        self._last_if_branches: tuple[dict[str, str], dict[str, str]] | None = None
 
     def _invalidate_var(self, vars_dict: dict[str, str], name: str) -> None:
         if self._function_params_stack and name in self._function_params_stack[-1]:
@@ -1212,7 +1218,7 @@ class NoneDereferenceDetector(ast.NodeVisitor):
                 names.add(node.id)
         return names
 
-    def _visit_statement_sequence(self, stmts: list[ast.stmt]) -> None:
+    def _visit_statement_sequence(self, stmts: list[ast.stmt]) -> dict[str, str]:
         """Visit a sequence of statements while tracking variable None states and guards."""
         current_vars = dict(self._current_var_state)
 
@@ -1254,73 +1260,19 @@ class NoneDereferenceDetector(ast.NodeVisitor):
 
             # 2. If guards with exit or assignment
             if isinstance(stmt, ast.If):
-                body_exits = any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.body)
-                orelse_exits = bool(stmt.orelse) and any(_statement_always_exits(s, in_loop=self._in_loop) for s in stmt.orelse)
-                promoted_guards: set[str] = set()
+                body_exits = _block_always_exits(stmt.body, in_loop=self._in_loop)
+                orelse_exits = bool(stmt.orelse) and _block_always_exits(stmt.orelse, in_loop=self._in_loop)
+                branch_states = self._last_if_branches
+                final_body, final_else = branch_states if branch_states else ({}, {})
 
-                tf, ff = _extract_branch_facts(stmt.test)
-
-                if body_exits:
-                    for var in ff.known_not_none_vars:
-                        current_vars[var] = "KNOWN_NOT_NONE"
-                    for var in ff.definitely_none_vars:
-                        current_vars[var] = "DEFINITELY_NONE"
-                    for s in stmt.orelse:
-                        if isinstance(s, ast.Assign):
-                            for target in s.targets:
-                                if isinstance(target, ast.Name):
-                                    if _is_none_literal(s.value):
-                                        current_vars[target.id] = "DEFINITELY_NONE"
-                                    else:
-                                        current_vars[target.id] = "KNOWN_NOT_NONE"
-                                elif isinstance(target, (ast.Tuple, ast.List)):
-                                    for elt in ast.walk(target):
-                                        if isinstance(elt, ast.Name):
-                                            self._invalidate_var(current_vars, elt.id)
-                        elif isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
-                            if s.value and _is_none_literal(s.value):
-                                current_vars[s.target.id] = "DEFINITELY_NONE"
-                            elif s.value:
-                                current_vars[s.target.id] = "KNOWN_NOT_NONE"
-                            else:
-                                self._invalidate_var(current_vars, s.target.id)
-                        elif isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name):
-                            current_vars[s.target.id] = "KNOWN_NOT_NONE"
-                        else:
-                            for name in _extract_assigned_names_in_subtree(s):
-                                self._invalidate_var(current_vars, name)
-
+                if body_exits and orelse_exits:
+                    current_vars.clear()
+                elif body_exits:
+                    current_vars = dict(final_else)
                 elif orelse_exits:
-                    for var in tf.known_not_none_vars:
-                        current_vars[var] = "KNOWN_NOT_NONE"
-                    for var in tf.definitely_none_vars:
-                        current_vars[var] = "DEFINITELY_NONE"
-                    for s in stmt.body:
-                        if isinstance(s, ast.Assign):
-                            for target in s.targets:
-                                if isinstance(target, ast.Name):
-                                    if _is_none_literal(s.value):
-                                        current_vars[target.id] = "DEFINITELY_NONE"
-                                    else:
-                                        current_vars[target.id] = "KNOWN_NOT_NONE"
-                                elif isinstance(target, (ast.Tuple, ast.List)):
-                                    for elt in ast.walk(target):
-                                        if isinstance(elt, ast.Name):
-                                            self._invalidate_var(current_vars, elt.id)
-                        elif isinstance(s, ast.AnnAssign) and isinstance(s.target, ast.Name):
-                            if s.value and _is_none_literal(s.value):
-                                current_vars[s.target.id] = "DEFINITELY_NONE"
-                            elif s.value:
-                                current_vars[s.target.id] = "KNOWN_NOT_NONE"
-                            else:
-                                self._invalidate_var(current_vars, s.target.id)
-                        elif isinstance(s, ast.AugAssign) and isinstance(s.target, ast.Name):
-                            current_vars[s.target.id] = "KNOWN_NOT_NONE"
-                        else:
-                            for name in _extract_assigned_names_in_subtree(s):
-                                self._invalidate_var(current_vars, name)
-
+                    current_vars = dict(final_body)
                 elif not stmt.orelse:
+                    promoted_guards: set[str] = set()
                     for var in self._extract_names_from_test(stmt.test):
                         if (_is_test_checking_is_none(stmt.test, var) or _is_test_checking_falsy(stmt.test, var)) and _body_always_assigns_non_none(stmt.body, var):
                             current_vars[var] = "KNOWN_NOT_NONE"
@@ -1329,11 +1281,22 @@ class NoneDereferenceDetector(ast.NodeVisitor):
                         if name not in promoted_guards:
                             self._invalidate_var(current_vars, name)
                 else:
-                    for name in _extract_assigned_names_in_subtree(stmt):
-                        self._invalidate_var(current_vars, name)
+                    # Both branches reach convergence: merge facts that hold on every reachable path
+                    merged_vars: dict[str, str] = {}
+                    all_candidates = set(current_vars.keys()) | set(final_body.keys()) | set(final_else.keys())
+                    for var in all_candidates:
+                        state_b = final_body.get(var)
+                        state_e = final_else.get(var)
+                        if state_b == state_e and state_b is not None:
+                            merged_vars[var] = state_b
+                        else:
+                            self._invalidate_var(merged_vars, var)
+                    current_vars = merged_vars
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.Try)):
                 for name in _extract_assigned_names_in_subtree(stmt):
                     self._invalidate_var(current_vars, name)
+
+        return current_vars
 
     def _extract_function_params(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> dict[str, str]:
         """Extract function parameters and determine if any default to None."""
@@ -1495,7 +1458,7 @@ class NoneDereferenceDetector(ast.NodeVisitor):
             body_vars[var] = "DEFINITELY_NONE"
 
         self._var_state_stack.append(body_vars)
-        self._visit_statement_sequence(node.body)
+        final_body = self._visit_statement_sequence(node.body)
         self._var_state_stack.pop()
 
         # 2. Else branch
@@ -1506,8 +1469,10 @@ class NoneDereferenceDetector(ast.NodeVisitor):
             else_vars[var] = "DEFINITELY_NONE"
 
         self._var_state_stack.append(else_vars)
-        self._visit_statement_sequence(node.orelse)
+        final_else = self._visit_statement_sequence(node.orelse)
         self._var_state_stack.pop()
+
+        self._last_if_branches = (final_body, final_else)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
         # Recurse into children first
@@ -1750,6 +1715,83 @@ class NoneDereferenceDetector(ast.NodeVisitor):
                 )
             )
             return
+
+        # Case 1b: Built-in len() called on literal None or variable known to be None
+        if isinstance(node.func, ast.Name) and node.func.id == "len" and node.args:
+            first_arg = node.args[0]
+            if _is_none_literal(first_arg):
+                if not self._is_enclosed_in_type_error_handler():
+                    self.issues.append(
+                        Issue(
+                            code="SEM002",
+                            message="Calling len() on literal None will raise TypeError.",
+                            file_path=self.file_path,
+                            line=node.lineno,
+                            column=node.col_offset,
+                            severity="WARNING",
+                            tool="semantic_analyzer",
+                            fixable=False,
+                            confidence="HIGH",
+                            explanation=(
+                                "Calling len(None) unconditionally raises TypeError: "
+                                "object of type 'NoneType' has no len()."
+                            ),
+                            suggested_fix="Ensure the argument is a valid sequence or mapping before calling len().",
+                        )
+                    )
+                return
+
+            arg_name = _get_name_id(first_arg)
+            if arg_name:
+                arg_state = self._current_var_state.get(arg_name)
+                if arg_state == "DEFINITELY_NONE":
+                    if not self._is_enclosed_in_type_error_handler():
+                        self.issues.append(
+                            Issue(
+                                code="SEM002",
+                                message=(
+                                    f"Calling len() on variable '{arg_name}' which is known to be None: "
+                                    f"call will raise TypeError."
+                                ),
+                                file_path=self.file_path,
+                                line=node.lineno,
+                                column=node.col_offset,
+                                severity="WARNING",
+                                tool="semantic_analyzer",
+                                fixable=False,
+                                confidence="HIGH",
+                                explanation=(
+                                    f"Variable '{arg_name}' is proven to evaluate to None in this execution path. "
+                                    f"Calling len({arg_name}) raises TypeError: object of type 'NoneType' has no len()."
+                                ),
+                                suggested_fix=f"Verify that '{arg_name}' is not None prior to calling len({arg_name}).",
+                            )
+                        )
+                    return
+                if arg_state == "MAYBE_NONE":
+                    if not self._is_enclosed_in_type_error_handler():
+                        self.issues.append(
+                            Issue(
+                                code="SEM002",
+                                message=(
+                                    f"Possible None dereference: parameter '{arg_name}' defaults to None "
+                                    f"and is passed to len() without an effective guard."
+                                ),
+                                file_path=self.file_path,
+                                line=node.lineno,
+                                column=node.col_offset,
+                                severity="WARNING",
+                                tool="semantic_analyzer",
+                                fixable=False,
+                                confidence="MEDIUM",
+                                explanation=(
+                                    f"Parameter '{arg_name}' has a default value of None and is passed to len() "
+                                    f"without an effective guard."
+                                ),
+                                suggested_fix=f"Verify that '{arg_name}' is not None prior to calling len({arg_name}).",
+                            )
+                        )
+                    return
 
         # Case 2: Variable call ('x()')
         var_name = _get_name_id(node.func)

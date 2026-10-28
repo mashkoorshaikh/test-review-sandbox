@@ -487,22 +487,22 @@ class TestFullDeterministicBenchmarkExecution:
 
         overall = summary["overall"]
         assert overall["cases_total"] == 15
-        assert overall["cases_passed"] == 12
-        assert overall["cases_mismatched"] == 3
+        assert overall["cases_passed"] == 13
+        assert overall["cases_mismatched"] == 2
         assert overall["cases_failed"] == 0
         assert overall["tool_failures"] == 0
 
         # Ground truth vs actual findings
         assert overall["expected_findings"] == 13
-        assert overall["actual_findings"] == 13
-        assert overall["matched_findings"] == 11
+        assert overall["actual_findings"] == 14
+        assert overall["matched_findings"] == 12
         assert overall["unmatched_actual"] == 2
-        assert overall["unmatched_expected"] == 2
+        assert overall["unmatched_expected"] == 1
 
         # Precision & Recall in expanded suite
-        assert overall["precision"] == 0.8462
-        assert overall["recall"] == 0.8462
-        assert overall["f1_score"] == 0.8462
+        assert overall["precision"] == 0.8571
+        assert overall["recall"] == 0.9231
+        assert overall["f1_score"] == 0.8889
 
         # Clean/safe FPR in expanded suite (all 5 clean/safe cases pass with 0 FP)
         clean = summary["clean_metrics"]
@@ -517,33 +517,33 @@ class TestFullDeterministicBenchmarkExecution:
 
         overall = summary["overall"]
         assert overall["cases_total"] == 30
-        assert overall["cases_passed"] == 27
-        assert overall["cases_mismatched"] == 3
+        assert overall["cases_passed"] == 28
+        assert overall["cases_mismatched"] == 2
         assert overall["cases_failed"] == 0
         assert overall["tool_failures"] == 0
 
         # Finding counts across all 30 cases
         assert overall["expected_findings"] == 26
-        assert overall["actual_findings"] == 26
-        assert overall["matched_findings"] == 24
+        assert overall["actual_findings"] == 27
+        assert overall["matched_findings"] == 25
         assert overall["unmatched_actual"] == 2
-        assert overall["unmatched_expected"] == 2
+        assert overall["unmatched_expected"] == 1
 
         # Aggregate metrics
-        assert overall["precision"] == 0.9231
-        assert overall["recall"] == 0.9231
-        assert overall["f1_score"] == 0.9231
+        assert overall["precision"] == 0.9259
+        assert overall["recall"] == 0.9615
+        assert overall["f1_score"] == 0.9434
 
         # Defect metrics
         defect = summary["defect_metrics"]
         assert defect["cases_total"] == 19
-        assert defect["cases_passed"] == 16
-        assert defect["cases_mismatched"] == 3
+        assert defect["cases_passed"] == 17
+        assert defect["cases_mismatched"] == 2
         assert defect["expected_findings"] == 26
-        assert defect["matched_findings"] == 24
-        assert defect["precision"] == 0.9231
-        assert defect["recall"] == 0.9231
-        assert defect["f1_score"] == 0.9231
+        assert defect["matched_findings"] == 25
+        assert defect["precision"] == 0.9259
+        assert defect["recall"] == 0.9615
+        assert defect["f1_score"] == 0.9434
 
         # Clean & safe-edge subset (11 clean/safe cases total, 0 false positives)
         clean = summary["clean_metrics"]
@@ -555,10 +555,10 @@ class TestFullDeterministicBenchmarkExecution:
 
         # Per-detector breakdown across all 30 cases
         detectors = summary["by_detector"]
-        assert detectors["semantic_analyzer"]["tp"] == 9
-        assert detectors["semantic_analyzer"]["fn"] == 2
+        assert detectors["semantic_analyzer"]["tp"] == 10
+        assert detectors["semantic_analyzer"]["fn"] == 1
         assert detectors["semantic_analyzer"]["fp"] == 0
-        assert detectors["semantic_analyzer"]["recall"] == 0.8182
+        assert detectors["semantic_analyzer"]["recall"] == 0.9091
         assert detectors["semantic_analyzer"]["precision"] == 1.0000
 
         assert detectors["bandit"]["tp"] == 10
