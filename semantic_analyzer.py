@@ -518,6 +518,34 @@ def _walk_enclosing_scope(node: ast.AST):
         queue.extend(ast.iter_child_nodes(current))
 
 
+def _classify_function_returns_none(node: ast.FunctionDef) -> bool:
+    """Determine if a synchronous, undecorated function unconditionally returns None.
+
+    Conservative classification rules:
+      - Decorated functions are UNKNOWN (decorators can wrap return values).
+      - Functions containing yield/yield-from are generators, not None-returners.
+      - Functions with no explicit return statements are UNKNOWN (could be stubs/hooks).
+      - All reachable return statements must be ``return None`` or bare ``return``.
+      - If any return has a non-None value expression, the function is UNKNOWN.
+
+    This intentionally does NOT descend into nested functions, lambdas, or classes.
+    """
+    if node.decorator_list:
+        return False
+    has_return = False
+    # Walk the function body statements (not the FunctionDef node itself,
+    # because _walk_enclosing_scope skips children of FunctionDef nodes).
+    for body_stmt in node.body:
+        for child in _walk_enclosing_scope(body_stmt):
+            if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                return False
+            if isinstance(child, ast.Return):
+                has_return = True
+                if child.value is not None and not _is_none_literal(child.value):
+                    return False
+    return has_return
+
+
 def _extract_all_modified_names(node: ast.AST) -> set[str]:
     """Extract all variable names that are modified, assigned, deleted, or called in an AST subtree without descending into nested scopes."""
     names: set[str] = set()
@@ -1072,12 +1100,38 @@ class NoneDereferenceDetector(ast.NodeVisitor):
         self._in_loop_stack: list[bool] = [False]
         self._function_params_stack: list[dict[str, str]] = []
         self._last_if_branches: tuple[dict[str, str], dict[str, str]] | None = None
+        self._function_return_summaries: dict[str, str] = {}
 
     def _invalidate_var(self, vars_dict: dict[str, str], name: str) -> None:
         if self._function_params_stack and name in self._function_params_stack[-1]:
             vars_dict[name] = self._function_params_stack[-1][name]
         else:
             vars_dict.pop(name, None)
+
+    def _call_returns_none(self, value: ast.expr, current_vars: dict[str, str] | None = None) -> bool:
+        """Check if a call expression invokes a module-level function summarized as always returning None.
+
+        Returns False (conservative) when:
+          - The value is not a simple ``name(...)`` call.
+          - The callee name is not in the module-level return summaries.
+          - The callee name is shadowed by a local variable or function parameter.
+        """
+        if not isinstance(value, ast.Call):
+            return False
+        if not isinstance(value.func, ast.Name):
+            return False
+        callee = value.func.id
+        if self._function_return_summaries.get(callee) != "DEFINITELY_NONE":
+            return False
+        # Guard against local/parameter shadowing of the module-level name.
+        if self._function_params_stack:
+            for params in self._function_params_stack:
+                if callee in params:
+                    return False
+            vars_to_check = current_vars if current_vars is not None else self._current_var_state
+            if callee in vars_to_check:
+                return False
+        return True
 
     @property
     def _current_var_state(self) -> dict[str, str]:
@@ -1231,7 +1285,7 @@ class NoneDereferenceDetector(ast.NodeVisitor):
             if isinstance(stmt, ast.Assign):
                 for target in stmt.targets:
                     if isinstance(target, ast.Name):
-                        if _is_none_literal(stmt.value):
+                        if _is_none_literal(stmt.value) or self._call_returns_none(stmt.value, current_vars):
                             current_vars[target.id] = "DEFINITELY_NONE"
                         else:
                             current_vars[target.id] = "KNOWN_NOT_NONE"
@@ -1240,7 +1294,7 @@ class NoneDereferenceDetector(ast.NodeVisitor):
                             if isinstance(elt, ast.Name):
                                 current_vars.pop(elt.id, None)
             elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
-                if stmt.value and _is_none_literal(stmt.value):
+                if stmt.value and (_is_none_literal(stmt.value) or self._call_returns_none(stmt.value, current_vars)):
                     current_vars[stmt.target.id] = "DEFINITELY_NONE"
                 elif stmt.value:
                     current_vars[stmt.target.id] = "KNOWN_NOT_NONE"
@@ -1338,6 +1392,15 @@ class NoneDereferenceDetector(ast.NodeVisitor):
         self._function_params_stack.pop()
 
     def visit_Module(self, node: ast.Module) -> None:
+        # Pre-pass: build conservative return summaries for top-level functions.
+        # Definition-order independent: scan all top-level FunctionDefs before
+        # visiting any statements so callers above or below the definition benefit.
+        self._function_return_summaries = {
+            stmt.name: "DEFINITELY_NONE"
+            for stmt in node.body
+            if isinstance(stmt, ast.FunctionDef)
+            and _classify_function_returns_none(stmt)
+        }
         self._var_state_stack.append({})
         self._visit_statement_sequence(node.body)
         self._var_state_stack.pop()

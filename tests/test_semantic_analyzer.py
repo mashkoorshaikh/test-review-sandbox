@@ -3200,3 +3200,247 @@ class TestBranchConvergenceNoneAnalysis:
             "        return 0\n"
         )
         assert analyze_python_source(source, "app.py") == []
+
+
+
+# ============================================================================
+# 37. Phase 6 Step 6: Interprocedural None-Return Summary Analysis
+# ============================================================================
+
+
+class TestInterproceduralNoneReturnAnalysis:
+    """Regression tests for narrowly scoped interprocedural None-return detection."""
+
+    def test_unconditional_return_none_attribute_dereference(self):
+        """Helper unconditionally returns None -> caller attribute access flagged."""
+        source = (
+            "def fetch_user(uid: int):\n"
+            "    return None\n"
+            "\n"
+            "def get_user_name(uid: int) -> str:\n"
+            "    user = fetch_user(uid)\n"
+            "    return user.name\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+    def test_bare_return_attribute_dereference(self):
+        """Helper with bare return (implicit None) -> caller attribute access flagged."""
+        source = (
+            "def get_nothing():\n"
+            "    return\n"
+            "\n"
+            "def process():\n"
+            "    result = get_nothing()\n"
+            "    return result.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+    def test_unconditional_return_none_subscript_dereference(self):
+        """Helper returns None -> caller subscripts the result."""
+        source = (
+            "def fetch_config():\n"
+            "    return None\n"
+            "\n"
+            "def get_setting():\n"
+            "    cfg = fetch_config()\n"
+            "    return cfg['timeout']\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+    def test_unconditional_return_none_len_dereference(self):
+        """Helper returns None -> caller passes result to len()."""
+        source = (
+            "def fetch_items():\n"
+            "    return None\n"
+            "\n"
+            "def count_items():\n"
+            "    items = fetch_items()\n"
+            "    return len(items)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 6
+
+    def test_conditional_mixed_returns_no_false_positive(self):
+        """Helper sometimes returns non-None -> caller dereference is NOT flagged."""
+        source = (
+            "def maybe_fetch(uid: int):\n"
+            "    if uid > 0:\n"
+            "        return 'user_object'\n"
+            "    return None\n"
+            "\n"
+            "def process(uid: int):\n"
+            "    user = maybe_fetch(uid)\n"
+            "    return user.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_non_none_return_no_false_positive(self):
+        """Helper always returns non-None -> caller dereference is NOT flagged."""
+        source = (
+            "def make_user():\n"
+            "    return {'name': 'Alice'}\n"
+            "\n"
+            "def process():\n"
+            "    user = make_user()\n"
+            "    return user['name']\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_helper_defined_after_caller(self):
+        """Helper defined below the caller -> still detected (definition-order independent)."""
+        source = (
+            "def get_user_name(uid: int) -> str:\n"
+            "    user = fetch_user(uid)\n"
+            "    return user.name\n"
+            "\n"
+            "def fetch_user(uid: int):\n"
+            "    return None\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 3
+
+    def test_parameter_shadowing_no_false_positive(self):
+        """Caller has parameter with same name as module helper -> summary not applied."""
+        source = (
+            "def fetch_user():\n"
+            "    return None\n"
+            "\n"
+            "def process(fetch_user=None):\n"
+            "    result = fetch_user()\n"
+            "    return result.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        # fetch_user is a MAYBE_NONE parameter; calling it is a MEDIUM issue,
+        # but the module-level summary should NOT apply.
+        sem002_high = [i for i in issues if i.code == "SEM002" and i.confidence == "HIGH"]
+        assert sem002_high == []
+
+    def test_local_assignment_shadowing_no_false_positive(self):
+        """Callee name is reassigned locally -> summary not applied."""
+        source = (
+            "def fetch_user():\n"
+            "    return None\n"
+            "\n"
+            "def process():\n"
+            "    fetch_user = lambda: {'name': 'Bob'}\n"
+            "    result = fetch_user()\n"
+            "    return result['name']\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_guard_protection_preserved(self):
+        """Caller guards with 'if user is None' -> no finding after guard."""
+        source = (
+            "def fetch_user(uid: int):\n"
+            "    return None\n"
+            "\n"
+            "def get_user_name(uid: int) -> str:\n"
+            "    user = fetch_user(uid)\n"
+            "    if user is None:\n"
+            "        return 'unknown'\n"
+            "    return user.name\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_exception_handler_suppression(self):
+        """Caller wraps dereference in try/except AttributeError -> suppressed."""
+        source = (
+            "def fetch_user(uid: int):\n"
+            "    return None\n"
+            "\n"
+            "def get_user_name(uid: int) -> str:\n"
+            "    user = fetch_user(uid)\n"
+            "    try:\n"
+            "        return user.name\n"
+            "    except AttributeError:\n"
+            "        return 'unknown'\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_decorated_function_not_summarized(self):
+        """Decorated function is UNKNOWN -> caller dereference not flagged."""
+        source = (
+            "def my_decorator(f):\n"
+            "    return f\n"
+            "\n"
+            "@my_decorator\n"
+            "def fetch_user():\n"
+            "    return None\n"
+            "\n"
+            "def process():\n"
+            "    user = fetch_user()\n"
+            "    return user.name\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_generator_function_not_summarized(self):
+        """Generator function is not classified as returns-None."""
+        source = (
+            "def gen_items():\n"
+            "    yield None\n"
+            "    return None\n"
+            "\n"
+            "def process():\n"
+            "    result = gen_items()\n"
+            "    return result.send(None)\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_no_explicit_return_not_summarized(self):
+        """Function with no explicit return is not classified (stub/hook pattern)."""
+        source = (
+            "def setup():\n"
+            "    pass\n"
+            "\n"
+            "def process():\n"
+            "    result = setup()\n"
+            "    return result.name\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert issues == []
+
+    def test_multiple_return_none_branches_all_none(self):
+        """Function with multiple branches all returning None -> still summarized."""
+        source = (
+            "def lookup(key: str):\n"
+            "    if key == 'a':\n"
+            "        return None\n"
+            "    elif key == 'b':\n"
+            "        return None\n"
+            "    else:\n"
+            "        return\n"
+            "\n"
+            "def process():\n"
+            "    val = lookup('x')\n"
+            "    return val.strip()\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        assert len(issues) == 1
+        assert issues[0].code == "SEM002"
+        assert issues[0].confidence == "HIGH"
+        assert issues[0].line == 11
