@@ -25,10 +25,13 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,8 +44,16 @@ SANDBOX_IMAGE = os.getenv("SANDBOX_IMAGE", "code-review-sandbox:3.11")
 # Default timeout for sandboxed execution (seconds)
 DEFAULT_SANDBOX_TIMEOUT = 60
 
+# Bounded timeout for forceful container cleanup commands (seconds)
+DEFAULT_CLEANUP_TIMEOUT = 10.0
+
 # Maximum size of stdout/stderr captured from container (bytes)
 MAX_OUTPUT_BYTES = 64 * 1024  # 64 KB
+
+# Allowed test filename pattern: must start with alphanumeric or underscore,
+# end with .py, and contain only letters, numbers, underscores, and hyphens.
+_SAFE_TEST_FILENAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_-]*\.py$")
+_FORBIDDEN_FILENAME_CHARS = frozenset(";&|`$><(){}[]!*?\"' \t\r\n\x00/\\")
 
 
 @dataclass
@@ -61,6 +72,7 @@ class SandboxResult:
         error_message: Human-readable error if execution failed or was skipped.
         source_workspace: Path to the disposable source copy used.
         test_workspace: Path to the disposable test workspace used.
+        container_name: Assigned unique container name for this execution.
     """
     executed: bool = False
     exit_code: int | None = None
@@ -72,6 +84,7 @@ class SandboxResult:
     error_message: str | None = None
     source_workspace: str | None = None
     test_workspace: str | None = None
+    container_name: str | None = None
 
 
 def is_docker_available() -> bool:
@@ -122,11 +135,104 @@ def validate_test_file_path(test_file: str, test_workspace: str) -> Path:
     return resolved
 
 
+def validate_test_filename(test_filename: str) -> str:
+    """
+    Validate that test_filename is a safe, strictly-formed Python test filename.
+
+    Rejects:
+      - None, non-strings, or empty/whitespace strings.
+      - Path separators ('/' or '\\') or absolute paths.
+      - Traversal components ('.' or '..') or filenames containing '..'.
+      - Shell metacharacters (;, &, |, `, $, quotes, redirection, spaces, etc.).
+      - Non-.py extensions or unexpected filename forms.
+
+    Returns:
+        The validated clean filename string.
+
+    Raises:
+        ValueError: If the filename violates any safety constraint.
+    """
+    if not isinstance(test_filename, str) or not test_filename.strip():
+        raise ValueError("Test filename must be a non-empty string.")
+
+    cleaned = test_filename.strip()
+
+    # Reject path separators and absolute paths
+    if "/" in cleaned or "\\" in cleaned or os.path.isabs(cleaned):
+        raise ValueError(
+            f"Path separators and absolute paths are forbidden in test filename: {test_filename!r}"
+        )
+
+    # Reject traversal segments and relative dot components
+    if cleaned in (".", "..") or ".." in cleaned:
+        raise ValueError(
+            f"Traversal components ('.' or '..') are forbidden in test filename: {test_filename!r}"
+        )
+
+    # Reject shell metacharacters, whitespace, and control characters
+    for ch in cleaned:
+        if ch in _FORBIDDEN_FILENAME_CHARS or ord(ch) < 32 or ord(ch) > 126:
+            raise ValueError(
+                f"Forbidden character {ch!r} detected in test filename: {test_filename!r}"
+            )
+
+    # Must match safe Python test filename format
+    if not _SAFE_TEST_FILENAME_RE.match(cleaned):
+        raise ValueError(
+            f"Invalid test filename format: {test_filename!r}. "
+            "Must be a standard Python file ending in '.py' with alphanumeric, underscore, or hyphen characters."
+        )
+
+    return cleaned
+
+
+def generate_sandbox_container_name() -> str:
+    """Generate a unique, unpredictable container name for sandbox execution."""
+    return f"agy_sbx_{uuid.uuid4().hex[:16]}"
+
+
+def _cleanup_container(container_name: str, timeout: float = DEFAULT_CLEANUP_TIMEOUT) -> None:
+    """
+    Forcefully stop and remove a specific named container if it is still running.
+
+    Guarantees:
+      - Targets strictly the specific unique container name.
+      - Bounded execution time (timeout=10.0s).
+      - Catches and logs all errors without raising or exposing secrets.
+      - Never raises exceptions that would mask upstream timeouts or results.
+    """
+    if not container_name:
+        return
+    try:
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.warning("Failed to force-remove container '%s': %s", container_name, e)
+    except Exception as e:  # noqa: BLE001 - cleanup must never crash caller
+        logger.warning("Unexpected error cleaning up container '%s': %s", container_name, e)
+
+
+def _safe_cleanup(cleanup_fn: Callable[[str], None], container_name: str | None) -> None:
+    """Invoke container cleanup safely, ensuring no exception masks caller results."""
+    if not container_name:
+        return
+    try:
+        cleanup_fn(container_name)
+    except Exception as exc:  # noqa: BLE001 - cleanup must never mask caller's result
+        logger.warning("Error during container cleanup for '%s': %s", container_name, exc)
+
+
 def _build_docker_run_command(
     source_mount: str,
     test_mount: str,
     test_filename: str,
     timeout: int,
+    container_name: str | None = None,
 ) -> list[str]:
     """
     Build the complete `docker run` command with security constraints.
@@ -141,10 +247,18 @@ def _build_docker_run_command(
       --security-opt=no-new-privileges, --user=65534:65534,
       --memory=256m, --cpus=1.0, --pids-limit=64,
       --rm (auto-remove container on exit)
+      --name=<unique_container_name> (per-execution container name for lifecycle control)
+
+    Execution model:
+      Runs pytest executable directly (no shell or sh -c interpretation).
     """
+    safe_filename = validate_test_filename(test_filename)
+    c_name = container_name or generate_sandbox_container_name()
+
     return [
         "docker", "run",
         "--rm",
+        f"--name={c_name}",
         "--network=none",
         "--read-only",
         "--cap-drop=ALL",
@@ -158,11 +272,8 @@ def _build_docker_run_command(
         f"--mount=type=bind,source={test_mount},target=/tests,readonly",
         "--workdir=/src",
         SANDBOX_IMAGE,
-        "sh", "-c",
-        (
-            f"python -m pytest /tests/{test_filename} -v --tb=short "
-            "--no-header -p no:cacheprovider"
-        ),
+        "python", "-m", "pytest", f"/tests/{safe_filename}",
+        "-v", "--tb=short", "--no-header", "-p", "no:cacheprovider",
     ]
 
 
@@ -172,6 +283,7 @@ def run_tests_in_sandbox(
     timeout: int = DEFAULT_SANDBOX_TIMEOUT,
     _docker_runner: object | None = None,  # injection point for unit tests
     test_workspace: str | None = None,
+    _cleanup_fn: Callable[[str], None] | None = None,  # injection point for cleanup tests
 ) -> SandboxResult:
     """
     Execute a test file against a source directory inside a disposable Docker container.
@@ -184,6 +296,7 @@ def run_tests_in_sandbox(
                         Signature: (cmd: List[str], timeout: int) -> subprocess.CompletedProcess
         test_workspace: Optional designated workspace directory. If provided,
                         validates that test_file does not escape it.
+        _cleanup_fn: Optional callable for container cleanup injection in tests.
 
     Returns:
         SandboxResult describing execution outcome.
@@ -192,6 +305,10 @@ def run_tests_in_sandbox(
       - If Docker is not available, returns SandboxResult(docker_unavailable=True).
       - Source and test files are mounted read-only; container runs as non-root.
       - No network access, no privilege escalation, limited resources.
+      - Direct executable execution of pytest without shell or sh -c interpretation.
+      - Test filename strictly validated against path traversal and shell metacharacters.
+      - Unique unpredictable container name assigned per execution.
+      - Guarantees forceful container removal on timeout or error via bounded docker rm -f.
       - Symlinks pointing outside the source tree are ignored.
       - Never executes code directly on the host.
       - All temp directories are cleaned up regardless of outcome.
@@ -227,7 +344,13 @@ def run_tests_in_sandbox(
         )
 
     test_filename = test_path.name
+    try:
+        safe_filename = validate_test_filename(test_filename)
+    except ValueError as err:
+        return SandboxResult(error_message=f"Invalid test file: {err}")
 
+    cleanup = _cleanup_fn or _cleanup_container
+    container_name: str | None = None
     disposable_src: str | None = None
     disposable_tests: str | None = None
 
@@ -248,7 +371,7 @@ def run_tests_in_sandbox(
                         if not target.is_relative_to(source_path):
                             logger.warning(
                                 "Ignoring symlink '%s' pointing outside source tree: '%s'",
-                                item_p, target
+                                item_p, target,
                             )
                             ignored.append(name)
                     except (ValueError, RuntimeError):
@@ -265,14 +388,16 @@ def run_tests_in_sandbox(
             shutil.copy2(str(source_path), str(Path(disposable_src) / source_path.name))
 
         # Copy only the single test file
-        shutil.copy2(str(test_path), os.path.join(disposable_tests, test_filename))
+        shutil.copy2(str(test_path), os.path.join(disposable_tests, safe_filename))
 
-        # 3. Build docker run command
+        # 3. Build docker run command with unique container name
+        container_name = generate_sandbox_container_name()
         cmd = _build_docker_run_command(
             source_mount=disposable_src,
             test_mount=disposable_tests,
-            test_filename=test_filename,
+            test_filename=safe_filename,
             timeout=timeout,
+            container_name=container_name,
         )
 
         logger.info("Launching sandbox container: %s", " ".join(shlex.quote(c) for c in cmd))
@@ -305,10 +430,12 @@ def run_tests_in_sandbox(
             stderr=stderr_text,
             source_workspace=disposable_src,
             test_workspace=disposable_tests,
+            container_name=container_name,
         )
 
     except subprocess.TimeoutExpired:
         logger.warning("Sandbox execution timed out after %d seconds.", timeout)
+        _safe_cleanup(cleanup, container_name)
         return SandboxResult(
             executed=True,
             exit_code=None,
@@ -317,14 +444,20 @@ def run_tests_in_sandbox(
             error_message=f"Sandbox execution timed out after {timeout} seconds.",
             source_workspace=disposable_src,
             test_workspace=disposable_tests,
+            container_name=container_name,
         )
     except Exception as exc:  # noqa: BLE001 - sandbox boundary containment
         logger.error("Sandbox execution failed: %s: %s", type(exc).__name__, exc)
+        _safe_cleanup(cleanup, container_name)
         return SandboxResult(
             error_message=f"Sandbox execution error: {type(exc).__name__}: {exc}",
             source_workspace=disposable_src,
             test_workspace=disposable_tests,
+            container_name=container_name,
         )
+    except BaseException:
+        _safe_cleanup(cleanup, container_name)
+        raise
     finally:
         # 5. Cleanup disposable workspaces unconditionally
         for temp_dir in [disposable_src, disposable_tests]:
