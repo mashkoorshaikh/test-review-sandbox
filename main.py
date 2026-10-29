@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import warnings
 from collections.abc import Callable
 from datetime import datetime
 from typing import Any
@@ -450,6 +451,7 @@ from github_client import (
     GitHubUncertainWriteError,
     GitHubValidationError,
     redact_token,
+    register_sensitive_token,
 )
 from github_review_workflow import (
     PrePublicationValidationError,
@@ -484,6 +486,8 @@ def run_pr_pipeline(
     Execute the PR review workflow or controlled publishing workflow for a GitHub PR.
     """
     out = output_func or print
+    if token:
+        register_sensitive_token(token)
     has_credentials = is_api_key_configured() or llm is not None
     effective_enable_ai = enable_ai and has_credentials
     if enable_ai and not has_credentials:
@@ -645,7 +649,7 @@ def main() -> None:
         "--token",
         dest="token",
         default=None,
-        help="GitHub token (defaults to GITHUB_TOKEN or GH_TOKEN env var)",
+        help="GitHub token (DEPRECATED for security: prefer GITHUB_TOKEN or GH_TOKEN env var)",
     )
     parser.add_argument(
         "--publish",
@@ -683,6 +687,20 @@ def main() -> None:
         help="Disable the Debugging Agent (no patch proposals)",
     )
     args = parser.parse_args()
+
+    if args.token is not None:
+        warnings.warn(
+            "Passing GitHub token via '--token' CLI option is deprecated for security reasons: "
+            "command-line arguments can be exposed in process tables and shell history. "
+            "Please set the GITHUB_TOKEN or GH_TOKEN environment variable (or GITHUB_TOKEN_FILE) instead.",
+            UserWarning,
+            stacklevel=2,
+        )
+        sys.stderr.write(
+            "[Security Warning] Passing GitHub token via '--token' CLI option is deprecated. "
+            "Command-line arguments can be visible to other users and logged in shell history. "
+            "Please set the GITHUB_TOKEN or GH_TOKEN environment variable instead.\n"
+        )
 
     if args.publish and not args.pr:
         print("ERROR: --publish requires a GitHub PR target specified via --pr.")

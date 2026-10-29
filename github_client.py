@@ -29,9 +29,108 @@ import requests
 logger = logging.getLogger(__name__)
 
 # Patterns used for credential redaction
+# Registered active tokens across client instances and secure file sources
+_REGISTERED_TOKENS: set[str] = set()
+
+
+def register_sensitive_token(token: str | None) -> None:
+    """
+    Register a token to be globally scrubbed by redact_token.
+    Prevents leaking credentials passed explicitly to client instances
+    or loaded from secure credential files.
+    """
+    if token and isinstance(token, str):
+        cleaned = token.strip()
+        if len(cleaned) >= 4:
+            _REGISTERED_TOKENS.add(cleaned)
+
+
+def clear_sensitive_tokens() -> None:
+    """Clear registered sensitive tokens (primarily used for test cleanup)."""
+    _REGISTERED_TOKENS.clear()
+
+
+def resolve_github_token(token: str | None = None) -> str | None:
+    """
+    Resolve GitHub credentials following strict precedence:
+      1. Explicit function argument / CLI input (highest precedence).
+      2. GITHUB_TOKEN environment variable.
+      3. GH_TOKEN environment variable.
+      4. GITHUB_TOKEN_FILE environment variable (path to token file).
+
+    Registers any resolved token for automated log/exception redaction.
+    """
+    resolved, _ = resolve_github_token_with_source(token)
+    return resolved
+
+
+def resolve_github_token_with_source(
+    token: str | None = None,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve GitHub credentials and identify the source.
+
+    Precedence:
+      1. Explicit argument (or CLI --token)
+      2. GITHUB_TOKEN env var
+      3. GH_TOKEN env var
+      4. GITHUB_TOKEN_FILE env var
+
+    Returns:
+        tuple[token, source] where source is one of:
+        'explicit', 'GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN_FILE', or None.
+    """
+    # 1. Explicit token argument
+    if token is not None:
+        cleaned = token.strip()
+        if cleaned:
+            register_sensitive_token(cleaned)
+            return cleaned, "explicit"
+        return "", "explicit"
+
+    # 2. GITHUB_TOKEN environment variable
+    env_gh = os.getenv("GITHUB_TOKEN")
+    if env_gh is not None and env_gh.strip():
+        cleaned = env_gh.strip()
+        register_sensitive_token(cleaned)
+        return cleaned, "GITHUB_TOKEN"
+
+    # 3. GH_TOKEN environment variable
+    env_gh_short = os.getenv("GH_TOKEN")
+    if env_gh_short is not None and env_gh_short.strip():
+        cleaned = env_gh_short.strip()
+        register_sensitive_token(cleaned)
+        return cleaned, "GH_TOKEN"
+
+    # 4. GITHUB_TOKEN_FILE environment variable
+    token_file = os.getenv("GITHUB_TOKEN_FILE")
+    if token_file is not None and token_file.strip():
+        file_path = Path(token_file.strip()).resolve()
+        if not file_path.is_file():
+            raise GitHubAuthError(
+                f"Configured GITHUB_TOKEN_FILE does not exist or is not a file: {file_path}"
+            )
+        try:
+            file_content = file_path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            raise GitHubAuthError(
+                f"Failed to read token from GITHUB_TOKEN_FILE '{file_path}': {e}"
+            ) from None
+
+        if not file_content:
+            raise GitHubAuthError(
+                f"Configured GITHUB_TOKEN_FILE '{file_path}' is empty."
+            )
+        register_sensitive_token(file_content)
+        return file_content, "GITHUB_TOKEN_FILE"
+
+    return None, None
+
+
 _TOKEN_PATTERNS = [
     re.compile(r"(?i)(authorization[:=]\s*(?:Bearer|token)\s+)[^\s,'\"\\]+"),
     re.compile(r"(?i)\b(bearer\s+)[a-zA-Z0-9_\-\.]+"),
+    re.compile(r"(?i)([?&](?:access_token|token)=)[^&\s'\"]+"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}\b"),
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b"),
     re.compile(r"\bsk-[a-zA-Z0-9_\-]{20,}\b"),
@@ -51,12 +150,25 @@ def redact_token(text: str, token: str | None = None) -> str:
     if not text:
         return ""
     sanitized = str(text)
-    if token and len(token) >= 3:
-        sanitized = sanitized.replace(token, "[REDACTED]")
+
+    # 1. Redact explicit token argument if provided
+    if token and isinstance(token, str):
+        cleaned_token = token.strip()
+        if len(cleaned_token) >= 3:
+            sanitized = sanitized.replace(cleaned_token, "[REDACTED]")
+
+    # 2. Redact all registered tokens (from GitHubClient instances or secure file inputs)
+    for reg_token in _REGISTERED_TOKENS:
+        if reg_token and len(reg_token) >= 4:
+            sanitized = sanitized.replace(reg_token, "[REDACTED]")
+
+    # 3. Redact environment variables
     for _env in ("GITHUB_TOKEN", "GH_TOKEN", "OPENAI_API_KEY"):
         _v = os.getenv(_env, "").strip()
         if _v and len(_v) >= 4:
             sanitized = sanitized.replace(_v, "[REDACTED]")
+
+    # 4. Regex pattern scrubbing for standard token formats and URL parameters
     for pattern in _TOKEN_PATTERNS:
         if pattern.groups == 1:
             sanitized = pattern.sub(r"\1[REDACTED]", sanitized)
@@ -345,11 +457,7 @@ class GitHubClient:
         session: requests.Session | None = None,
         require_token: bool = False,
     ) -> None:
-        raw_token = (
-            token
-            if token is not None
-            else (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN"))
-        )
+        raw_token, token_source = resolve_github_token_with_source(token)
         if raw_token is not None:
             raw_token = raw_token.strip()
             if not raw_token:
@@ -360,12 +468,14 @@ class GitHubClient:
                 raise GitHubAuthError(
                     "Invalid GitHub token: contains forbidden control characters."
                 )
+            register_sensitive_token(raw_token)
         elif require_token:
             raise GitHubAuthError(
-                "Missing GitHub token. Provide a token or set GITHUB_TOKEN."
+                "Missing GitHub token. Provide a token, set GITHUB_TOKEN or GH_TOKEN, or specify GITHUB_TOKEN_FILE."
             )
 
         self._token: str | None = raw_token
+        self._token_source: str | None = token_source
         self.base_url = (base_url or self.DEFAULT_BASE_URL).rstrip("/")
         self.timeout = float(timeout)
         self._session = session or requests.Session()

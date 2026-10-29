@@ -24,12 +24,16 @@ from github_client import (
     GitHubValidationError,
     PRMetadata,
     TokenRedactingFilter,
+    clear_sensitive_tokens,
     create_pull_request_review,
     get_pr_diff,
     get_pr_metadata,
     get_pr_reviews,
     parse_diff_hunks,
     redact_token,
+    register_sensitive_token,
+    resolve_github_token,
+    resolve_github_token_with_source,
 )
 
 # ============================================================================
@@ -1568,3 +1572,152 @@ class TestStage1SecurityFixesAndHunkSpan:
         # Zero or negative
         assert df.find_hunk_for_span(0, 10) is None
         assert df.find_hunk_for_span(-5, -1) is None
+
+
+
+# ============================================================================
+# Token Precedence, Resolution, and Instance Redaction Tests
+# ============================================================================
+
+
+class TestTokenPrecedenceAndResolution:
+    """Tests for token source precedence, fallback, and file-based token input."""
+
+    def test_explicit_token_has_highest_precedence(self, monkeypatch, tmp_path):
+        token_file = tmp_path / "token.txt"
+        token_file.write_text("file_token_4444", encoding="utf-8")
+        monkeypatch.setenv("GITHUB_TOKEN", "env_token_2222")
+        monkeypatch.setenv("GH_TOKEN", "gh_token_3333")
+        monkeypatch.setenv("GITHUB_TOKEN_FILE", str(token_file))
+
+        resolved, source = resolve_github_token_with_source("explicit_token_1111")
+        assert resolved == "explicit_token_1111"
+        assert source == "explicit"
+
+    def test_github_token_precedes_gh_token_and_file(self, monkeypatch, tmp_path):
+        token_file = tmp_path / "token.txt"
+        token_file.write_text("file_token_4444", encoding="utf-8")
+        monkeypatch.setenv("GITHUB_TOKEN", "env_token_2222")
+        monkeypatch.setenv("GH_TOKEN", "gh_token_3333")
+        monkeypatch.setenv("GITHUB_TOKEN_FILE", str(token_file))
+
+        resolved, source = resolve_github_token_with_source(None)
+        assert resolved == "env_token_2222"
+        assert source == "GITHUB_TOKEN"
+
+    def test_gh_token_precedes_file(self, monkeypatch, tmp_path):
+        token_file = tmp_path / "token.txt"
+        token_file.write_text("file_token_4444", encoding="utf-8")
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.setenv("GH_TOKEN", "gh_token_3333")
+        monkeypatch.setenv("GITHUB_TOKEN_FILE", str(token_file))
+
+        resolved, source = resolve_github_token_with_source(None)
+        assert resolved == "gh_token_3333"
+        assert source == "GH_TOKEN"
+
+    def test_github_token_file_resolved_when_env_vars_absent(self, monkeypatch, tmp_path):
+        token_file = tmp_path / "token.txt"
+        token_file.write_text("file_token_4444\n", encoding="utf-8")
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setenv("GITHUB_TOKEN_FILE", str(token_file))
+
+        resolved, source = resolve_github_token_with_source(None)
+        assert resolved == "file_token_4444"
+        assert source == "GITHUB_TOKEN_FILE"
+
+    def test_github_token_file_missing_raises_auth_error(self, monkeypatch, tmp_path):
+        missing_path = tmp_path / "nonexistent_token.txt"
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setenv("GITHUB_TOKEN_FILE", str(missing_path))
+
+        with pytest.raises(GitHubAuthError, match="Configured GITHUB_TOKEN_FILE does not exist"):
+            resolve_github_token_with_source(None)
+
+    def test_github_token_file_empty_raises_auth_error(self, monkeypatch, tmp_path):
+        empty_file = tmp_path / "empty_token.txt"
+        empty_file.write_text("   \n", encoding="utf-8")
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setenv("GITHUB_TOKEN_FILE", str(empty_file))
+
+        with pytest.raises(GitHubAuthError, match="Configured GITHUB_TOKEN_FILE .* is empty"):
+            resolve_github_token_with_source(None)
+
+    def test_missing_credentials_raises_when_required(self, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN_FILE", raising=False)
+
+        with pytest.raises(GitHubAuthError, match="Missing GitHub token"):
+            GitHubClient(require_token=True)
+
+
+class TestInstanceTokenRedaction:
+    """Tests verifying that tokens passed to GitHubClient instances are globally scrubbed."""
+
+    def test_client_instance_token_is_automatically_registered_and_redacted(self):
+        clear_sensitive_tokens()
+        secret = "custom_instance_pat_9876543210123"
+        client = GitHubClient(token=secret)
+        assert client._token == secret
+
+        # Calling redact_token without passing token explicitly must scrub the secret
+        raw_msg = f"API error occurred while using token {secret} to connect"
+        scrubbed = redact_token(raw_msg)
+        assert secret not in scrubbed
+        assert "[REDACTED]" in scrubbed
+
+    def test_logger_filter_redacts_instance_token_without_token_arg(self, caplog):
+        clear_sensitive_tokens()
+        secret = "instance_key_for_logger_test_5555"
+        GitHubClient(token=secret)
+
+        test_logger = logging.getLogger("test_instance_redact")
+        test_logger.addFilter(TokenRedactingFilter())
+
+        with caplog.at_level(logging.INFO):
+            test_logger.info("Connecting using %s to API endpoint", secret)
+        assert secret not in caplog.text
+        assert "[REDACTED]" in caplog.text
+
+    def test_github_client_error_redacts_registered_token_without_param(self):
+        clear_sensitive_tokens()
+        secret = "secret_inside_exception_msg_7777"
+        GitHubClient(token=secret)
+
+        err = GitHubClientError(f"HTTP 500 server error with {secret}")
+        assert secret not in str(err)
+        assert "[REDACTED]" in str(err)
+
+    def test_multiple_client_instances_register_and_redact_all_tokens(self):
+        clear_sensitive_tokens()
+        secret1 = "client_one_secret_token_1111"
+        secret2 = "client_two_secret_token_2222"
+        GitHubClient(token=secret1)
+        GitHubClient(token=secret2)
+
+        combined_msg = f"Credentials {secret1} and {secret2} were active"
+        scrubbed = redact_token(combined_msg)
+        assert secret1 not in scrubbed
+        assert secret2 not in scrubbed
+        assert scrubbed.count("[REDACTED]") == 2
+
+    def test_url_query_parameters_with_token_are_redacted(self):
+        url_with_param = "https://api.github.com/repos/owner/repo/pulls?access_token=secret_in_url_8888&page=2"
+        scrubbed = redact_token(url_with_param)
+        assert "secret_in_url_8888" not in scrubbed
+        assert "?access_token=[REDACTED]&page=2" in scrubbed
+
+    def test_resolve_github_token_convenience_helper(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "helper_test_token_9999")
+        tok = resolve_github_token()
+        assert tok == "helper_test_token_9999"
+
+    def test_register_sensitive_token_manually(self):
+        clear_sensitive_tokens()
+        register_sensitive_token("manual_secret_token_8888")
+        assert "manual_secret_token_8888" not in redact_token("leaked manual_secret_token_8888 here")
+        assert "[REDACTED]" in redact_token("leaked manual_secret_token_8888 here")
