@@ -7,8 +7,11 @@ No Docker calls are made; no network access required.
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from debugging_agent import (
     DEBUGGING_DISCLAIMER,
@@ -17,6 +20,7 @@ from debugging_agent import (
     _extract_diff_from_response,
     _validate_patch_safety,
     apply_patch_to_copy,
+    cleanup_temp_dir,
 )
 from llm_config import MissingApiKeyError
 
@@ -382,3 +386,99 @@ class TestDebuggingAgentRun:
         # max_attempts > 5 is clamped to 5
         agent_high = DebuggingAgent(max_attempts=99)
         assert agent_high.max_attempts == 5
+
+
+# ---------------------------------------------------------------------------
+# Temporary Directory Cleanup Tests
+# ---------------------------------------------------------------------------
+
+
+class TestTemporaryDirectoryCleanup:
+    """Tests verifying temporary-directory cleanup on success, failure, and exception paths."""
+
+    def test_cleanup_temp_dir_removes_valid_temp_directory(self):
+        d = tempfile.mkdtemp(prefix="test_cleanup_")
+        assert Path(d).is_dir()
+        result = cleanup_temp_dir(d)
+        assert result is True
+        assert not Path(d).exists()
+
+    def test_cleanup_temp_dir_rejects_paths_outside_temp_root(self):
+        project_root = Path(__file__).resolve().parent.parent
+        assert project_root.is_dir()
+        result = cleanup_temp_dir(str(project_root))
+        # Must refuse to remove paths outside system temp dir
+        assert result is False
+        assert project_root.is_dir()
+
+    def test_cleanup_temp_dir_handles_none_or_missing_path(self):
+        assert cleanup_temp_dir(None) is False
+        assert cleanup_temp_dir("nonexistent_path_12345") is False
+
+    def test_apply_patch_to_copy_cleans_up_on_diff_mismatch(self, tmp_path):
+        orig = tmp_path / "sample.py"
+        orig.write_text("actual_content = 42\n", encoding="utf-8")
+
+        with patch("debugging_agent._apply_unified_diff", return_value=None):
+            success, err, copy_path = apply_patch_to_copy(str(orig), SIMPLE_DIFF)
+            assert success is False
+            assert copy_path is None
+            assert "did not match file content" in err
+
+    def test_apply_patch_to_copy_cleans_up_on_copy_exception(self, tmp_path):
+        orig = tmp_path / "sample.py"
+        orig.write_text("x = 1\n", encoding="utf-8")
+
+        with patch("shutil.copy2", side_effect=OSError("Disk full")):
+            success, err, copy_path = apply_patch_to_copy(str(orig), SIMPLE_DIFF)
+            assert success is False
+            assert copy_path is None
+            assert "Disk full" in err
+
+    def test_debugging_agent_cleanup_and_context_manager(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_WORKSPACE_ROOT", str(tmp_path))
+        src = tmp_path / "app.py"
+        src.write_text("x = 1\n", encoding="utf-8")
+
+        mock_llm = make_mock_llm()
+        with DebuggingAgent(llm=mock_llm, workspace_root=str(tmp_path)) as agent:
+            proposal = agent.propose_patch(
+                target_file=str(src),
+                ruff_findings=[],
+                bandit_findings=[],
+                failed_test_output="",
+            )
+            assert proposal.patch_succeeded is True
+            assert proposal.patch_applied_to_copy is not None
+            copy_path = Path(proposal.patch_applied_to_copy)
+            assert copy_path.is_file()
+            parent_dir = copy_path.parent
+            assert parent_dir.is_dir()
+
+        # After exiting context manager, temporary directory must be cleaned up
+        assert not parent_dir.exists()
+
+    def test_debugging_agent_run_cleans_up_on_base_exception(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("AGENT_WORKSPACE_ROOT", str(tmp_path))
+        src = tmp_path / "app.py"
+        src.write_text("x = 1\n", encoding="utf-8")
+
+        mock_llm = make_mock_llm()
+        agent = DebuggingAgent(llm=mock_llm, workspace_root=str(tmp_path))
+
+        def failing_runner(**kwargs):
+            raise KeyboardInterrupt("Simulated interrupt")
+
+        with pytest.raises(KeyboardInterrupt):
+            agent.run(
+                target_file=str(src),
+                ruff_findings=[],
+                bandit_findings=[],
+                failed_test_output="Failed",
+                sandbox_runner=failing_runner,
+                test_file="test_app.py",
+                source_dir=str(tmp_path),
+            )
+
+        # Agent should have cleaned up temporary directories on BaseException
+        assert len(agent._created_temp_dirs) == 0

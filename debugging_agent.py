@@ -22,7 +22,7 @@ import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -137,6 +137,28 @@ def _validate_patch_safety(patch_text: str) -> bool:
 
 
 
+def cleanup_temp_dir(path: str | Path | None) -> bool:
+    """
+    Safely remove a temporary directory created for patch application.
+
+    Ensures that only directories strictly inside the system temp directory
+    (and not the system temp root itself) are removed.
+    Returns True if directory was removed, False otherwise.
+    """
+    if not path:
+        return False
+    try:
+        p = Path(path).resolve()
+        dir_to_remove = p if p.is_dir() else p.parent
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        if dir_to_remove.is_relative_to(temp_root) and dir_to_remove != temp_root and dir_to_remove.exists():
+            shutil.rmtree(str(dir_to_remove), ignore_errors=True)
+            return True
+    except (ValueError, RuntimeError, OSError):
+        pass
+    return False
+
+
 def apply_patch_to_copy(
     original_file: str,
     patch_text: str,
@@ -156,6 +178,7 @@ def apply_patch_to_copy(
         Tuple of (success: bool, error_message: str, patched_copy_path: Optional[str]).
         On success, patched_copy_path points to the temporary patched file.
     """
+    temp_dir: str | None = None
     try:
         orig = Path(original_file).resolve()
 
@@ -180,13 +203,20 @@ def apply_patch_to_copy(
         # Use a simple inline patch applier
         patched_lines = _apply_unified_diff(original_lines, patch_lines)
         if patched_lines is None:
-            return False, "Failed to apply patch: diff did not match file content.", str(temp_dir)
+            cleanup_temp_dir(temp_dir)
+            return False, "Failed to apply patch: diff did not match file content.", None
 
         patched_copy.write_text("".join(patched_lines), encoding="utf-8")
         return True, "", str(patched_copy)
 
     except Exception as exc:  # noqa: BLE001 - defensive patch sandbox isolation
+        if temp_dir:
+            cleanup_temp_dir(temp_dir)
         return False, f"Patch application error: {type(exc).__name__}: {exc}", None
+    except BaseException:
+        if temp_dir:
+            cleanup_temp_dir(temp_dir)
+        raise
 
 
 
@@ -272,6 +302,19 @@ class DebuggingAgent:
         self.llm = llm
         self.max_attempts = max(1, min(max_attempts, 5))  # bound between 1 and 5
         self.workspace_root = workspace_root
+        self._created_temp_dirs: list[str] = []
+
+    def cleanup(self) -> None:
+        """Clean up all disposable temporary directories created by this agent."""
+        for d in list(self._created_temp_dirs):
+            cleanup_temp_dir(d)
+        self._created_temp_dirs.clear()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        self.cleanup()
 
     def _get_llm(self) -> BaseChatModel:
         if self.llm is not None:
@@ -395,6 +438,8 @@ class DebuggingAgent:
             )
             proposal.patch_succeeded = success
             proposal.patch_applied_to_copy = patched_path
+            if success and patched_path:
+                self._created_temp_dirs.append(str(Path(patched_path).parent))
             if not success:
                 proposal.error_message = err_msg
 
@@ -427,51 +472,56 @@ class DebuggingAgent:
         proposals: list[dict[str, Any]] = []
         patch_verified = False
 
-        for attempt in range(1, self.max_attempts + 1):
-            logger.info("Debugging Agent attempt %d/%d", attempt, self.max_attempts)
+        try:
+            for attempt in range(1, self.max_attempts + 1):
+                logger.info("Debugging Agent attempt %d/%d", attempt, self.max_attempts)
 
-            proposal = self.propose_patch(
-                target_file=target_file,
-                ruff_findings=ruff_findings,
-                bandit_findings=bandit_findings,
-                failed_test_output=failed_test_output,
-                attempt_number=attempt,
-            )
+                proposal = self.propose_patch(
+                    target_file=target_file,
+                    ruff_findings=ruff_findings,
+                    bandit_findings=bandit_findings,
+                    failed_test_output=failed_test_output,
+                    attempt_number=attempt,
+                )
 
-            if proposal.error_message:
-                errors.append(f"Attempt {attempt}: {proposal.error_message}")
+                if proposal.error_message:
+                    errors.append(f"Attempt {attempt}: {proposal.error_message}")
 
-            # If patch applied and sandbox runner provided, verify it
-            if (
-                proposal.patch_succeeded
-                and proposal.patch_applied_to_copy
-                and sandbox_runner is not None
-                and test_file is not None
-                and source_dir is not None
-            ):
-                try:
-                    verification = sandbox_runner(
-                        source_dir=proposal.patch_applied_to_copy
-                        if os.path.isdir(proposal.patch_applied_to_copy)
-                        else str(Path(proposal.patch_applied_to_copy).parent),
-                        test_file=test_file,
-                    )
-                    proposal.verification_result = verification
-                    if verification.passed:
-                        patch_verified = True
-                        proposals.append(_proposal_to_dict(proposal))
-                        break  # Stop on first passing patch
-                except Exception as verify_err:  # noqa: BLE001 - runner error containment
-                    errors.append(
-                        f"Attempt {attempt} verification error: "
-                        f"{type(verify_err).__name__}: {verify_err}"
-                    )
+                # If patch applied and sandbox runner provided, verify it
+                if (
+                    proposal.patch_succeeded
+                    and proposal.patch_applied_to_copy
+                    and sandbox_runner is not None
+                    and test_file is not None
+                    and source_dir is not None
+                ):
+                    try:
+                        verification = sandbox_runner(
+                            source_dir=proposal.patch_applied_to_copy
+                            if os.path.isdir(proposal.patch_applied_to_copy)
+                            else str(Path(proposal.patch_applied_to_copy).parent),
+                            test_file=test_file,
+                        )
+                        proposal.verification_result = verification
+                        if verification.passed:
+                            patch_verified = True
+                            proposals.append(_proposal_to_dict(proposal))
+                            break  # Stop on first passing patch
+                    except Exception as verify_err:  # noqa: BLE001 - runner error containment
+                        errors.append(
+                            f"Attempt {attempt} verification error: "
+                            f"{type(verify_err).__name__}: {verify_err}"
+                        )
 
 
-            proposals.append(_proposal_to_dict(proposal))
+                proposals.append(_proposal_to_dict(proposal))
 
-            if patch_verified:
-                break
+                if patch_verified:
+                    break
+
+        except BaseException:
+            self.cleanup()
+            raise
 
         return {
             "patch_proposals": proposals,

@@ -36,15 +36,52 @@ _VALID_TEST_PATTERNS = [
     re.compile(r"\bclass\s+Test\w+\s*[:(]", re.MULTILINE),  # class TestXxx
 ]
 
+# Prohibited modules and calls for static defense-in-depth screening.
+# NOTE: Static AST/regex screening is a secondary defense-in-depth measure;
+# Docker container isolation (sandbox_runner.py) remains the primary sandbox boundary.
+PROHIBITED_MODULES: frozenset[str] = frozenset({
+    "subprocess",
+    "pty",
+    "posix",
+    "ctypes",
+    "socket",
+    "http.client",
+    "urllib.request",
+    "importlib",
+})
+
+PROHIBITED_OS_FUNCS: frozenset[str] = frozenset({
+    "system",
+    "popen",
+    "spawn",
+    "remove",
+    "unlink",
+    "rmdir",
+    "kill",
+})
+
+PROHIBITED_BUILTINS: frozenset[str] = frozenset({
+    "eval",
+    "exec",
+    "__import__",
+    "compile",
+    "breakpoint",
+})
+
 # Patterns that indicate suspicious prompt injection attempts in generated code
 _SUSPICIOUS_INJECTION_PATTERNS = [
-    re.compile(r"import\s+subprocess", re.IGNORECASE),
-    re.compile(r"os\.system\s*\(", re.IGNORECASE),
-    re.compile(r"exec\s*\(", re.IGNORECASE),
-    re.compile(r"eval\s*\(", re.IGNORECASE),
-    re.compile(r"__import__\s*\(", re.IGNORECASE),
-    re.compile(r"open\s*\(.*['\"]w['\"]", re.IGNORECASE),
-    re.compile(r"shutil\.(rmtree|move|copy)", re.IGNORECASE),
+    re.compile(r"\bimport\s+(subprocess|pty|posix|ctypes|socket)", re.IGNORECASE),
+    re.compile(r"\bfrom\s+(subprocess|pty|posix|ctypes|socket)\b", re.IGNORECASE),
+    re.compile(r"\bos\.(system|popen|spawn|remove|unlink|rmdir|kill)\s*\(", re.IGNORECASE),
+    re.compile(r"\bexec\s*\(", re.IGNORECASE),
+    re.compile(r"\beval\s*\(", re.IGNORECASE),
+    re.compile(r"\bcompile\s*\(", re.IGNORECASE),
+    re.compile(r"\bbreakpoint\s*\(", re.IGNORECASE),
+    re.compile(r"\b__import__\s*\(", re.IGNORECASE),
+    re.compile(r"\bimportlib\.(import_module|__import__)\s*\(", re.IGNORECASE),
+    re.compile(r"\bopen\s*\(.*['\"]w['\"]", re.IGNORECASE),
+    re.compile(r"\bshutil\.(rmtree|move|copy)", re.IGNORECASE),
+    re.compile(r"\b__subclasses__\s*\(", re.IGNORECASE),
 ]
 
 
@@ -133,27 +170,36 @@ def validate_generated_test_content(content: str) -> tuple[bool, str]:
             "`class Test*` classes. Cannot treat as a pytest test file."
         )
 
-    # 4. AST visitor for dangerous calls/imports (defense-in-depth)
+    # 4. AST visitor for dangerous calls/imports (defense-in-depth screening)
     for node in ast.walk(tree):
         # Disallow dangerous imports
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name in ("subprocess", "pty", "posix"):
+                base_pkg = alias.name.split(".")[0]
+                if alias.name in PROHIBITED_MODULES or base_pkg in PROHIBITED_MODULES:
                     return False, f"Generated test imports prohibited module '{alias.name}'."
         elif isinstance(node, ast.ImportFrom):
-            if node.module in ("subprocess", "pty", "posix"):
-                return False, f"Generated test imports from prohibited module '{node.module}'."
-            if node.module == "os":
+            mod = node.module or ""
+            base_pkg = mod.split(".")[0]
+            if mod in PROHIBITED_MODULES or base_pkg in PROHIBITED_MODULES:
+                return False, f"Generated test imports from prohibited module '{mod}'."
+            if mod == "os":
                 for alias in node.names:
-                    if alias.name in ("system", "popen", "spawn"):
+                    if alias.name in PROHIBITED_OS_FUNCS:
                         return False, f"Generated test imports prohibited function 'os.{alias.name}'."
         # Disallow dangerous function calls
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in ("eval", "exec", "__import__")
-        ):
-            return False, f"Generated test calls prohibited built-in '{node.func.id}()'."
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name) and node.func.id in PROHIBITED_BUILTINS:
+                return False, f"Generated test calls prohibited built-in '{node.func.id}()'."
+            if isinstance(node.func, ast.Attribute):
+                if node.func.attr == "__subclasses__":
+                    return False, "Generated test calls prohibited method '__subclasses__()'."
+                if (
+                    isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"
+                    and node.func.attr in PROHIBITED_OS_FUNCS
+                ):
+                    return False, f"Generated test calls prohibited function 'os.{node.func.attr}()'."
 
 
     return True, ""

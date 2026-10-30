@@ -231,6 +231,29 @@ class TestRunRuff:
         assert result.success is False
         assert "Failed to parse Ruff output" in (result.error_message or "")
 
+    @patch("subprocess.run")
+    def test_run_ruff_guards_against_flag_like_path(self, mock_subprocess, tmp_path):
+        """Paths starting with a dash or flag name must be preceded by '--' and sanitized."""
+        flag_file = tmp_path / "-v.py"
+        flag_file.write_text("x = 1\n", encoding="utf-8")
+        mock_subprocess.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+
+        result = run_ruff(str(flag_file))
+        assert result.success is True
+
+        cmd_called = mock_subprocess.call_args[0][0]
+        assert "--" in cmd_called
+        dash_idx = cmd_called.index("--")
+        path_arg = cmd_called[dash_idx + 1]
+        assert path_arg != "-v.py"
+        assert not path_arg.startswith("-")
+
+    def test_run_ruff_rejects_null_bytes(self):
+        result = run_ruff("app\x00.py")
+        assert result.success is False
+        assert result.exit_code is None
+
+
 
 # -----------------------------------------------------------------------------
 # Tests for Bandit Execution
@@ -358,6 +381,29 @@ class TestRunBandit:
         cmd_called = mock_subprocess.call_args[0][0]
         assert "-r" not in cmd_called
         assert sample_file_path in cmd_called
+
+    @patch("subprocess.run")
+    def test_run_bandit_guards_against_flag_like_path(self, mock_subprocess, tmp_path):
+        """Paths starting with a dash or flag name must be preceded by '--' and sanitized."""
+        flag_file = tmp_path / "-v.py"
+        flag_file.write_text("x = 1\n", encoding="utf-8")
+        mock_subprocess.return_value = MagicMock(returncode=0, stdout=BANDIT_CLEAN_JSON, stderr="")
+
+        result = run_bandit(str(flag_file))
+        assert result.success is True
+
+        cmd_called = mock_subprocess.call_args[0][0]
+        assert "--" in cmd_called
+        dash_idx = cmd_called.index("--")
+        path_arg = cmd_called[dash_idx + 1]
+        assert path_arg != "-v.py"
+        assert not path_arg.startswith("-")
+
+    def test_run_bandit_rejects_null_bytes(self):
+        result = run_bandit("app\x00.py")
+        assert result.success is False
+        assert result.exit_code is None
+
 
 
 # -----------------------------------------------------------------------------

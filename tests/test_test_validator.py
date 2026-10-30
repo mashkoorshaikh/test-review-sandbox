@@ -121,6 +121,48 @@ class TestValidateGeneratedTestContent:
         ok, _ = validate_generated_test_content(content)
         assert ok is True
 
+    def test_rejects_socket_import(self):
+        content = "import socket\ndef test_net():\n    s = socket.socket()\n"
+        ok, reason = validate_generated_test_content(content)
+        assert ok is False
+        assert "unsafe pattern" in reason.lower() or "prohibited" in reason.lower()
+
+    def test_rejects_ctypes_import(self):
+        content = "import ctypes\ndef test_mem():\n    pass\n"
+        ok, reason = validate_generated_test_content(content)
+        assert ok is False
+        assert "unsafe pattern" in reason.lower() or "prohibited" in reason.lower()
+
+    def test_rejects_importlib_usage(self):
+        content = "import importlib\ndef test_dyn():\n    importlib.import_module('os')\n"
+        ok, reason = validate_generated_test_content(content)
+        assert ok is False
+        assert "unsafe pattern" in reason.lower() or "prohibited" in reason.lower()
+
+    def test_rejects_compile_and_breakpoint_calls(self):
+        content1 = "def test_compile():\n    compile('x=1', '', 'exec')\n"
+        ok1, reason1 = validate_generated_test_content(content1)
+        assert ok1 is False
+        assert "compile" in reason1.lower()
+
+        content2 = "def test_bp():\n    breakpoint()\n"
+        ok2, reason2 = validate_generated_test_content(content2)
+        assert ok2 is False
+        assert "breakpoint" in reason2.lower()
+
+    def test_rejects_os_file_deletion(self):
+        content = "import os\ndef test_del():\n    os.remove('file.txt')\n"
+        ok, reason = validate_generated_test_content(content)
+        assert ok is False
+        assert "unsafe pattern" in reason.lower() or "prohibited" in reason.lower()
+
+    def test_rejects_subclasses_traversal(self):
+        content = "def test_sub():\n    ().__class__.__subclasses__()\n"
+        ok, reason = validate_generated_test_content(content)
+        assert ok is False
+        assert "unsafe pattern" in reason.lower() or "subclasses" in reason.lower()
+
+
 
 
 # ---------------------------------------------------------------------------

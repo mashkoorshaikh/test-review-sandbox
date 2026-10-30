@@ -262,8 +262,8 @@ def run_ruff(
     """
     start_time = time.time()
 
-    # Pre-validation: ensure target path exists
-    if not os.path.exists(target_path):
+    # Pre-validation: ensure target path is non-empty, contains no null bytes, and exists
+    if not target_path or "\x00" in target_path or not os.path.exists(target_path):
         return ToolResult(
             tool_name="Ruff",
             target_path=target_path,
@@ -277,7 +277,11 @@ def run_ruff(
     # Build safe argument list: shell=False
     base_cmd = custom_cmd if custom_cmd is not None else resolve_tool_command("ruff")
     # Note: --fix is deliberately NOT passed to protect source code from unwanted modifications
-    cmd = list(base_cmd) + ["check", target_path, "--output-format=json"]
+    safe_path = target_path
+    if safe_path.startswith("-"):
+        safe_path = f".{os.sep}{safe_path}"
+    # Use '--' to prevent paths starting with a dash or flag-like names from being parsed as options
+    cmd = list(base_cmd) + ["check", "--output-format=json", "--", safe_path]
 
     try:
         process = subprocess.run(
@@ -414,8 +418,8 @@ def run_bandit(
     """
     start_time = time.time()
 
-    # Pre-validation: ensure target path exists
-    if not os.path.exists(target_path):
+    # Pre-validation: ensure target path is non-empty, contains no null bytes, and exists
+    if not target_path or "\x00" in target_path or not os.path.exists(target_path):
         return ToolResult(
             tool_name="Bandit",
             target_path=target_path,
@@ -429,13 +433,16 @@ def run_bandit(
     # Build safe argument list: shell=False
     base_cmd = custom_cmd if custom_cmd is not None else resolve_tool_command("bandit")
 
-    # If the target is a directory, use recursive flag '-r'
-    cmd = list(base_cmd) + ["-q"]
+    safe_path = target_path
+    if safe_path.startswith("-"):
+        safe_path = f".{os.sep}{safe_path}"
+
+    # Use '--' to prevent paths from being parsed as CLI options
+    cmd = list(base_cmd) + ["-q", "-f", "json"]
     if os.path.isdir(target_path):
-        cmd.extend(["-r", target_path])
+        cmd.extend(["-r", "--", safe_path])
     else:
-        cmd.append(target_path)
-    cmd.extend(["-f", "json"])
+        cmd.extend(["--", safe_path])
 
     try:
         process = subprocess.run(
