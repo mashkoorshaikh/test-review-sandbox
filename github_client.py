@@ -214,8 +214,18 @@ logger.addFilter(TokenRedactingFilter())
 class GitHubClientError(Exception):
     """Base exception for all GitHub client errors."""
 
-    def __init__(self, message: str, token: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        token: str | None = None,
+        response_message: str | None = None,
+        sso_hint: str | None = None,
+    ) -> None:
         super().__init__(redact_token(message, token))
+        self.response_message = (
+            redact_token(response_message, token) if response_message else None
+        )
+        self.sso_hint = redact_token(sso_hint, token) if sso_hint else None
 
 
 class GitHubAuthError(GitHubClientError):
@@ -441,6 +451,23 @@ class DiffFile:
 # ============================================================================
 
 
+def _get_response_header(response: requests.Response, name: str) -> str | None:
+    """Safely extract a header value from a response with case-insensitive fallback."""
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    if hasattr(headers, "get"):
+        val = headers.get(name)
+        if val is not None:
+            return str(val)
+        target = name.casefold()
+        if hasattr(headers, "items"):
+            for k, v in headers.items():
+                if isinstance(k, str) and k.casefold() == target:
+                    return str(v)
+    return None
+
+
 class GitHubClient:
     """
     Minimal GitHub REST API client for code review workflow.
@@ -536,9 +563,9 @@ class GitHubClient:
                 token=self._token,
             )
         if status in (403, 429):
-            remaining = response.headers.get("X-RateLimit-Remaining")
-            retry_after_str = response.headers.get("Retry-After")
-            reset_str = response.headers.get("X-RateLimit-Reset")
+            remaining = _get_response_header(response, "X-RateLimit-Remaining")
+            retry_after_str = _get_response_header(response, "Retry-After")
+            reset_str = _get_response_header(response, "X-RateLimit-Reset")
             retry_after = (
                 int(retry_after_str)
                 if retry_after_str and retry_after_str.isdigit()
@@ -546,10 +573,34 @@ class GitHubClient:
             )
             reset_at = int(reset_str) if reset_str and reset_str.isdigit() else None
 
+            raw_text = (
+                response.text
+                if hasattr(response, "text") and isinstance(response.text, str)
+                else ""
+            )
+
+            # Attempt to extract GitHub's response JSON message
+            github_msg = ""
+            if hasattr(response, "json") and callable(response.json):
+                try:
+                    err_data = response.json()
+                    if isinstance(err_data, dict):
+                        raw_msg = err_data.get("message")
+                        if isinstance(raw_msg, str) and raw_msg.strip():
+                            github_msg = raw_msg.strip()
+                except (
+                    ValueError,
+                    requests.exceptions.JSONDecodeError,
+                    AttributeError,
+                    TypeError,
+                ):
+                    pass
+
             is_rate_limit = (
                 status == 429
                 or remaining == "0"
-                or "rate limit" in response.text.lower()
+                or "rate limit" in raw_text.lower()
+                or "rate limit" in github_msg.lower()
             )
             if is_rate_limit:
                 msg = f"GitHub API rate limit exceeded for {owner}/{repo}."
@@ -563,9 +614,49 @@ class GitHubClient:
                     reset_at=reset_at,
                     token=self._token,
                 )
+
+            # Preserve GitHub's response JSON message and diagnostic headers for non-rate-limit 403
+            if not github_msg and raw_text.strip():
+                github_msg = raw_text.strip()[:200]
+
+            details: list[str] = []
+            if github_msg:
+                clean_msg = " ".join(github_msg.split())
+                if len(clean_msg) > 250:
+                    clean_msg = clean_msg[:247] + "..."
+                details.append(clean_msg)
+
+            sso_hint: str | None = None
+            sso_header = _get_response_header(response, "X-GitHub-SSO")
+            if sso_header and sso_header.strip():
+                clean_sso = " ".join(sso_header.strip().split())
+                if len(clean_sso) > 250:
+                    clean_sso = clean_sso[:247] + "..."
+                sso_hint = f"SSO authorization required: {clean_sso}"
+                details.append(sso_hint)
+
+            accepted_scopes = _get_response_header(response, "X-Accepted-OAuth-Scopes")
+            oauth_scopes = _get_response_header(response, "X-OAuth-Scopes")
+            scope_hints: list[str] = []
+            if accepted_scopes and accepted_scopes.strip():
+                scope_hints.append(f"required: {accepted_scopes.strip()}")
+            if oauth_scopes and oauth_scopes.strip():
+                scope_hints.append(f"token: {oauth_scopes.strip()}")
+            if scope_hints:
+                details.append(f"OAuth scopes ({', '.join(scope_hints)})")
+
+            if details:
+                diagnostic_str = "; ".join(details)
+                safe_details = self._sanitize(diagnostic_str)
+                snippet = f": {safe_details.rstrip('.')}."
+            else:
+                snippet = "."
+
             raise GitHubClientError(
-                f"GitHub API access forbidden: HTTP 403 for {owner}/{repo} PR #{pr_number}.",
+                f"GitHub API access forbidden: HTTP 403 for {owner}/{repo} PR #{pr_number}{snippet}",
                 token=self._token,
+                response_message=github_msg or None,
+                sso_hint=sso_hint,
             )
         if status == 422:
             error_details = ""
@@ -656,8 +747,24 @@ class GitHubClient:
                     token=self._token,
                 )
             if resp.status_code in (403, 429):
-                raise GitHubRateLimitError(
-                    "GitHub API rate limit exceeded for /user.",
+                remaining = _get_response_header(resp, "X-RateLimit-Remaining")
+                raw_u_text = (
+                    resp.text
+                    if hasattr(resp, "text") and isinstance(resp.text, str)
+                    else ""
+                )
+                is_rate_limit = (
+                    resp.status_code == 429
+                    or remaining == "0"
+                    or "rate limit" in raw_u_text.lower()
+                )
+                if is_rate_limit:
+                    raise GitHubRateLimitError(
+                        "GitHub API rate limit exceeded for /user.",
+                        token=self._token,
+                    )
+                raise GitHubClientError(
+                    f"GitHub user request failed with HTTP 403{snippet}",
                     token=self._token,
                 )
             raise GitHubClientError(

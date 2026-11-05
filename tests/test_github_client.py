@@ -6,6 +6,7 @@ All HTTP requests are mocked so tests require no network access or credentials.
 
 from __future__ import annotations
 
+import json
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -1075,6 +1076,134 @@ class TestCreatePullRequestReview:
         client = GitHubClient(session=mock_session)
         with pytest.raises(GitHubClientError, match="HTTP 403"):
             client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+    def test_create_review_http_403_resource_not_accessible_pat(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 403
+        mock_response.headers = {"X-RateLimit-Remaining": "50"}
+        mock_response.json.return_value = {
+            "message": "Resource not accessible by personal access token",
+            "documentation_url": "https://docs.github.com/rest/pulls/reviews",
+        }
+        mock_response.text = json.dumps(mock_response.json.return_value)
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token="ghp_test_secret_token", session=mock_session)
+        with pytest.raises(GitHubClientError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        err = str(exc_info.value)
+        assert "HTTP 403" in err
+        assert "Resource not accessible by personal access token" in err
+        assert "ghp_test_secret_token" not in err
+        assert (
+            exc_info.value.response_message
+            == "Resource not accessible by personal access token"
+        )
+
+    def test_create_review_http_403_must_have_push_access(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 403
+        mock_response.headers = {
+            "X-RateLimit-Remaining": "50",
+            "X-Accepted-OAuth-Scopes": "repo",
+            "X-OAuth-Scopes": "read:user",
+        }
+        mock_response.json.return_value = {
+            "message": "Must have push access to repository",
+            "documentation_url": "https://docs.github.com/rest/pulls/reviews",
+        }
+        mock_response.text = json.dumps(mock_response.json.return_value)
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token="ghp_test_secret_token", session=mock_session)
+        with pytest.raises(GitHubClientError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        err = str(exc_info.value)
+        assert "HTTP 403" in err
+        assert "Must have push access to repository" in err
+        assert "OAuth scopes (required: repo, token: read:user)" in err
+        assert "ghp_test_secret_token" not in err
+        assert exc_info.value.response_message == "Must have push access to repository"
+
+    def test_create_review_http_403_sso_authorization_required(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 403
+        mock_response.headers = {
+            "X-RateLimit-Remaining": "50",
+            "X-GitHub-SSO": "required; url=https://github.com/orgs/my-org/sso?authorization_request=abc123",
+        }
+        mock_response.json.return_value = {
+            "message": "Resource protected by organization SAML enforcement.",
+        }
+        mock_response.text = json.dumps(mock_response.json.return_value)
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token="ghp_test_secret_token", session=mock_session)
+        with pytest.raises(GitHubClientError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        err = str(exc_info.value)
+        assert "HTTP 403" in err
+        assert "SSO authorization required" in err
+        assert "https://github.com/orgs/my-org/sso?authorization_request=abc123" in err
+        assert "ghp_test_secret_token" not in err
+        assert exc_info.value.sso_hint is not None
+        assert "SSO authorization required" in exc_info.value.sso_hint
+
+    def test_create_review_http_403_rate_limit(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 403
+        mock_response.headers = {
+            "X-RateLimit-Remaining": "0",
+            "Retry-After": "90",
+            "X-RateLimit-Reset": "1740000000",
+        }
+        mock_response.json.return_value = {
+            "message": "API rate limit exceeded for user ID 123",
+        }
+        mock_response.text = json.dumps(mock_response.json.return_value)
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token="ghp_test_secret_token", session=mock_session)
+        with pytest.raises(GitHubRateLimitError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        assert exc_info.value.retry_after == 90
+        assert exc_info.value.reset_at == 1740000000
+        assert "rate limit exceeded" in str(exc_info.value).lower()
+        assert "ghp_test_secret_token" not in str(exc_info.value)
+
+    def test_create_review_http_403_token_redaction(self):
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 403
+        mock_response.headers = {
+            "X-RateLimit-Remaining": "50",
+            "X-GitHub-SSO": "required; url=https://github.com/sso?token=ghp_leaked_secret_token",
+        }
+        mock_response.json.return_value = {
+            "message": "Token ghp_leaked_secret_token lacks permissions.",
+        }
+        mock_response.text = json.dumps(mock_response.json.return_value)
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.post.return_value = mock_response
+
+        client = GitHubClient(token="ghp_leaked_secret_token", session=mock_session)
+        with pytest.raises(GitHubClientError) as exc_info:
+            client.create_pull_request_review("owner", "repo", 1, "1234567", "body")
+
+        err = str(exc_info.value)
+        assert "ghp_leaked_secret_token" not in err
+        assert "[REDACTED]" in err
+        if exc_info.value.response_message:
+            assert "ghp_leaked_secret_token" not in exc_info.value.response_message
+        if exc_info.value.sso_hint:
+            assert "ghp_leaked_secret_token" not in exc_info.value.sso_hint
 
     def test_create_review_http_404_not_found(self):
         mock_response = MagicMock(spec=requests.Response)
