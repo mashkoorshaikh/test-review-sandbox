@@ -489,3 +489,5 @@ The file [`sample_project/app.py`](sample_project/app.py) contains deliberate de
 - [x] **Milestone 3:** Test Generation, Docker Sandboxed Execution & Verified Fix Proposals
 - [x] **Milestone 4:** GitHub Integration (PR review automation, inline GitHub suggestions, controlled publishing)
 - [x] **Milestone 5:** GitHub Actions Integration (automated CI review, least-privilege permissions, step summaries)
+
+<!-- GitHub Actions workflow test -->
