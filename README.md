@@ -303,8 +303,7 @@ pytest -v
 ```
 
 **Verified Test Suite Status:**
-- **816 passed, 5 skipped** (integration tests requiring opt-in live Docker daemon)
-- Fast execution (~25s total runtime)
+- **838 passed, 5 skipped** (integration tests requiring opt-in live Docker daemon)
 
 To optionally run the live Docker integration tests when Docker is active:
 
@@ -363,6 +362,116 @@ pytest tests/test_sandbox_integration.py -v
   - Prompts the human reviewer with an interactive approval gate requiring explicit confirmation (`yes`).
   - Publishes the review in a single atomic submission via GitHub REST API upon approval.
 
+### 7. GitHub Actions CI Integration (Milestone 5)
+- **Automated Trigger**: Configured in [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml), triggering on pull request `opened`, `synchronize`, and `reopened` events.
+- **Least-Privilege Permissions**: Declares strict read-only permissions (`contents: read`, `pull-requests: read`) with zero write access.
+- **Secret-Free Workflow**: No custom repository secrets or `OPENAI_API_KEY` are provided to the workflow. The ephemeral `GITHUB_TOKEN` is available to the workflow step for API rate limits when downloading diffs, but is strictly restricted by the declared read-only permissions.
+- **Rejection of `pull_request_target`**: The workflow strictly uses standard `pull_request` triggers and intentionally avoids `pull_request_target` to prevent privileged execution against untrusted PR code.
+- **Trust Boundary & Runner Isolation**: The runner checks out the repository's trusted base branch (`ref: ${{ github.base_ref || github.event.repository.default_branch }}`) so dependencies (`requirements.txt`) and pipeline logic (`main.py`) are trusted maintainer code. Untrusted PR code is downloaded into an isolated temporary workspace for static analysis and is never executed on the runner host (`--no-sandbox`).
+- **Passive Data Inspection**: PR source files are treated strictly as read-only input. They are never imported (`import`/`importlib`), never executed (`python`/`pytest`), and only inspected via static AST scanners.
+- **Credential Hygiene**: `persist-credentials: false` ensures `actions/checkout` does not leave the token stored in `.git/config`. Automatic token redaction scrubs recognized tokens and credentials across GitHubClient logs, exceptions, CLI error output, and GitHub Actions step summaries.
+- **Step Summary Markdown Defenses**: Step summaries sanitize all PR-derived table cells (escaping pipes `\|`, backticks, HTML tags, and markdown image/link embeds) to prevent formatting corruption, tracking pixel leakage, or phishing injection.
+- **Approval Gate Preservation**: Review publishing is strictly disabled in non-interactive CI environments (`NonInteractivePublishingDisabledError` fails closed). Live publication requires explicit interactive human confirmation via the local CLI.
+
+---
+
+## ⚙️ GitHub Actions CI Integration (Milestone 5)
+
+The pipeline includes an automated GitHub Actions workflow configured in [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml).
+
+### Workflow Configuration
+
+```yaml
+name: Multi-Agent PR Review
+
+"on":
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-review-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Strictly enforce least-privilege permissions: read-only access to repository contents and PRs.
+# Never grant write permissions (contents: write or pull-requests: write) in pull_request workflows.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review:
+    name: Code Review & Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      # Trust boundary defense: Check out the trusted repository base branch (NOT untrusted PR code).
+      # The review pipeline fetches PR diff and source files via GitHub API into an isolated
+      # ephemeral workspace for static inspection, preventing malicious PR code or requirements.txt
+      # from executing on the runner or accessing repository secrets.
+      - name: Checkout Trusted Repository Base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref || github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # Dependencies are installed strictly from the trusted base branch requirements.txt.
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Executes the review pipeline from the trusted base repository.
+      # PR code is inspected as passive data in an isolated workspace; dynamic execution is skipped (--no-sandbox).
+      # No custom repository secrets or OPENAI_API_KEY are provided to this workflow.
+      # GITHUB_TOKEN is available to the workflow step, restricted to the declared read-only permissions.
+      # PR context values are mapped via environment variables to eliminate shell script injection risks.
+      - name: Run Multi-Agent PR Review (Read-Only Preview)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          python main.py --pr "$PR_NUMBER" --repo "$REPO_NAME" --no-sandbox
+```
+
+### Setup & Credentials
+
+1. **Automatic GitHub Token**: GitHub Actions automatically injects `secrets.GITHUB_TOKEN`. Used with least privilege (`contents: read`, `pull-requests: read`) for API rate limits when fetching PR diffs.
+2. **Secret-Free CI Security**: `OPENAI_API_KEY` is deliberately omitted from CI pull request workflows to prevent PR-controlled workflow definitions from accessing secrets. CI reviews run deterministically with Ruff and Bandit. AI analysis and fix proposals remain available for maintainers running the review locally.
+
+### Viewing Run Results & Step Summaries
+
+1. Navigate to the **Actions** tab in your GitHub repository.
+2. Select the **Multi-Agent PR Review** workflow run for your pull request.
+3. Open the job to view the rendered **Step Summary**, which provides:
+   - PR number and repository link
+   - Analyzed commit head SHA
+   - Review verdict badge (`COMMENT`, `REQUEST_CHANGES`, `APPROVE`)
+   - Executive findings overview
+   - Proposed inline comments table with line numbers and preview snippets
+   - Advisory notice disclaimer
+
+### Troubleshooting & Common Scenarios
+
+- **Exit Codes & CI Status:**
+  - `0`: Clean review with zero issues detected; review verdict is `APPROVE` or `COMMENT` with no comments.
+  - `1`: Static scanners (Ruff / Bandit) identified findings, review verdict is `REQUEST_CHANGES`, or proposed inline comments exist. This is expected CI behavior to prevent merging issues. Check the Step Summary or job logs for details. To run as an advisory-only check without failing the build, add `continue-on-error: true` to the review step.
+  - `2`: Fatal pipeline error (e.g. GitHub API error, invalid repository/PR target, unhandled exception, or non-interactive publishing rejection).
+- **Forked Pull Requests:**
+  GitHub Actions omits repository secrets on forked PRs for security. The pipeline detects this automatically, reports `[Notice] LLM credentials not configured. Running PR review in deterministic mode.`, and proceeds with Ruff & Bandit static scans without failing.
+- **Publishing Reviews:**
+  Publishing reviews with inline comments to GitHub requires human confirmation and cannot be executed automatically by CI. Maintainers can review proposed actions locally and publish with human authorization:
+  ```powershell
+  python main.py --pr owner/repo#123 --publish
+  ```
+  *(replace `owner/repo#123` with your target repository and pull request number)*
+
 ---
 
 ## 🧪 Sample Demonstrations
@@ -379,3 +488,4 @@ The file [`sample_project/app.py`](sample_project/app.py) contains deliberate de
 - [x] **Milestone 2:** Multi-Agent AI Review using LangGraph (Linter, Security, Test-Writer Agents)
 - [x] **Milestone 3:** Test Generation, Docker Sandboxed Execution & Verified Fix Proposals
 - [x] **Milestone 4:** GitHub Integration (PR review automation, inline GitHub suggestions, controlled publishing)
+- [x] **Milestone 5:** GitHub Actions Integration (automated CI review, least-privilege permissions, step summaries)

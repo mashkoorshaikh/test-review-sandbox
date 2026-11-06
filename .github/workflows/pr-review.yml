@@ -1,0 +1,56 @@
+name: Multi-Agent PR Review
+
+"on":
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-review-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Strictly enforce least-privilege permissions: read-only access to repository contents and PRs.
+# Never grant write permissions (contents: write or pull-requests: write) in pull_request workflows.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review:
+    name: Code Review & Static Analysis
+    runs-on: ubuntu-latest
+
+    steps:
+      # Trust boundary defense: Check out the trusted repository base branch (NOT untrusted PR code).
+      # The review pipeline fetches PR diff and source files via GitHub API into an isolated
+      # ephemeral workspace for static inspection, preventing malicious PR code or requirements.txt
+      # from executing on the runner or accessing repository secrets.
+      - name: Checkout Trusted Repository Base
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.base_ref || github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # Dependencies are installed strictly from the trusted base branch requirements.txt.
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Executes the review pipeline from the trusted base repository.
+      # PR code is inspected as passive data in an isolated workspace; dynamic execution is skipped (--no-sandbox).
+      # No custom repository secrets or OPENAI_API_KEY are provided to this workflow.
+      # GITHUB_TOKEN is available to the workflow step, restricted to the declared read-only permissions.
+      # PR context values are mapped via environment variables to eliminate shell script injection risks.
+      - name: Run Multi-Agent PR Review (Read-Only Preview)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO_NAME: ${{ github.repository }}
+        run: |
+          python main.py --pr "$PR_NUMBER" --repo "$REPO_NAME" --no-sandbox

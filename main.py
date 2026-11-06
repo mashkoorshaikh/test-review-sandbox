@@ -18,11 +18,14 @@ Integrates:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
+import re
 import sys
 import warnings
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -32,6 +35,8 @@ from sandbox_runner import is_docker_available
 from semantic_analyzer import run_semantic_analysis
 from tools import ToolResult, run_bandit, run_ruff
 from workflow import run_review_pipeline
+
+logger = logging.getLogger(__name__)
 
 
 def format_separator(char: str = "=", length: int = 78) -> str:
@@ -461,6 +466,189 @@ from github_review_workflow import (
 )
 
 
+def _escape_markdown_table_cell(text: str) -> str:
+    """
+    Escape PR-derived text placed inside a GitHub Flavored Markdown table cell.
+
+    Guarantees:
+      - Flattens newlines, carriage returns, and control characters to spaces.
+      - Escapes table column delimiters ('|' -> '\\|') to prevent column splitting.
+      - Neutralizes raw HTML tags ('<' -> '&lt;', '>' -> '&gt;').
+      - Neutralizes markdown image embeds (![alt](url)) and links ([text](url)) by escaping brackets
+        ('\\[', '\\]') to prevent external asset requests, tracking pixels, or phishing links in CI.
+      - Replaces backticks with apostrophes to prevent breaking out of code spans.
+    """
+    if not text:
+        return ""
+
+    # 1. Flatten newlines and control characters to prevent multi-line table breakdown
+    cleaned = "".join(c if (ord(c) >= 32 or c in "\t") else " " for c in text)
+    cleaned = cleaned.replace("\r", " ").replace("\n", " ").replace("\t", " ")
+
+    # 2. Escape backslashes first
+    cleaned = cleaned.replace("\\", "\\\\")
+
+    # 3. Escape pipes to prevent table column injection
+    cleaned = cleaned.replace("|", "\\|")
+
+    # 4. Neutralize HTML tags
+    cleaned = cleaned.replace("<", "&lt;").replace(">", "&gt;")
+
+    # 5. Neutralize markdown image and link brackets
+    cleaned = cleaned.replace("[", "\\[").replace("]", "\\]")
+
+    # 6. Neutralize backticks to prevent breaking inline code formatting
+    cleaned = cleaned.replace("`", "'")
+
+    return cleaned.strip()
+
+
+def _sanitize_markdown_text(text: str) -> str:
+    """
+    Sanitize general PR-derived markdown text (e.g. summaries).
+
+    Disarms raw HTML tags, tracking pixels, and external image embeds.
+    """
+    if not text:
+        return ""
+    # Neutralize HTML script, iframe, object, and img tags
+    sanitized = re.sub(
+        r"<\s*(script|iframe|object|embed|img|link|style)\b[^>]*>",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Neutralize markdown image embeds (![...](...)) -> [Image Disabled: ...]
+    sanitized = re.sub(
+        r"!\[(.*?)\]\([^\)]+\)",
+        r"[Image Disabled: \1]",
+        sanitized,
+    )
+    return sanitized
+
+
+def format_github_step_summary(result: Any) -> str:
+    """
+    Format a GitHub Actions step summary markdown document from a PR review result.
+
+    Includes:
+      - Repository, PR number, target commit SHA, and review verdict.
+      - Executive summary of findings (from generate_review_summary).
+      - Table of proposed inline comments (if any).
+      - Required advisory notice.
+    """
+    owner = getattr(result, "owner", "")
+    repo = getattr(result, "repo", "")
+    pr_number = getattr(result, "pr_number", "")
+    head_sha = getattr(result, "head_sha", "")
+    action_plan = getattr(result, "action_plan", None)
+    verdict = action_plan.verdict if action_plan else "COMMENT"
+    summary_text = getattr(result, "summary", "") or (action_plan.summary if action_plan else "")
+    comments = getattr(result, "review_comments", None) or (action_plan.comments if action_plan else ())
+
+    # Clean publication marker if present in summary_text, and sanitize external embeds
+    clean_summary = re.sub(r"<!-- agy-review-marker: [^>]+ -->", "", summary_text).strip()
+    clean_summary = _sanitize_markdown_text(clean_summary)
+
+    safe_owner = _escape_markdown_table_cell(str(owner))
+    safe_repo = _escape_markdown_table_cell(str(repo))
+    safe_pr_number = _escape_markdown_table_cell(str(pr_number))
+    safe_head_sha = _escape_markdown_table_cell(str(head_sha))
+    safe_verdict = _escape_markdown_table_cell(str(verdict))
+
+    target_link = (
+        f"[#{safe_pr_number}](https://github.com/{safe_owner}/{safe_repo}/pull/{safe_pr_number})"
+        if owner and repo and pr_number
+        else f"#{safe_pr_number}"
+    )
+    sha_display = f"`{safe_head_sha[:10]}` (`{safe_head_sha}`)" if safe_head_sha else "N/A"
+
+    lines: list[str] = [
+        f"## 🤖 Multi-Agent PR Review: #{safe_pr_number}",
+        "",
+        "| Repository | Pull Request | Target Head SHA | Review Verdict |",
+        "|:---|:---|:---|:---|",
+        f"| `{safe_owner}/{safe_repo}` | {target_link} | {sha_display} | **{safe_verdict}** |",
+        "",
+    ]
+
+    if clean_summary:
+        lines.extend([
+            clean_summary,
+            "",
+        ])
+
+    if comments:
+        lines.extend([
+            f"### Proposed Inline Comments ({len(comments)})",
+            "",
+            "| File | Line | Side | Comment Preview |",
+            "|:---|:---:|:---:|:---|",
+        ])
+        for c in comments:
+            raw_path = getattr(c, "path", "")
+            c_path = _escape_markdown_table_cell(str(raw_path))
+            c_line = _escape_markdown_table_cell(str(getattr(c, "line", None) or "file-level"))
+            c_side = _escape_markdown_table_cell(str(getattr(c, "side", "RIGHT")))
+            raw_body = getattr(c, "body", "").strip()
+            clean_body = _escape_markdown_table_cell(raw_body)
+            c_body = (clean_body[:97] + "...") if len(clean_body) > 100 else clean_body
+            lines.append(f"| `{c_path}` | `{c_line}` | `{c_side}` | {c_body} |")
+        lines.append("")
+
+    # Ensure advisory notice is explicitly included if not already in summary
+    if "Advisory Notice:" not in clean_summary:
+        lines.extend([
+            "> [!NOTE]",
+            (
+                "> **Advisory Notice:** Automated analysis findings, test generation, and AI explanations represent advisory hypotheses. "
+                "Static analysis and sandboxed tests do not guarantee total runtime security. "
+                "Human maintainer review is required before merging."
+            ),
+            "",
+        ])
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_github_step_summary(
+    result: Any,
+    token: str | None = None,
+    step_summary_path: str | Path | None = None,
+) -> bool:
+    """
+    Safely append a sanitized, token-redacted review summary to $GITHUB_STEP_SUMMARY.
+
+    Guarantees:
+      - If GITHUB_STEP_SUMMARY is not set or empty, silently returns False without error.
+      - If GITHUB_STEP_SUMMARY cannot be written or opened (e.g. invalid path/permissions),
+        catches the exception and returns False without crashing the CLI.
+      - Automatically applies token redaction to all content before writing.
+      - Appends to the summary file using UTF-8 encoding.
+
+    Returns:
+      True if the step summary was successfully written, False otherwise.
+    """
+    target_path = step_summary_path or os.getenv("GITHUB_STEP_SUMMARY")
+    if not target_path or not str(target_path).strip():
+        return False
+
+    summary_file = Path(str(target_path).strip())
+
+    try:
+        summary_md = format_github_step_summary(result)
+        # Apply token redaction for absolute credential safety
+        safe_summary = redact_token(summary_md, token)
+
+        # Open in append mode as expected by GitHub Actions Step Summaries
+        with summary_file.open("a", encoding="utf-8") as f:
+            f.write(f"\n{safe_summary}\n")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not write GITHUB_STEP_SUMMARY to '%s': %s", summary_file, exc)
+        return False
+
+
 def run_pr_pipeline(
     pr_target: str,
     repo: str | None = None,
@@ -481,6 +669,7 @@ def run_pr_pipeline(
     ruff_runner: Callable[..., ToolResult] | None = None,
     bandit_runner: Callable[..., ToolResult] | None = None,
     sandbox_runner_fn: Callable[..., Any] | None = None,
+    step_summary_path: str | Path | None = None,
 ) -> int:
     """
     Execute the PR review workflow or controlled publishing workflow for a GitHub PR.
@@ -565,6 +754,11 @@ def run_pr_pipeline(
             out(format_separator("="))
             return 2
 
+        # Write GitHub Actions Step Summary if running in CI
+        write_github_step_summary(
+            workflow_res, token=token, step_summary_path=step_summary_path
+        )
+
         if not workflow_res.success:
             return 2
         if workflow_res.action_plan.verdict == "REQUEST_CHANGES":
@@ -612,6 +806,11 @@ def run_pr_pipeline(
     if agent_errors:
         display_agent_errors(agent_errors)
 
+    # Write GitHub Actions Step Summary if running in CI
+    write_github_step_summary(
+        result, token=token, step_summary_path=step_summary_path
+    )
+
     # Exit code based on verdict and issues
     if not result.success:
         return 2
@@ -625,7 +824,7 @@ def run_pr_pipeline(
 def main() -> None:
     """Command-line interface entry point."""
     parser = argparse.ArgumentParser(
-        description="Multi-Agent Code Review & Debugging Pipeline - Milestone 4"
+        description="Multi-Agent Code Review & Debugging Pipeline - Milestone 5"
     )
     parser.add_argument(
         "target",
