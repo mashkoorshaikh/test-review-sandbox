@@ -936,7 +936,9 @@ class TestCLIIntegration:
 
         with patch("main.run_pr_review_workflow", return_value=mock_result):
             exit_code = run_pr_pipeline("octocat/Hello-World#42")
-            assert exit_code == 1
+            # In read-only PR preview mode, successful review completion returns 0
+            # even when issues are found (findings are rendered in summary/output).
+            assert exit_code == 0
 
     def test_cli_run_pr_pipeline_error_handling(self, capsys):
         with patch("main.run_pr_review_workflow", side_effect=PRReviewInputError("Invalid PR number")):
