@@ -460,9 +460,9 @@ jobs:
 ### Troubleshooting & Common Scenarios
 
 - **Exit Codes & CI Status:**
-  - `0`: Clean review with zero issues detected; review verdict is `APPROVE` or `COMMENT` with no comments.
-  - `1`: Static scanners (Ruff / Bandit) identified findings, review verdict is `REQUEST_CHANGES`, or proposed inline comments exist. This is expected CI behavior to prevent merging issues. Check the Step Summary or job logs for details. To run as an advisory-only check without failing the build, add `continue-on-error: true` to the review step.
-  - `2`: Fatal pipeline error (e.g. GitHub API error, invalid repository/PR target, unhandled exception, or non-interactive publishing rejection).
+  - `0`: Read-only PR review completed successfully. The review analysis finished cleanly and published its findings, verdict, and proposed inline comments to the GitHub Actions Step Summary and console output (even when code issues or a `REQUEST_CHANGES` verdict are reported). In local single-target analysis (`python main.py <target>`), exit code `0` indicates no issues were detected.
+  - `1`: In local deterministic mode (`python main.py <target>`), indicates lint or security issues were detected. In controlled publishing mode (`--publish`), indicates the human reviewer cancelled publication or changes were requested.
+  - `2`: Genuine execution or workflow failure (e.g. fatal tool crash, invalid repository/PR target, GitHub API network/auth error, or publishing rejected in a non-interactive CI environment).
 - **Forked Pull Requests:**
   GitHub Actions omits repository secrets on forked PRs for security. The pipeline detects this automatically, reports `[Notice] LLM credentials not configured. Running PR review in deterministic mode.`, and proceeds with Ruff & Bandit static scans without failing.
 - **Publishing Reviews:**
@@ -489,3 +489,5 @@ The file [`sample_project/app.py`](sample_project/app.py) contains deliberate de
 - [x] **Milestone 3:** Test Generation, Docker Sandboxed Execution & Verified Fix Proposals
 - [x] **Milestone 4:** GitHub Integration (PR review automation, inline GitHub suggestions, controlled publishing)
 - [x] **Milestone 5:** GitHub Actions Integration (automated CI review, least-privilege permissions, step summaries)
+
+<!-- GitHub Actions workflow test -->

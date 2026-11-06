@@ -811,13 +811,14 @@ def run_pr_pipeline(
         result, token=token, step_summary_path=step_summary_path
     )
 
-    # Exit code based on verdict and issues
+    # Exit code:
+    # In read-only PR review mode, return 0 when the review analysis completes successfully,
+    # even if code issues are identified, comments are proposed, or the verdict is REQUEST_CHANGES.
+    # The review findings, verdict badge, and inline suggestions are communicated via the GitHub
+    # Actions Step Summary and console output.
+    # Return 2 on genuine execution or workflow failures (tool crashes, invalid targets, or API errors).
     if not result.success:
         return 2
-    if result.action_plan.verdict == "REQUEST_CHANGES":
-        return 1
-    if result.review_comments:
-        return 1
     return 0
 
 

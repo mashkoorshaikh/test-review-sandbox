@@ -600,3 +600,184 @@ class TestCIWorkflowSafetyBehavior:
             summary_content = summary_file.read_text(encoding="utf-8")
             assert "#12" in summary_content
             assert "Deterministic scan completed" in summary_content
+
+
+class TestReadOnlyPRReviewExitSemantics:
+    """
+    Verifies that read-only PR review in CI returns 0 upon successful analysis,
+    regardless of whether findings were detected or changes were requested,
+    while actual execution/workflow failures strictly return 2.
+    """
+
+    def _make_mock_result(
+        self,
+        success: bool = True,
+        verdict: str = "COMMENT",
+        comments: tuple[ReviewComment, ...] = (),
+        summary: str = "Analysis summary",
+    ) -> PRReviewResult:
+        plan = ActionPlan(
+            owner="test-owner",
+            repo="test-repo",
+            pr_number=100,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict=verdict,
+            summary=summary,
+            comments=comments,
+            dry_run=True,
+            created_at_mono=100.0,
+        )
+        return PRReviewResult(
+            owner="test-owner",
+            repo="test-repo",
+            pr_number=100,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            action_plan=plan,
+            preview_text="preview",
+            report={},
+            review_comments=comments,
+            changed_files=("app.py",),
+            workflow_state={},
+            success=success,
+            summary=summary,
+        )
+
+    def test_read_only_pr_review_clean_returns_0(self):
+        """Clean PR scan with no findings returns 0."""
+        mock_res = self._make_mock_result(success=True, verdict="COMMENT", comments=())
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_read_only_pr_review_with_findings_returns_0(self):
+        """Successful review reporting findings returns 0 (review task succeeded)."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="COMMENT",
+            summary="Found 3 lint warnings",
+            comments=(),
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_read_only_pr_review_with_request_changes_verdict_returns_0(self):
+        """Review completing with REQUEST_CHANGES returns 0 (findings communicate via step summary)."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            summary="Critical security vulnerability detected",
+            comments=(),
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_read_only_pr_review_with_comments_returns_0(self):
+        """Review proposing inline comments returns 0."""
+        comment = ReviewComment(
+            path="app.py",
+            line=12,
+            body="Use safe_load instead of load",
+            side="RIGHT",
+        )
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            comments=(comment,),
+            summary="Proposed 1 comment",
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_read_only_pr_review_execution_failure_returns_2(self):
+        """Tool crash or fatal analysis failure (success=False) returns 2."""
+        mock_res = self._make_mock_result(
+            success=False,
+            verdict="REQUEST_CHANGES",
+            summary="Fatal tool crash",
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_read_only_pr_review_exception_fails_safely_returns_2(self, capsys):
+        """Exceptions in PR workflow return 2 and display safe error."""
+        from github_review_workflow import PRReviewWorkflowError
+
+        with patch(
+            "main.run_pr_review_workflow",
+            side_effect=PRReviewWorkflowError("Network connection reset"),
+        ):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+            out = capsys.readouterr().out
+            assert "PR WORKFLOW FAILED: Network connection reset" in out
+
+    def test_step_summary_written_even_with_findings_and_verdict(self, tmp_path, monkeypatch):
+        """Verifies Step Summary contains findings and verdict when exit code is 0."""
+        summary_file = tmp_path / "ci_step_summary.md"
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+        comment = ReviewComment(
+            path="math_utils.py",
+            line=40,
+            body="Division by zero guard required",
+            side="RIGHT",
+        )
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            comments=(comment,),
+            summary="### Findings\n- Division by zero at line 40\n",
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+            assert summary_file.is_file()
+            content = summary_file.read_text(encoding="utf-8")
+            assert "REQUEST_CHANGES" in content
+            assert "math_utils.py" in content
+            assert "Division by zero guard required" in content
+
+    def test_local_deterministic_pipeline_semantics_retained(self):
+        """Local deterministic analysis retains its distinct exit semantics: 0=clean, 1=findings, 2=error."""
+        from main import run_pipeline
+        from tools import ToolResult
+
+        clean_tool = ToolResult(
+            tool_name="Ruff", target_path=".", success=True, issues_found=False, exit_code=0, issues=[]
+        )
+        error_tool = ToolResult(
+            tool_name="Ruff", target_path=".", success=False, issues_found=False, exit_code=2, issues=[], error_message="Crash"
+        )
+
+        mock_issue = MagicMock()
+        issue_tool = ToolResult(
+            tool_name="Ruff", target_path=".", success=True, issues_found=True, exit_code=1, issues=[mock_issue]
+        )
+
+        # 1. Clean -> 0
+        with (
+            patch("main.run_ruff", return_value=clean_tool),
+            patch("main.run_bandit", return_value=clean_tool),
+            patch("main.run_semantic_analysis", return_value=clean_tool),
+        ):
+            assert run_pipeline(".", enable_ai=False) == 0
+
+        # 2. Issues found -> 1
+        with (
+            patch("main.run_ruff", return_value=issue_tool),
+            patch("main.run_bandit", return_value=clean_tool),
+            patch("main.run_semantic_analysis", return_value=clean_tool),
+        ):
+            assert run_pipeline(".", enable_ai=False) == 1
+
+        # 3. Execution error -> 2
+        with (
+            patch("main.run_ruff", return_value=error_tool),
+            patch("main.run_bandit", return_value=clean_tool),
+            patch("main.run_semantic_analysis", return_value=clean_tool),
+        ):
+            assert run_pipeline(".", enable_ai=False) == 2
