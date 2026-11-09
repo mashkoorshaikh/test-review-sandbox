@@ -940,6 +940,15 @@ class TestCLIIntegration:
             # even when issues are found (findings are rendered in summary/output).
             assert exit_code == 0
 
+    def test_cli_run_pr_pipeline_with_tool_failure(self):
+        mock_result = MagicMock(spec=PRReviewResult)
+        mock_result.success = False
+        mock_result.tool_status = {"ruff": True, "bandit": True, "semantic": False}
+
+        with patch("main.run_pr_review_workflow", return_value=mock_result):
+            exit_code = run_pr_pipeline("octocat/Hello-World#42")
+            assert exit_code == 2
+
     def test_cli_run_pr_pipeline_error_handling(self, capsys):
         with patch("main.run_pr_review_workflow", side_effect=PRReviewInputError("Invalid PR number")):
             exit_code = run_pr_pipeline("invalid_input")

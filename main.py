@@ -813,13 +813,9 @@ def run_pr_pipeline(
     write_github_step_summary(
         result, token=token, step_summary_path=step_summary_path
     )
-
     # Exit code:
-    # In read-only PR review mode, return 0 when the review analysis completes successfully,
-    # even if code issues are identified, comments are proposed, or the verdict is REQUEST_CHANGES.
-    # The review findings, verdict badge, and inline suggestions are communicated via the GitHub
-    # Actions Step Summary and console output.
-    # Return 2 on genuine execution or workflow failures (tool crashes, invalid targets, or API errors).
+    # A completed read-only review should not fail CI merely because issues were found.
+    # Return 2 only when the review execution or workflow itself fails.
     raw_tool_status = getattr(result, "tool_status", None)
     if not isinstance(raw_tool_status, dict):
         raw_tool_status = wf_state.get("tool_status", {}) if isinstance(wf_state, dict) else {}
@@ -833,7 +829,6 @@ def run_pr_pipeline(
     if not result.success or has_tool_failure:
         return 2
     return 0
-
 
 def main() -> None:
     """Command-line interface entry point."""
