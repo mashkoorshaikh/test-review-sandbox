@@ -461,7 +461,7 @@ jobs:
 
 - **Exit Codes & CI Status:**
   - `0`: Read-only PR review completed successfully. The review analysis finished cleanly and published its findings, verdict, and proposed inline comments to the GitHub Actions Step Summary and console output (even when code issues or a `REQUEST_CHANGES` verdict are reported). In local single-target analysis (`python main.py <target>`), exit code `0` indicates no issues were detected.
-  - `1`: In local deterministic mode (`python main.py <target>`), indicates lint or security issues were detected. In controlled publishing mode (`--publish`), indicates the human reviewer cancelled publication or changes were requested.
+  - `1`: In local deterministic mode (`python main.py <target>`), indicates lint or security issues were detected. In controlled publishing mode (`--publish`), indicates the human reviewer cancelled publication, changes were requested (`REQUEST_CHANGES`), or proposed review comments exist.
   - `2`: Genuine execution or workflow failure (e.g. fatal tool crash, invalid repository/PR target, GitHub API network/auth error, or publishing rejected in a non-interactive CI environment).
 - **Forked Pull Requests:**
   GitHub Actions omits repository secrets on forked PRs for security. The pipeline detects this automatically, reports `[Notice] LLM credentials not configured. Running PR review in deterministic mode.`, and proceeds with Ruff & Bandit static scans without failing.

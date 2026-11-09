@@ -668,6 +668,7 @@ def run_pr_pipeline(
     publication_marker: str | None = None,
     ruff_runner: Callable[..., ToolResult] | None = None,
     bandit_runner: Callable[..., ToolResult] | None = None,
+    semantic_runner: Callable[..., ToolResult] | None = None,
     sandbox_runner_fn: Callable[..., Any] | None = None,
     step_summary_path: str | Path | None = None,
 ) -> int:
@@ -714,6 +715,7 @@ def run_pr_pipeline(
                 publication_marker=publication_marker,
                 ruff_runner=ruff_runner,
                 bandit_runner=bandit_runner,
+                semantic_runner=semantic_runner,
                 sandbox_runner_fn=sandbox_runner_fn,
             )
         except NonInteractivePublishingDisabledError as e:
@@ -791,6 +793,7 @@ def run_pr_pipeline(
             clock=clock,
             ruff_runner=ruff_runner,
             bandit_runner=bandit_runner,
+            semantic_runner=semantic_runner,
             sandbox_runner_fn=sandbox_runner_fn,
         )
     except Exception as e:  # noqa: BLE001
@@ -817,7 +820,17 @@ def run_pr_pipeline(
     # The review findings, verdict badge, and inline suggestions are communicated via the GitHub
     # Actions Step Summary and console output.
     # Return 2 on genuine execution or workflow failures (tool crashes, invalid targets, or API errors).
-    if not result.success:
+    raw_tool_status = getattr(result, "tool_status", None)
+    if not isinstance(raw_tool_status, dict):
+        raw_tool_status = wf_state.get("tool_status", {}) if isinstance(wf_state, dict) else {}
+    tool_status = raw_tool_status if isinstance(raw_tool_status, dict) else {}
+
+    has_tool_failure = (
+        any(tool_status.get(t) is False for t in ("ruff", "bandit", "semantic"))
+        if tool_status
+        else False
+    )
+    if not result.success or has_tool_failure:
         return 2
     return 0
 

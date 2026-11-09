@@ -1065,6 +1065,21 @@ class TestVerdictMapping:
         assert has_fatal_analysis_error(["   "]) is False
         assert has_fatal_analysis_error([]) is False
         assert has_fatal_analysis_error(["Warning: linter found 2 notices"]) is False
+        # Structured tool_status takes precedence over empty or non-keyword error strings
+        assert has_fatal_analysis_error([], tool_status={"semantic": False}) is True
+        assert has_fatal_analysis_error([], tool_status={"semantic": True, "ruff": True, "bandit": True}) is False
+        assert has_fatal_analysis_error(["Target path does not exist"], tool_status={"semantic": False}) is True
+
+    def test_failed_semantic_analyzer_without_error_keywords_maps_to_request_changes(self):
+        """Failed semantic analyzer maps to REQUEST_CHANGES even without error/failed keywords."""
+        assert (
+            determine_review_verdict([], ["SemanticAnalyzer: Target path does not exist"])
+            == "REQUEST_CHANGES"
+        )
+        assert (
+            determine_review_verdict([], [], tool_status={"semantic": False})
+            == "REQUEST_CHANGES"
+        )
 
     def test_test_writer_http_401_auth_error_maps_to_comment(self):
         """HTTP 401 / invalid API key in TestWriterAgent is an advisory warning, not fatal."""

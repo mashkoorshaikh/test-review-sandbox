@@ -615,6 +615,7 @@ class TestReadOnlyPRReviewExitSemantics:
         verdict: str = "COMMENT",
         comments: tuple[ReviewComment, ...] = (),
         summary: str = "Analysis summary",
+        tool_status: dict[str, bool] | None = None,
     ) -> PRReviewResult:
         plan = ActionPlan(
             owner="test-owner",
@@ -627,6 +628,11 @@ class TestReadOnlyPRReviewExitSemantics:
             dry_run=True,
             created_at_mono=100.0,
         )
+        t_status = (
+            tool_status
+            if tool_status is not None
+            else {"ruff": True, "bandit": True, "semantic": success}
+        )
         return PRReviewResult(
             owner="test-owner",
             repo="test-repo",
@@ -637,9 +643,10 @@ class TestReadOnlyPRReviewExitSemantics:
             report={},
             review_comments=comments,
             changed_files=("app.py",),
-            workflow_state={},
+            workflow_state={"tool_status": t_status},
             success=success,
             summary=summary,
+            tool_status=t_status,
         )
 
     def test_read_only_pr_review_clean_returns_0(self):
@@ -781,3 +788,73 @@ class TestReadOnlyPRReviewExitSemantics:
             patch("main.run_semantic_analysis", return_value=clean_tool),
         ):
             assert run_pipeline(".", enable_ai=False) == 2
+
+    def test_failed_semantic_analyzer_returns_exit_code_2(self):
+        """Regression test: failed semantic analyzer returning 'Target path does not exist' returns exit code 2."""
+        mock_res = self._make_mock_result(
+            success=False,
+            verdict="REQUEST_CHANGES",
+            summary="Target path '/nonexistent' does not exist.",
+            tool_status={"ruff": True, "bandit": True, "semantic": False},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_failed_semantic_analyzer_structured_tool_status_returns_2(self):
+        """Structured tool_status causes exit code 2 even if result.success flag is True."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            summary="Target path 'missing.py' does not exist.",
+            tool_status={"ruff": True, "bandit": True, "semantic": False},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_successful_semantic_analyzer_with_findings_returns_exit_code_0(self):
+        """Regression test: successful semantic analyzer with AST findings returns 0 in read-only PR review."""
+        comment = ReviewComment(
+            path="math_utils.py",
+            line=40,
+            body="SEM001: Possible division by zero",
+            side="RIGHT",
+        )
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            comments=(comment,),
+            summary="Semantic findings detected",
+            tool_status={"ruff": True, "bandit": True, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_run_review_pipeline_with_failed_semantic_analyzer(self, tmp_path):
+        """Integration test: semantic runner returning 'Target path does not exist' produces FAILED status and tool_status."""
+        from tools import ToolResult
+        from workflow import run_review_pipeline
+
+        test_file = tmp_path / "test.py"
+        test_file.write_text("x = 1\n", encoding="utf-8")
+
+        mock_semantic = MagicMock(return_value=ToolResult(
+            tool_name="SemanticAnalyzer",
+            target_path=str(test_file),
+            success=False,
+            issues_found=False,
+            exit_code=2,
+            issues=[],
+            error_message=f"Target path '{test_file}' does not exist.",
+        ))
+
+        state = run_review_pipeline(
+            target_path=str(test_file),
+            enable_ai=False,
+            semantic_runner=mock_semantic,
+        )
+
+        assert state["tool_status"]["semantic"] is False
+        assert state["final_review_report"]["summary"]["status"] == "FAILED"

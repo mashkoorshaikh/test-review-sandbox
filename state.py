@@ -63,6 +63,7 @@ class ReviewState(TypedDict, total=False):
     debug_attempts: int                    # Number of debugging attempts used
     sandbox_skipped: bool                  # Was sandbox skipped (Docker unavailable)?
     semantic_findings: list[dict[str, Any]]  # Milestone 5: AST semantic bug findings
+    tool_status: Annotated[dict[str, bool], merge_dict_reducer]  # Structured tool execution success/failure state
 
 
 def issue_to_dict(issue: Issue) -> dict[str, Any]:
@@ -105,4 +106,5 @@ def create_initial_state(target_path: str) -> ReviewState:
         "patch_verified": False,
         "debug_attempts": 0,
         "sandbox_skipped": False,
+        "tool_status": {},
     }
