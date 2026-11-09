@@ -858,3 +858,70 @@ class TestReadOnlyPRReviewExitSemantics:
 
         assert state["tool_status"]["semantic"] is False
         assert state["final_review_report"]["summary"]["status"] == "FAILED"
+
+    def test_successful_bandit_with_security_findings_returns_exit_code_0(self):
+        """Regression test: successful Bandit scan with code findings returns 0 in read-only PR review (findings posted to summary)."""
+        comment = ReviewComment(
+            path="app.py",
+            line=10,
+            body="B101: assert used",
+            side="RIGHT",
+        )
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="COMMENT",
+            comments=(comment,),
+            summary="Bandit security findings detected",
+            tool_status={"ruff": True, "bandit": True, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_failed_bandit_analyzer_returns_exit_code_2(self):
+        """Regression test: failed Bandit execution (crash or exit code 2) returns exit code 2."""
+        mock_res = self._make_mock_result(
+            success=False,
+            verdict="REQUEST_CHANGES",
+            summary="Bandit failed with exit code 2",
+            tool_status={"ruff": True, "bandit": False, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_failed_bandit_analyzer_structured_tool_status_returns_2(self):
+        """Structured tool_status bandit=False causes exit code 2 even if result.success is True."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            summary="Bandit execution failed",
+            tool_status={"ruff": True, "bandit": False, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_failed_ruff_analyzer_returns_exit_code_2(self):
+        """Regression test: failed Ruff execution returns exit code 2."""
+        mock_res = self._make_mock_result(
+            success=False,
+            verdict="REQUEST_CHANGES",
+            summary="Ruff failed with fatal error",
+            tool_status={"ruff": False, "bandit": True, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_failed_ruff_analyzer_structured_tool_status_returns_2(self):
+        """Structured tool_status ruff=False causes exit code 2 even if result.success is True."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            summary="Ruff syntax crash",
+            tool_status={"ruff": False, "bandit": True, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2

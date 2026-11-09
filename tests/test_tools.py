@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -403,6 +404,47 @@ class TestRunBandit:
         result = run_bandit("app\x00.py")
         assert result.success is False
         assert result.exit_code is None
+
+    def test_run_bandit_uses_config_to_skip_b101_in_test_files(self, tmp_path):
+        """Test files using pytest assertions do not generate B101 findings when bandit.yaml is present."""
+        test_file = tmp_path / "test_example.py"
+        test_file.write_text("def test_foo():\n    assert 1 == 1\n", encoding="utf-8")
+        result = run_bandit(str(test_file))
+        assert result.success is True
+        assert not any(i.code == "B101" for i in result.issues)
+
+    def test_run_bandit_detects_b101_in_production_files(self):
+        """Production files using assertions are strictly flagged with B101."""
+        with tempfile.TemporaryDirectory(prefix="service_") as td:
+            prod_file = Path(td) / "production_service.py"
+            prod_file.write_text("def auth(user):\n    assert user.is_admin\n", encoding="utf-8")
+            result = run_bandit(str(prod_file))
+            assert result.success is True
+            assert result.issues_found is True
+            b101_issues = [i for i in result.issues if i.code == "B101"]
+            assert len(b101_issues) >= 1
+            assert b101_issues[0].file_path == str(prod_file)
+
+    def test_run_bandit_detects_real_vulnerabilities_in_test_files(self, tmp_path):
+        """Non-assertion security vulnerabilities in test files (e.g. eval, B307) remain detected."""
+        test_file = tmp_path / "test_vulnerable.py"
+        test_file.write_text("def test_vulnerable():\n    assert True\n    eval('2 + 2')\n", encoding="utf-8")
+        result = run_bandit(str(test_file))
+        assert result.success is True
+        assert result.issues_found is True
+        codes = [i.code for i in result.issues]
+        assert "B307" in codes  # eval
+        assert "B101" not in codes  # assert is skipped
+
+    def test_run_bandit_explicit_config_path_respected(self, tmp_path):
+        """Passing explicit config_path passes '-c' with that config."""
+        custom_cfg = tmp_path / "custom_bandit.yaml"
+        custom_cfg.write_text("assert_used:\n  skips: ['*']\n", encoding="utf-8")
+        target_file = tmp_path / "app.py"
+        target_file.write_text("assert True\n", encoding="utf-8")
+        result = run_bandit(str(target_file), config_path=str(custom_cfg))
+        assert result.success is True
+        assert not any(i.code == "B101" for i in result.issues)
 
 
 
