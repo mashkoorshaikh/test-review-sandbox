@@ -666,6 +666,170 @@ class CollectionLiteralState:
         )
 
 
+# ============================================================================
+# Path-Joining & Filesystem Path Heuristics
+# ============================================================================
+
+_PATH_CLASS_NAMES = {
+    "Path",
+    "PurePath",
+    "PosixPath",
+    "WindowsPath",
+    "PurePosixPath",
+    "PureWindowsPath",
+}
+
+_PATH_METHOD_NAMES = {
+    "cwd",
+    "home",
+    "resolve",
+    "absolute",
+    "joinpath",
+    "expanduser",
+    "with_name",
+    "with_suffix",
+    "with_stem",
+}
+
+_PATH_VAR_NAMES = {
+    "tmp_path",
+    "tmp_path_factory",
+    "tmpdir",
+    "tmpdir_factory",
+    "path",
+    "filepath",
+    "file_path",
+    "dirpath",
+    "dir_path",
+    "directory",
+    "folder",
+    "base_dir",
+    "root_dir",
+    "out_dir",
+    "output_dir",
+    "src_dir",
+    "dst_dir",
+    "target_dir",
+    "dest_dir",
+    "workdir",
+    "workspace",
+}
+
+_PATH_NAME_SUFFIXES = (
+    "_path",
+    "_dir",
+    "_file",
+    "_folder",
+    "Path",
+    "Dir",
+    "File",
+    "Folder",
+)
+
+_PATH_NAME_PREFIXES = (
+    "path_",
+    "dir_",
+    "file_",
+    "folder_",
+)
+
+
+def _is_path_name(name: str) -> bool:
+    """Check if variable name suggests a filesystem path."""
+    name_lower = name.lower()
+    if name_lower in _PATH_VAR_NAMES:
+        return True
+    if any(name.endswith(suffix) for suffix in _PATH_NAME_SUFFIXES):
+        return True
+    return any(name.startswith(prefix) for prefix in _PATH_NAME_PREFIXES)
+
+
+def _is_path_type_annotation(node: ast.AST | None) -> bool:
+    """Check if a type annotation indicates a Path or PathLike object."""
+    if node is None:
+        return False
+    if isinstance(node, ast.Name):
+        return node.id in _PATH_CLASS_NAMES or node.id in ("PathLike", "os.PathLike")
+    if isinstance(node, ast.Attribute):
+        return node.attr in _PATH_CLASS_NAMES or node.attr in ("PathLike",)
+    if isinstance(node, ast.Subscript):
+        return _is_path_type_annotation(node.slice)
+    if isinstance(node, ast.Tuple):
+        return any(_is_path_type_annotation(elt) for elt in node.elts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _is_path_type_annotation(node.left) or _is_path_type_annotation(node.right)
+    return False
+
+
+def _is_path_call(node: ast.AST) -> bool:
+    """Check if an AST node is a call returning a path object."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id in _PATH_CLASS_NAMES or _is_path_name(func.id)
+    if isinstance(func, ast.Attribute):
+        if func.attr in _PATH_CLASS_NAMES or func.attr in _PATH_METHOD_NAMES:
+            return True
+        return isinstance(func.value, ast.Name) and func.value.id == "pathlib"
+    return False
+
+
+def _is_string_or_bytes_like(node: ast.AST) -> bool:
+    """Check if an AST node represents a string, bytes, or formatted string."""
+    if isinstance(node, ast.Constant):
+        return isinstance(node.value, (str, bytes))
+    return isinstance(node, ast.JoinedStr)
+
+
+def _is_path_like_expression(node: ast.AST, path_vars: set[str] | None = None) -> bool:
+    """Check if an AST node represents a path or path-like object."""
+    if isinstance(node, ast.Name):
+        if path_vars and node.id in path_vars:
+            return True
+        return _is_path_name(node.id)
+
+    if _is_path_call(node):
+        return True
+
+    if isinstance(node, ast.Attribute):
+        if node.attr in ("parent", "parents", "stem", "suffix", "suffixes"):
+            return True
+        if _is_path_like_expression(node.value, path_vars):
+            return True
+        return _is_path_name(node.attr)
+
+    if isinstance(node, ast.Subscript) and _is_path_like_expression(node.value, path_vars):
+        return True
+
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return _is_path_joining_operation(node, path_vars)
+
+    return False
+
+
+def _is_path_joining_operation(node: ast.BinOp, path_vars: set[str] | None = None) -> bool:
+    """
+    Determine if a BinOp node is a pathlib.Path joining operation rather than arithmetic division.
+
+    Pathlib only overloads '/' (ast.Div), never '//' or '%'.
+    """
+    if not isinstance(node.op, ast.Div):
+        return False
+
+    # Explicit zero literals are never treated as path joining
+    if _is_zero_literal(node.right):
+        return False
+
+    # In Python, standard '/' with a string/bytes divisor cannot raise ZeroDivisionError:
+    # it is either path joining (Path / str) or a TypeError at runtime.
+    if _is_string_or_bytes_like(node.right):
+        return True
+
+    # Left or right operand is path-like
+    return bool(_is_path_like_expression(node.left, path_vars) or _is_path_like_expression(node.right, path_vars))
+
+
 class DivisionByZeroDetector(ast.NodeVisitor):
     """
     AST visitor that scans for division, floor division, and modulo operations
@@ -679,12 +843,18 @@ class DivisionByZeroDetector(ast.NodeVisitor):
         self._try_handlers_stack: list[list[ast.ExceptHandler]] = []
         # Stack of sets of variables currently known to be non-zero in the active branch
         self._guarded_vars_stack: list[set[str]] = [set()]
+        # Stack of sets of variables known to hold filesystem Path objects
+        self._path_vars_stack: list[set[str]] = [set()]
         # Loop context stack tracking whether execution is inside a loop iteration
         self._in_loop_stack: list[bool] = [False]
 
     @property
     def _current_guarded_vars(self) -> set[str]:
         return self._guarded_vars_stack[-1]
+
+    @property
+    def _current_path_vars(self) -> set[str]:
+        return self._path_vars_stack[-1]
 
     @property
     def _in_loop(self) -> bool:
@@ -701,7 +871,9 @@ class DivisionByZeroDetector(ast.NodeVisitor):
         # 1. Visit try body with its handlers on the try stack
         self._try_handlers_stack.append(node.handlers)
         self._guarded_vars_stack.append(set(self._current_guarded_vars))
+        self._path_vars_stack.append(set(self._current_path_vars))
         self._visit_statement_sequence(node.body)
+        self._path_vars_stack.pop()
         self._guarded_vars_stack.pop()
         self._try_handlers_stack.pop()
 
@@ -711,7 +883,9 @@ class DivisionByZeroDetector(ast.NodeVisitor):
 
         # 3. Visit orelse (runs if no exception was raised in try)
         self._guarded_vars_stack.append(set(self._current_guarded_vars))
+        self._path_vars_stack.append(set(self._current_path_vars))
         self._visit_statement_sequence(node.orelse)
+        self._path_vars_stack.pop()
         self._guarded_vars_stack.pop()
 
         # 4. Visit finalbody
@@ -724,14 +898,18 @@ class DivisionByZeroDetector(ast.NodeVisitor):
                 finally_guards.discard(handler.name)
 
         self._guarded_vars_stack.append(finally_guards)
+        self._path_vars_stack.append(set(self._current_path_vars))
         self._visit_statement_sequence(node.finalbody)
+        self._path_vars_stack.pop()
         self._guarded_vars_stack.pop()
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
         if node.type:
             self.visit(node.type)
         self._guarded_vars_stack.append(set(self._current_guarded_vars))
+        self._path_vars_stack.append(set(self._current_path_vars))
         self._visit_statement_sequence(node.body)
+        self._path_vars_stack.pop()
         self._guarded_vars_stack.pop()
 
     def visit_For(self, node: ast.For) -> None:
@@ -801,13 +979,42 @@ class DivisionByZeroDetector(ast.NodeVisitor):
         visit_TryStar = visit_Try
 
     def _visit_statement_sequence(self, stmts: list[ast.stmt]) -> None:
-        """Visit a sequence of statements while tracking variable guards and exits."""
+        """Visit a sequence of statements while tracking variable guards, exits, and path variables."""
         current_guards = set(self._current_guarded_vars)
+        current_paths = set(self._current_path_vars)
 
         for stmt in stmts:
             self._guarded_vars_stack.append(set(current_guards))
+            self._path_vars_stack.append(set(current_paths))
             self.visit(stmt)
+            self._path_vars_stack.pop()
             self._guarded_vars_stack.pop()
+
+            # Track path variables assigned in this statement
+            if isinstance(stmt, ast.Assign):
+                if _is_path_like_expression(stmt.value, current_paths):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name):
+                            current_paths.add(target.id)
+                        elif isinstance(target, (ast.Tuple, ast.List)):
+                            for elt in target.elts:
+                                if isinstance(elt, ast.Name) and _is_path_name(elt.id):
+                                    current_paths.add(elt.id)
+                else:
+                    for target in stmt.targets:
+                        for name in _extract_assigned_names_in_subtree(target):
+                            if not _is_path_name(name):
+                                current_paths.discard(name)
+            elif isinstance(stmt, ast.AnnAssign):
+                if (stmt.value and _is_path_like_expression(stmt.value, current_paths)) or _is_path_type_annotation(stmt.annotation):
+                    if isinstance(stmt.target, ast.Name):
+                        current_paths.add(stmt.target.id)
+                elif isinstance(stmt.target, ast.Name) and not _is_path_name(stmt.target.id):
+                    current_paths.discard(stmt.target.id)
+            elif isinstance(stmt, (ast.For, ast.AsyncFor)):
+                for name in _extract_assigned_names_in_subtree(stmt.target):
+                    if _is_path_name(name):
+                        current_paths.add(name)
 
             # Check if this statement is an exit guard
             if isinstance(stmt, ast.If):
@@ -877,14 +1084,34 @@ class DivisionByZeroDetector(ast.NodeVisitor):
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._guarded_vars_stack.append(set())
         self._in_loop_stack.append(False)
+        fn_paths = set()
+        for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+            if _is_path_name(arg.arg) or _is_path_type_annotation(arg.annotation):
+                fn_paths.add(arg.arg)
+        if node.args.vararg and _is_path_name(node.args.vararg.arg):
+            fn_paths.add(node.args.vararg.arg)
+        if node.args.kwarg and _is_path_name(node.args.kwarg.arg):
+            fn_paths.add(node.args.kwarg.arg)
+        self._path_vars_stack.append(fn_paths)
         self._visit_statement_sequence(node.body)
+        self._path_vars_stack.pop()
         self._in_loop_stack.pop()
         self._guarded_vars_stack.pop()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         self._guarded_vars_stack.append(set())
         self._in_loop_stack.append(False)
+        fn_paths = set()
+        for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+            if _is_path_name(arg.arg) or _is_path_type_annotation(arg.annotation):
+                fn_paths.add(arg.arg)
+        if node.args.vararg and _is_path_name(node.args.vararg.arg):
+            fn_paths.add(node.args.vararg.arg)
+        if node.args.kwarg and _is_path_name(node.args.kwarg.arg):
+            fn_paths.add(node.args.kwarg.arg)
+        self._path_vars_stack.append(fn_paths)
         self._visit_statement_sequence(node.body)
+        self._path_vars_stack.pop()
         self._in_loop_stack.pop()
         self._guarded_vars_stack.pop()
 
@@ -901,6 +1128,7 @@ class DivisionByZeroDetector(ast.NodeVisitor):
         outer_guards = set(self._current_guarded_vars)
         comp_guards = set(outer_guards)
         self._guarded_vars_stack.append(comp_guards)
+        self._path_vars_stack.append(set(self._current_path_vars))
 
         for gen in node.generators:
             self.visit(gen.iter)
@@ -918,6 +1146,7 @@ class DivisionByZeroDetector(ast.NodeVisitor):
         else:
             self.visit(node.elt)
 
+        self._path_vars_stack.pop()
         self._guarded_vars_stack.pop()
 
     visit_ListComp = _visit_comprehension
@@ -1003,6 +1232,10 @@ class DivisionByZeroDetector(ast.NodeVisitor):
 
         # Check if operation is division, floor division, or modulo
         if not isinstance(node.op, (ast.Div, ast.FloorDiv, ast.Mod)):
+            return
+
+        # Check for pathlib.Path joining operation (e.g. tmp_path / "test.py", p / filename)
+        if _is_path_joining_operation(node, self._current_path_vars):
             return
 
         op_name = {

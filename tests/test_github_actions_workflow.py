@@ -724,7 +724,7 @@ class TestReadOnlyPRReviewExitSemantics:
 
     def test_step_summary_written_even_with_findings_and_verdict(self, tmp_path, monkeypatch):
         """Verifies Step Summary contains findings and verdict when exit code is 0."""
-        summary_file = tmp_path / "ci_step_summary.md"
+        summary_file = tmp_path.joinpath("ci_step_summary.md")
         monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
 
         comment = ReviewComment(
@@ -837,7 +837,7 @@ class TestReadOnlyPRReviewExitSemantics:
         from tools import ToolResult
         from workflow import run_review_pipeline
 
-        test_file = tmp_path / "test.py"
+        test_file = tmp_path.joinpath("test.py")
         test_file.write_text("x = 1\n", encoding="utf-8")
 
         mock_semantic = MagicMock(return_value=ToolResult(
