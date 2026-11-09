@@ -128,6 +128,7 @@ class PRReviewResult:
     workflow_state: dict[str, Any]
     success: bool
     summary: str
+    tool_status: dict[str, bool] = field(default_factory=dict)
 
 
 # ============================================================================
@@ -373,12 +374,20 @@ def is_high_confidence_critical_issue(issue: dict[str, Any]) -> bool:
     return bool(is_qualifying_severity and is_high_conf)
 
 
-def has_fatal_analysis_error(agent_errors: list[str]) -> bool:
+def has_fatal_analysis_error(
+    agent_errors: list[str],
+    tool_status: dict[str, bool] | None = None,
+) -> bool:
     """
-    Check if agent errors contain genuine fatal analysis failures or primary tool crashes.
+    Check if tool execution or agent errors indicate genuine fatal analysis failures
+    or primary tool crashes.
     Auxiliary advisory warnings (such as Test-Writer provider errors or test validation failures)
     are excluded from fatal error determination and do not trigger REQUEST_CHANGES.
     """
+    if tool_status:
+        for tool in ("ruff", "bandit", "semantic"):
+            if tool_status.get(tool) is False:
+                return True
     fatal_errors, _ = split_agent_errors(agent_errors)
     return len(fatal_errors) > 0
 
@@ -387,6 +396,7 @@ def determine_review_verdict(
     issues: list[dict[str, Any]],
     agent_errors: list[str],
     inline_comments: list[ReviewComment] | None = None,
+    tool_status: dict[str, bool] | None = None,
 ) -> str:
     """
     Determine the deterministic GitHub review verdict for an automated analysis plan.
@@ -398,8 +408,8 @@ def determine_review_verdict(
       - 'APPROVE': NEVER chosen automatically. Clean reviews default to 'COMMENT'. The automated pipeline
                    never presumes authority to grant merge approval without explicit human discretion.
     """
-    # 1. Fatal analysis errors require changes (conservative fail-safe)
-    if has_fatal_analysis_error(agent_errors):
+    # 1. Fatal analysis errors or primary tool failures require changes (conservative fail-safe)
+    if has_fatal_analysis_error(agent_errors, tool_status=tool_status):
         return "REQUEST_CHANGES"
 
     # 2. High-confidence critical security findings require changes
@@ -997,6 +1007,7 @@ def run_pr_publishing_workflow(
     publication_marker: str | None = None,
     ruff_runner: Callable[..., ToolResult] | None = None,
     bandit_runner: Callable[..., ToolResult] | None = None,
+    semantic_runner: Callable[..., ToolResult] | None = None,
     sandbox_runner_fn: Callable[..., Any] | None = None,
 ) -> PRPublicationWorkflowResult:
     """
@@ -1041,6 +1052,7 @@ def run_pr_publishing_workflow(
         clock=_clock,
         ruff_runner=ruff_runner,
         bandit_runner=bandit_runner,
+        semantic_runner=semantic_runner,
         sandbox_runner_fn=sandbox_runner_fn,
     )
 
@@ -1297,10 +1309,12 @@ def run_pr_review_workflow(
         verify_head_sha_unchanged(expected_sha=live_sha, live_sha=fresh_meta.head_sha)
 
         # 10. Determine review verdict and formulate executive summary
+        tool_status = workflow_state.get("tool_status", {})
         verdict = determine_review_verdict(
             issues=all_issues,
             agent_errors=agent_errors,
             inline_comments=inline_comments,
+            tool_status=tool_status,
         )
 
         summary_text = generate_review_summary(
@@ -1344,7 +1358,7 @@ def run_pr_review_workflow(
             out(preview_text)
 
         report = workflow_state.get("final_review_report", {})
-        has_execution_error = has_fatal_analysis_error(agent_errors)
+        has_execution_error = has_fatal_analysis_error(agent_errors, tool_status=tool_status)
 
         return PRReviewResult(
             owner=owner,
@@ -1359,4 +1373,5 @@ def run_pr_review_workflow(
             workflow_state=workflow_state,
             success=not has_execution_error,
             summary=summary_text,
+            tool_status=tool_status,
         )

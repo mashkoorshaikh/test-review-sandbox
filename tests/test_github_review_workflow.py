@@ -935,8 +935,19 @@ class TestCLIIntegration:
         mock_result.review_comments = (MagicMock(),)
 
         with patch("main.run_pr_review_workflow", return_value=mock_result):
-         exit_code = run_pr_pipeline("octocat/Hello-World#42")
-        assert exit_code == 0
+            exit_code = run_pr_pipeline("octocat/Hello-World#42")
+            # In read-only PR preview mode, successful review completion returns 0
+            # even when issues are found (findings are rendered in summary/output).
+            assert exit_code == 0
+
+    def test_cli_run_pr_pipeline_with_tool_failure(self):
+        mock_result = MagicMock(spec=PRReviewResult)
+        mock_result.success = False
+        mock_result.tool_status = {"ruff": True, "bandit": True, "semantic": False}
+
+        with patch("main.run_pr_review_workflow", return_value=mock_result):
+            exit_code = run_pr_pipeline("octocat/Hello-World#42")
+            assert exit_code == 2
 
     def test_cli_run_pr_pipeline_error_handling(self, capsys):
         with patch("main.run_pr_review_workflow", side_effect=PRReviewInputError("Invalid PR number")):
@@ -1063,6 +1074,21 @@ class TestVerdictMapping:
         assert has_fatal_analysis_error(["   "]) is False
         assert has_fatal_analysis_error([]) is False
         assert has_fatal_analysis_error(["Warning: linter found 2 notices"]) is False
+        # Structured tool_status takes precedence over empty or non-keyword error strings
+        assert has_fatal_analysis_error([], tool_status={"semantic": False}) is True
+        assert has_fatal_analysis_error([], tool_status={"semantic": True, "ruff": True, "bandit": True}) is False
+        assert has_fatal_analysis_error(["Target path does not exist"], tool_status={"semantic": False}) is True
+
+    def test_failed_semantic_analyzer_without_error_keywords_maps_to_request_changes(self):
+        """Failed semantic analyzer maps to REQUEST_CHANGES even without error/failed keywords."""
+        assert (
+            determine_review_verdict([], ["SemanticAnalyzer: Target path does not exist"])
+            == "REQUEST_CHANGES"
+        )
+        assert (
+            determine_review_verdict([], [], tool_status={"semantic": False})
+            == "REQUEST_CHANGES"
+        )
 
     def test_test_writer_http_401_auth_error_maps_to_comment(self):
         """HTTP 401 / invalid API key in TestWriterAgent is an advisory warning, not fatal."""

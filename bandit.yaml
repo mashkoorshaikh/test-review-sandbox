@@ -1,0 +1,7 @@
+# Bandit security scanner configuration
+# Official documentation: https://bandit.readthedocs.io/
+
+# Exclude assert_used (B101) in test files where assertions are standard pytest idiom.
+# B101 remains strictly active on all production files.
+assert_used:
+  skips: ['*_test.py', '*test_*.py']

@@ -397,12 +397,14 @@ def run_bandit(
     target_path: str,
     custom_cmd: list[str] | None = None,
     timeout: int = 120,
+    config_path: str | None = None,
 ) -> ToolResult:
     """
     Execute Bandit security scanner safely on the target path using Python subprocess.
 
     Key behaviors:
       - Uses shell=False with argument list.
+      - Automatically loads bandit.yaml / .bandit configuration when available.
       - Bandit exit code 0: Clean code, no security findings. (success=True, issues_found=False)
       - Bandit exit code 1: Security findings detected. (success=True, issues_found=True)
       - Bandit exit code >= 2: Tool runtime error or fatal syntax problem. (success=False)
@@ -412,6 +414,7 @@ def run_bandit(
         target_path: File or directory path to inspect.
         custom_cmd: Optional override for the base command executable.
         timeout: Maximum seconds to wait before terminating the subprocess.
+        config_path: Optional explicit path to Bandit YAML configuration file.
 
     Returns:
         ToolResult instance with status, issues, and raw outputs.
@@ -437,8 +440,29 @@ def run_bandit(
     if safe_path.startswith("-"):
         safe_path = f".{os.sep}{safe_path}"
 
+    # Resolve Bandit configuration file (e.g. bandit.yaml or .bandit)
+    resolved_config = config_path
+    if not resolved_config:
+        candidates = []
+        if os.path.isdir(target_path):
+            candidates.append(os.path.join(target_path, "bandit.yaml"))
+            candidates.append(os.path.join(target_path, ".bandit"))
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        candidates.append(os.path.join(project_dir, "bandit.yaml"))
+        candidates.append(os.path.join(project_dir, ".bandit"))
+        candidates.append(os.path.join(os.getcwd(), "bandit.yaml"))
+        candidates.append(os.path.join(os.getcwd(), ".bandit"))
+
+        for cand in candidates:
+            if os.path.isfile(cand):
+                resolved_config = cand
+                break
+
     # Use '--' to prevent paths from being parsed as CLI options
-    cmd = list(base_cmd) + ["-q", "-f", "json"]
+    cmd = list(base_cmd)
+    if resolved_config and os.path.isfile(resolved_config):
+        cmd.extend(["-c", resolved_config])
+    cmd.extend(["-q", "-f", "json"])
     if os.path.isdir(target_path):
         cmd.extend(["-r", "--", safe_path])
     else:

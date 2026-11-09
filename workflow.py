@@ -82,14 +82,18 @@ def split_agent_errors(agent_errors: list[str]) -> tuple[list[str], list[str]]:
     fatal_errors: list[str] = []
     advisory_warnings: list[str] = []
     fatal_indicators = ("error", "failed", "crash", "exception", "timeout", "fatal")
+    primary_tool_prefixes = ("semanticanalyzer:", "ruff:", "bandit:", "linter tool", "security tool")
 
     for err in agent_errors:
         if not err or not str(err).strip():
             continue
         err_str = str(err).strip()
+        lower_err = err_str.lower()
         if is_advisory_agent_error(err_str):
             advisory_warnings.append(err_str)
-        elif any(ind in err_str.lower() for ind in fatal_indicators):
+        elif any(ind in lower_err for ind in fatal_indicators) or any(
+            lower_err.startswith(prefix) for prefix in primary_tool_prefixes
+        ):
             fatal_errors.append(err_str)
         else:
             advisory_warnings.append(err_str)
@@ -108,6 +112,7 @@ def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
     ai_explanations = state.get("ai_explanations", {})
     test_suggestions = state.get("generated_test_suggestions", [])
     errors = state.get("agent_errors", [])
+    tool_status = state.get("tool_status", {})
 
     # Milestone 3 fields
     stored_test_files = state.get("stored_test_files", [])
@@ -123,9 +128,13 @@ def create_orchestrator_report(state: ReviewState) -> dict[str, Any]:
     sandbox_passed = any(r.get("passed", False) for r in sandbox_results)
     sandbox_executed = any(r.get("executed", False) for r in sandbox_results)
 
-    if errors:
+    required_tools_failed = any(
+        tool_status.get(t) is False for t in ("ruff", "bandit", "semantic")
+    )
+
+    if errors or required_tools_failed:
         fatal_errors, _ = split_agent_errors(errors)
-        status = "FAILED" if fatal_errors else "COMPLETED_WITH_WARNINGS"
+        status = "FAILED" if (fatal_errors or required_tools_failed) else "COMPLETED_WITH_WARNINGS"
     elif total_code_issues > 0:
         status = "ATTENTION_REQUIRED"
     else:
@@ -230,14 +239,21 @@ def build_review_graph(
 
     def semantic_node(state: ReviewState) -> dict[str, Any]:
         target = state.get("target_path", "")
-        res = actual_semantic(target)
-        findings = [issue_to_dict(i) for i in res.issues]
         errs: list[str] = []
-        if not res.success and res.error_message:
-            errs.append(f"SemanticAnalyzer: {res.error_message}")
+        try:
+            res = actual_semantic(target)
+            findings = [issue_to_dict(i) for i in res.issues]
+            if not res.success and res.error_message:
+                errs.append(f"SemanticAnalyzer: {res.error_message}")
+            success = res.success
+        except Exception as exc:  # noqa: BLE001
+            findings = []
+            errs.append(f"SemanticAnalyzer Crash: {type(exc).__name__}: {exc}")
+            success = False
         return {
             "semantic_findings": findings,
             "agent_errors": errs,
+            "tool_status": {"semantic": success},
         }
 
     def test_writer_node(state: ReviewState) -> dict[str, Any]:
@@ -471,12 +487,18 @@ def run_deterministic_only(
     ]
 
     errors: list[str] = []
+    tool_status: dict[str, bool] = {
+        "ruff": ruff_res.success,
+        "bandit": bandit_res.success,
+        "semantic": semantic_res.success,
+    }
     if not ruff_res.success:
         errors.append(f"Ruff: {ruff_res.error_message}")
     if not bandit_res.success:
         errors.append(f"Bandit: {bandit_res.error_message}")
     if not semantic_res.success and semantic_res.error_message:
         errors.append(f"SemanticAnalyzer: {semantic_res.error_message}")
+    state["tool_status"] = tool_status
     state["agent_errors"] = errors
     state["final_review_report"] = create_orchestrator_report(state)
 

@@ -600,3 +600,328 @@ class TestCIWorkflowSafetyBehavior:
             summary_content = summary_file.read_text(encoding="utf-8")
             assert "#12" in summary_content
             assert "Deterministic scan completed" in summary_content
+
+
+class TestReadOnlyPRReviewExitSemantics:
+    """
+    Verifies that read-only PR review in CI returns 0 upon successful analysis,
+    regardless of whether findings were detected or changes were requested,
+    while actual execution/workflow failures strictly return 2.
+    """
+
+    def _make_mock_result(
+        self,
+        success: bool = True,
+        verdict: str = "COMMENT",
+        comments: tuple[ReviewComment, ...] = (),
+        summary: str = "Analysis summary",
+        tool_status: dict[str, bool] | None = None,
+    ) -> PRReviewResult:
+        plan = ActionPlan(
+            owner="test-owner",
+            repo="test-repo",
+            pr_number=100,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            verdict=verdict,
+            summary=summary,
+            comments=comments,
+            dry_run=True,
+            created_at_mono=100.0,
+        )
+        t_status = (
+            tool_status
+            if tool_status is not None
+            else {"ruff": True, "bandit": True, "semantic": success}
+        )
+        return PRReviewResult(
+            owner="test-owner",
+            repo="test-repo",
+            pr_number=100,
+            head_sha="0123456789abcdef0123456789abcdef01234567",
+            action_plan=plan,
+            preview_text="preview",
+            report={},
+            review_comments=comments,
+            changed_files=("app.py",),
+            workflow_state={"tool_status": t_status},
+            success=success,
+            summary=summary,
+            tool_status=t_status,
+        )
+
+    def test_read_only_pr_review_clean_returns_0(self):
+        """Clean PR scan with no findings returns 0."""
+        mock_res = self._make_mock_result(success=True, verdict="COMMENT", comments=())
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_read_only_pr_review_with_findings_returns_0(self):
+        """Successful review reporting findings returns 0 (review task succeeded)."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="COMMENT",
+            summary="Found 3 lint warnings",
+            comments=(),
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_read_only_pr_review_with_request_changes_verdict_returns_0(self):
+        """Review completing with REQUEST_CHANGES returns 0 (findings communicate via step summary)."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            summary="Critical security vulnerability detected",
+            comments=(),
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_read_only_pr_review_with_comments_returns_0(self):
+        """Review proposing inline comments returns 0."""
+        comment = ReviewComment(
+            path="app.py",
+            line=12,
+            body="Use safe_load instead of load",
+            side="RIGHT",
+        )
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            comments=(comment,),
+            summary="Proposed 1 comment",
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_read_only_pr_review_execution_failure_returns_2(self):
+        """Tool crash or fatal analysis failure (success=False) returns 2."""
+        mock_res = self._make_mock_result(
+            success=False,
+            verdict="REQUEST_CHANGES",
+            summary="Fatal tool crash",
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_read_only_pr_review_exception_fails_safely_returns_2(self, capsys):
+        """Exceptions in PR workflow return 2 and display safe error."""
+        from github_review_workflow import PRReviewWorkflowError
+
+        with patch(
+            "main.run_pr_review_workflow",
+            side_effect=PRReviewWorkflowError("Network connection reset"),
+        ):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+            out = capsys.readouterr().out
+            assert "PR WORKFLOW FAILED: Network connection reset" in out
+
+    def test_step_summary_written_even_with_findings_and_verdict(self, tmp_path, monkeypatch):
+        """Verifies Step Summary contains findings and verdict when exit code is 0."""
+        summary_file = tmp_path.joinpath("ci_step_summary.md")
+        monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+        comment = ReviewComment(
+            path="math_utils.py",
+            line=40,
+            body="Division by zero guard required",
+            side="RIGHT",
+        )
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            comments=(comment,),
+            summary="### Findings\n- Division by zero at line 40\n",
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+            assert summary_file.is_file()
+            content = summary_file.read_text(encoding="utf-8")
+            assert "REQUEST_CHANGES" in content
+            assert "math_utils.py" in content
+            assert "Division by zero guard required" in content
+
+    def test_local_deterministic_pipeline_semantics_retained(self):
+        """Local deterministic analysis retains its distinct exit semantics: 0=clean, 1=findings, 2=error."""
+        from main import run_pipeline
+        from tools import ToolResult
+
+        clean_tool = ToolResult(
+            tool_name="Ruff", target_path=".", success=True, issues_found=False, exit_code=0, issues=[]
+        )
+        error_tool = ToolResult(
+            tool_name="Ruff", target_path=".", success=False, issues_found=False, exit_code=2, issues=[], error_message="Crash"
+        )
+
+        mock_issue = MagicMock()
+        issue_tool = ToolResult(
+            tool_name="Ruff", target_path=".", success=True, issues_found=True, exit_code=1, issues=[mock_issue]
+        )
+
+        # 1. Clean -> 0
+        with (
+            patch("main.run_ruff", return_value=clean_tool),
+            patch("main.run_bandit", return_value=clean_tool),
+            patch("main.run_semantic_analysis", return_value=clean_tool),
+        ):
+            assert run_pipeline(".", enable_ai=False) == 0
+
+        # 2. Issues found -> 1
+        with (
+            patch("main.run_ruff", return_value=issue_tool),
+            patch("main.run_bandit", return_value=clean_tool),
+            patch("main.run_semantic_analysis", return_value=clean_tool),
+        ):
+            assert run_pipeline(".", enable_ai=False) == 1
+
+        # 3. Execution error -> 2
+        with (
+            patch("main.run_ruff", return_value=error_tool),
+            patch("main.run_bandit", return_value=clean_tool),
+            patch("main.run_semantic_analysis", return_value=clean_tool),
+        ):
+            assert run_pipeline(".", enable_ai=False) == 2
+
+    def test_failed_semantic_analyzer_returns_exit_code_2(self):
+        """Regression test: failed semantic analyzer returning 'Target path does not exist' returns exit code 2."""
+        mock_res = self._make_mock_result(
+            success=False,
+            verdict="REQUEST_CHANGES",
+            summary="Target path '/nonexistent' does not exist.",
+            tool_status={"ruff": True, "bandit": True, "semantic": False},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_failed_semantic_analyzer_structured_tool_status_returns_2(self):
+        """Structured tool_status causes exit code 2 even if result.success flag is True."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            summary="Target path 'missing.py' does not exist.",
+            tool_status={"ruff": True, "bandit": True, "semantic": False},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_successful_semantic_analyzer_with_findings_returns_exit_code_0(self):
+        """Regression test: successful semantic analyzer with AST findings returns 0 in read-only PR review."""
+        comment = ReviewComment(
+            path="math_utils.py",
+            line=40,
+            body="SEM001: Possible division by zero",
+            side="RIGHT",
+        )
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            comments=(comment,),
+            summary="Semantic findings detected",
+            tool_status={"ruff": True, "bandit": True, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_run_review_pipeline_with_failed_semantic_analyzer(self, tmp_path):
+        """Integration test: semantic runner returning 'Target path does not exist' produces FAILED status and tool_status."""
+        from tools import ToolResult
+        from workflow import run_review_pipeline
+
+        test_file = tmp_path.joinpath("test.py")
+        test_file.write_text("x = 1\n", encoding="utf-8")
+
+        mock_semantic = MagicMock(return_value=ToolResult(
+            tool_name="SemanticAnalyzer",
+            target_path=str(test_file),
+            success=False,
+            issues_found=False,
+            exit_code=2,
+            issues=[],
+            error_message=f"Target path '{test_file}' does not exist.",
+        ))
+
+        state = run_review_pipeline(
+            target_path=str(test_file),
+            enable_ai=False,
+            semantic_runner=mock_semantic,
+        )
+
+        assert state["tool_status"]["semantic"] is False
+        assert state["final_review_report"]["summary"]["status"] == "FAILED"
+
+    def test_successful_bandit_with_security_findings_returns_exit_code_0(self):
+        """Regression test: successful Bandit scan with code findings returns 0 in read-only PR review (findings posted to summary)."""
+        comment = ReviewComment(
+            path="app.py",
+            line=10,
+            body="B101: assert used",
+            side="RIGHT",
+        )
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="COMMENT",
+            comments=(comment,),
+            summary="Bandit security findings detected",
+            tool_status={"ruff": True, "bandit": True, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 0
+
+    def test_failed_bandit_analyzer_returns_exit_code_2(self):
+        """Regression test: failed Bandit execution (crash or exit code 2) returns exit code 2."""
+        mock_res = self._make_mock_result(
+            success=False,
+            verdict="REQUEST_CHANGES",
+            summary="Bandit failed with exit code 2",
+            tool_status={"ruff": True, "bandit": False, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_failed_bandit_analyzer_structured_tool_status_returns_2(self):
+        """Structured tool_status bandit=False causes exit code 2 even if result.success is True."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            summary="Bandit execution failed",
+            tool_status={"ruff": True, "bandit": False, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_failed_ruff_analyzer_returns_exit_code_2(self):
+        """Regression test: failed Ruff execution returns exit code 2."""
+        mock_res = self._make_mock_result(
+            success=False,
+            verdict="REQUEST_CHANGES",
+            summary="Ruff failed with fatal error",
+            tool_status={"ruff": False, "bandit": True, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2
+
+    def test_failed_ruff_analyzer_structured_tool_status_returns_2(self):
+        """Structured tool_status ruff=False causes exit code 2 even if result.success is True."""
+        mock_res = self._make_mock_result(
+            success=True,
+            verdict="REQUEST_CHANGES",
+            summary="Ruff syntax crash",
+            tool_status={"ruff": False, "bandit": True, "semantic": True},
+        )
+        with patch("main.run_pr_review_workflow", return_value=mock_res):
+            exit_code = run_pr_pipeline("test-owner/test-repo#100", publish=False)
+            assert exit_code == 2

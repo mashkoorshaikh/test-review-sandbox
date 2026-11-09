@@ -127,6 +127,112 @@ class TestNonZeroConstantsAndVariables:
         assert issues[1].line == 4
         assert all(i.confidence == "MEDIUM" for i in issues)
 
+# ============================================================================
+# 2b. Pathlib Path-Joining vs Arithmetic Division (SEM001)
+# ============================================================================
+
+
+class TestSEM001PathJoiningHandling:
+    """
+    Regression tests verifying that pathlib.Path '/' joining operations
+    are never misidentified as unhandled ZeroDivisionError (SEM001), while
+    genuine arithmetic zero-division risks remain strictly detected.
+    """
+
+    @staticmethod
+    def _assert_zero_issues(issues: list) -> None:
+        if issues:
+            raise AssertionError(f"Expected 0 issues, got: {issues}")
+
+    @staticmethod
+    def _assert_single_issue(
+        issues: list, expected_code: str, expected_conf: str, msg_substr: str | None = None
+    ) -> None:
+        if len(issues) != 1:
+            raise AssertionError(f"Expected 1 issue, got {len(issues)}: {issues}")
+        if issues[0].code != expected_code:
+            raise AssertionError(f"Expected code {expected_code}, got {issues[0].code}")
+        if issues[0].confidence != expected_conf:
+            raise AssertionError(f"Expected confidence {expected_conf}, got {issues[0].confidence}")
+        if msg_substr and msg_substr not in issues[0].message:
+            raise AssertionError(f"Expected '{msg_substr}' in '{issues[0].message}'")
+
+    def test_path_division_string_does_not_trigger_sem001(self):
+        source = "file_path = Path('src') / 'test.py'\n"
+        issues = analyze_python_source(source, "app.py")
+        self._assert_zero_issues(issues)
+
+    def test_tmp_path_division_string_does_not_trigger_sem001(self):
+        source = "test_file = tmp_path / 'test.py'\n"
+        issues = analyze_python_source(source, "test_app.py")
+        self._assert_zero_issues(issues)
+
+    def test_chained_path_division_does_not_trigger_sem001(self):
+        source = "workflow = Path('.github') / 'workflows' / 'pr-review.yml'\n"
+        issues = analyze_python_source(source, "app.py")
+        self._assert_zero_issues(issues)
+
+    def test_path_variable_division_does_not_trigger_sem001(self):
+        source = (
+            "p = Path('src')\n"
+            "out = p / filename\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        self._assert_zero_issues(issues)
+
+    def test_tmp_path_parameter_division_does_not_trigger_sem001(self):
+        source = (
+            "def test_example(tmp_path):\n"
+            "    config = tmp_path / filename\n"
+            "    return config\n"
+        )
+        issues = analyze_python_source(source, "test_app.py")
+        self._assert_zero_issues(issues)
+
+    def test_path_parent_division_does_not_trigger_sem001(self):
+        source = "summary = Path(__file__).resolve().parent / 'sub' / 'file.txt'\n"
+        issues = analyze_python_source(source, "app.py")
+        self._assert_zero_issues(issues)
+
+    def test_path_fstring_division_does_not_trigger_sem001(self):
+        source = "artifact = base_dir / f'artifact_{item_id}.json'\n"
+        issues = analyze_python_source(source, "app.py")
+        self._assert_zero_issues(issues)
+
+    def test_path_annotated_parameter_division_does_not_trigger_sem001(self):
+        source = (
+            "from pathlib import Path\n"
+            "def process_workspace(ws: Path, filename: str):\n"
+            "    return ws / filename\n"
+        )
+        issues = analyze_python_source(source, "app.py")
+        self._assert_zero_issues(issues)
+
+    def test_numeric_division_by_zero_still_triggers_sem001(self):
+        cases = [
+            ("x = 10 / 0\n", "/"),
+            ("x = 10 / 0.0\n", "/"),
+            ("x = 10 // 0\n", "//"),
+            ("x = 10 % 0\n", "%"),
+        ]
+        for src, _ in cases:
+            issues = analyze_python_source(src, "calc.py")
+            self._assert_single_issue(issues, "SEM001", "HIGH")
+
+    def test_numeric_division_by_variable_still_triggers_sem001(self):
+        source = (
+            "def calculate(numerator, divisor):\n"
+            "    return numerator / divisor\n"
+        )
+        issues = analyze_python_source(source, "calc.py")
+        self._assert_single_issue(issues, "SEM001", "MEDIUM", "divisor 'divisor' may evaluate to zero")
+
+    def test_path_divided_by_zero_literal_triggers_sem001(self):
+        source = "p = Path('src') / 0\n"
+        issues = analyze_python_source(source, "app.py")
+        self._assert_single_issue(issues, "SEM001", "HIGH", "Division by zero literal")
+
+
 
 # ============================================================================
 # 3. Reliably Guarded Branches & Try/Except Suppression

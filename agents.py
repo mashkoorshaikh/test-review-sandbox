@@ -101,6 +101,7 @@ class LinterAgent:
                     "linter": f"Ruff execution was unsuccessful. Details: {result.error_message}\n\n{LINTER_DISCLAIMER}"
                 },
                 "agent_errors": errors,
+                "tool_status": {"ruff": False},
             }
 
         # Case: Clean code with zero issues
@@ -115,6 +116,7 @@ class LinterAgent:
                     )
                 },
                 "agent_errors": [],
+                "tool_status": {"ruff": True},
             }
 
         # Case: Lint issues found -> generate beginner-friendly explanation
@@ -173,6 +175,7 @@ class LinterAgent:
             "ruff_findings": serialized_findings,
             "ai_explanations": {"linter": explanation},
             "agent_errors": errors,
+            "tool_status": {"ruff": True},
         }
 
 
@@ -224,6 +227,7 @@ class SecurityAgent:
                     "security": f"Bandit execution failed. Details: {result.error_message}\n\n{SECURITY_DISCLAIMER}"
                 },
                 "agent_errors": errors,
+                "tool_status": {"bandit": False},
             }
 
         # Case: Clean run with zero Bandit findings
@@ -238,6 +242,7 @@ class SecurityAgent:
                     )
                 },
                 "agent_errors": [],
+                "tool_status": {"bandit": True},
             }
 
         # Case: Security issues detected -> generate risk breakdown
@@ -295,6 +300,7 @@ class SecurityAgent:
             "bandit_findings": serialized_findings,
             "ai_explanations": {"security": explanation},
             "agent_errors": errors,
+            "tool_status": {"bandit": True},
         }
 
 

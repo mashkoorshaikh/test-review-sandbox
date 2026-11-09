@@ -668,6 +668,7 @@ def run_pr_pipeline(
     publication_marker: str | None = None,
     ruff_runner: Callable[..., ToolResult] | None = None,
     bandit_runner: Callable[..., ToolResult] | None = None,
+    semantic_runner: Callable[..., ToolResult] | None = None,
     sandbox_runner_fn: Callable[..., Any] | None = None,
     step_summary_path: str | Path | None = None,
 ) -> int:
@@ -714,6 +715,7 @@ def run_pr_pipeline(
                 publication_marker=publication_marker,
                 ruff_runner=ruff_runner,
                 bandit_runner=bandit_runner,
+                semantic_runner=semantic_runner,
                 sandbox_runner_fn=sandbox_runner_fn,
             )
         except NonInteractivePublishingDisabledError as e:
@@ -791,6 +793,7 @@ def run_pr_pipeline(
             clock=clock,
             ruff_runner=ruff_runner,
             bandit_runner=bandit_runner,
+            semantic_runner=semantic_runner,
             sandbox_runner_fn=sandbox_runner_fn,
         )
     except Exception as e:  # noqa: BLE001
@@ -810,10 +813,20 @@ def run_pr_pipeline(
     write_github_step_summary(
         result, token=token, step_summary_path=step_summary_path
     )
-    # Read-only review findings are reported in the GitHub Actions summary.
-    # A completed review should not fail CI merely because issues were found.
-    # Return 2 only when the review workflow itself fails.
-    if not result.success:
+    # Exit code:
+    # A completed read-only review should not fail CI merely because issues were found.
+    # Return 2 only when the review execution or workflow itself fails.
+    raw_tool_status = getattr(result, "tool_status", None)
+    if not isinstance(raw_tool_status, dict):
+        raw_tool_status = wf_state.get("tool_status", {}) if isinstance(wf_state, dict) else {}
+    tool_status = raw_tool_status if isinstance(raw_tool_status, dict) else {}
+
+    has_tool_failure = (
+        any(tool_status.get(t) is False for t in ("ruff", "bandit", "semantic"))
+        if tool_status
+        else False
+    )
+    if not result.success or has_tool_failure:
         return 2
     return 0
 
