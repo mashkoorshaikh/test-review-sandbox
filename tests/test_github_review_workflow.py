@@ -935,8 +935,8 @@ class TestCLIIntegration:
         mock_result.review_comments = (MagicMock(),)
 
         with patch("main.run_pr_review_workflow", return_value=mock_result):
-            exit_code = run_pr_pipeline("octocat/Hello-World#42")
-            assert exit_code == 1
+         exit_code = run_pr_pipeline("octocat/Hello-World#42")
+        assert exit_code == 0
 
     def test_cli_run_pr_pipeline_error_handling(self, capsys):
         with patch("main.run_pr_review_workflow", side_effect=PRReviewInputError("Invalid PR number")):

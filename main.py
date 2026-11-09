@@ -810,16 +810,12 @@ def run_pr_pipeline(
     write_github_step_summary(
         result, token=token, step_summary_path=step_summary_path
     )
-
-    # Exit code based on verdict and issues
+    # Read-only review findings are reported in the GitHub Actions summary.
+    # A completed review should not fail CI merely because issues were found.
+    # Return 2 only when the review workflow itself fails.
     if not result.success:
         return 2
-    if result.action_plan.verdict == "REQUEST_CHANGES":
-        return 1
-    if result.review_comments:
-        return 1
     return 0
-
 
 def main() -> None:
     """Command-line interface entry point."""
