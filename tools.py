@@ -24,22 +24,61 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class SeverityLevel(str, Enum):
+    """Structured severity levels for code review findings."""
+
+    CRITICAL = "Critical"
+    HIGH = "High"
+    MEDIUM = "Medium"
+    LOW = "Low"
+
+    @classmethod
+    def from_str(cls, val: Any) -> SeverityLevel:
+        """Parse arbitrary severity string or enum into canonical SeverityLevel."""
+        if isinstance(val, SeverityLevel):
+            return val
+        s = str(val or "").strip().upper()
+        if s in ("CRITICAL", "FATAL", "BLOCKER"):
+            return cls.CRITICAL
+        if s in ("HIGH", "ERROR"):
+            return cls.HIGH
+        if s in ("MEDIUM", "WARN", "WARNING", "MODERATE"):
+            return cls.MEDIUM
+        if s in ("LOW", "INFO", "NOTE", "INFORMATIONAL"):
+            return cls.LOW
+        return cls.MEDIUM
+
+
+def normalize_severity(val: Any) -> str:
+    """Normalize arbitrary severity strings or enums to canonical: Critical, High, Medium, Low."""
+    return SeverityLevel.from_str(val).value
 
 
 @dataclass
 class Issue:
     """
-    Represents an individual lint or security issue identified by a scanner.
+    Represents an individual lint, security, or semantic issue identified by a scanner.
 
     Attributes:
-        code: Identifier of the rule or violation (e.g. 'F401', 'B101').
+        code: Identifier of the rule or violation (e.g. 'F401', 'B101', 'SEM001').
         message: Human-readable description of what was detected.
         file_path: Relative or absolute path to the file containing the issue.
         line: 1-indexed line number where the issue occurred, if available.
         column: 1-indexed column number where the issue occurred, if available.
-        severity: Severity level (e.g. 'LOW', 'MEDIUM', 'HIGH', 'ERROR', 'WARNING').
-        tool: Name of the tool that detected the issue ('ruff' or 'bandit').
+        severity: Severity level (e.g. 'LOW', 'MEDIUM', 'HIGH', 'ERROR', 'WARNING', 'CRITICAL').
+        tool: Name of the tool that detected the issue ('ruff', 'bandit', 'semantic_analyzer').
         fixable: Boolean flag indicating if an automated fix is known to exist.
+        confidence: Categorical confidence level ('HIGH', 'MEDIUM', 'LOW', 'CRITICAL').
+        explanation: Additional narrative explanation of the finding.
+        suggested_fix: Actionable, practical guidance or code to remediate the issue.
+        confidence_score: Numeric confidence score between 0.0 and 1.0.
+        what: Precise description of what the issue is.
+        why: Explanation of why the issue matters for security/reliability/maintainability.
+        evidence: Code context, line, or snippet demonstrating the issue.
     """
     code: str
     message: str
@@ -52,6 +91,86 @@ class Issue:
     confidence: str = "HIGH"
     explanation: str = ""
     suggested_fix: str = ""
+    confidence_score: float | None = None
+    what: str = ""
+    why: str = ""
+    evidence: str = ""
+
+    def __post_init__(self) -> None:
+        # 1. Synchronize confidence and confidence_score (0.0 to 1.0)
+        if self.confidence_score is None:
+            c = str(self.confidence or "").strip().upper()
+            if c in ("CRITICAL", "VERY_HIGH"):
+                self.confidence_score = 1.0
+            elif c == "HIGH":
+                self.confidence_score = 0.9
+            elif c == "MEDIUM":
+                self.confidence_score = 0.6
+            elif c == "LOW":
+                self.confidence_score = 0.3
+            else:
+                self.confidence_score = 0.5
+        else:
+            self.confidence_score = max(0.0, min(1.0, float(self.confidence_score)))
+            # If confidence is default "HIGH" but score was explicitly low, adjust category
+            if self.confidence == "HIGH" and self.confidence_score < 0.5:
+                self.confidence = "LOW"
+            elif self.confidence == "HIGH" and self.confidence_score < 0.8:
+                self.confidence = "MEDIUM"
+
+        # 2. Populate 4-part structured explanation fields if omitted
+        if not self.what:
+            self.what = self.message or "Issue detected."
+        if not self.why:
+            self.why = self.explanation
+        if not self.evidence:
+            loc = f"{self.file_path}:{self.line}" if self.line else self.file_path
+            if self.column:
+                loc = f"{loc}:{self.column}"
+            self.evidence = loc
+
+    @property
+    def severity_level(self) -> SeverityLevel:
+        """Return canonical structured SeverityLevel enum (Critical, High, Medium, Low)."""
+        return SeverityLevel.from_str(self.severity)
+
+    def format_explanation(self) -> str:
+        """Format 4-part structured finding explanation: what, why, evidence, suggested fix."""
+        parts = [f"**What:** {self.what}"]
+        if self.why:
+            parts.append(f"**Why it matters:** {self.why}")
+        if self.evidence:
+            parts.append(f"**Evidence:** {self.evidence}")
+        if self.suggested_fix:
+            parts.append(f"**Suggested Fix:** {self.suggested_fix}")
+        return "\n\n".join(parts)
+
+
+def format_finding_explanation(issue: Issue | dict[str, Any]) -> str:
+    """Format finding explanation with what, why, evidence, and practical suggested fix."""
+    if isinstance(issue, Issue):
+        return issue.format_explanation()
+    what = issue.get("what") or issue.get("message", "Issue detected.")
+    why = issue.get("why") or issue.get("explanation", "")
+    evidence = issue.get("evidence")
+    if not evidence:
+        fp = issue.get("file_path", "")
+        ln = issue.get("line")
+        col = issue.get("column")
+        loc = f"{fp}:{ln}" if ln else fp
+        if col:
+            loc = f"{loc}:{col}"
+        evidence = loc
+    fix = issue.get("suggested_fix", "")
+
+    parts = [f"**What:** {what}"]
+    if why:
+        parts.append(f"**Why it matters:** {why}")
+    if evidence:
+        parts.append(f"**Evidence:** {evidence}")
+    if fix:
+        parts.append(f"**Suggested Fix:** {fix}")
+    return "\n\n".join(parts)
 
 
 @dataclass
@@ -186,16 +305,29 @@ def parse_ruff_json(stdout_text: str) -> list[Issue]:
     for item in data:
         loc = item.get("location") or {}
         fix = item.get("fix")
+        code = item.get("code", "UNKNOWN")
+        msg = item.get("message", "No description provided")
+        filename = item.get("filename", "")
+        row = loc.get("row")
+        col = loc.get("column")
+        loc_str = f"{filename}:{row}:{col}" if row else filename
+        fix_suggestion = "Apply automated Ruff fix (--fix)." if fix else "Refactor code to satisfy linter rule."
         issues.append(
             Issue(
-                code=item.get("code", "UNKNOWN"),
-                message=item.get("message", "No description provided"),
-                file_path=item.get("filename", ""),
-                line=loc.get("row"),
-                column=loc.get("column"),
+                code=code,
+                message=msg,
+                file_path=filename,
+                line=row,
+                column=col,
                 severity=str(item.get("severity", "error")).upper(),
                 tool="ruff",
                 fixable=bool(fix),
+                confidence="HIGH",
+                confidence_score=0.95,
+                what=msg,
+                why=f"Ruff linter violation for rule {code}.",
+                evidence=loc_str,
+                suggested_fix=fix_suggestion,
             )
         )
     return issues
@@ -221,17 +353,38 @@ def parse_bandit_json(stdout_text: str) -> list[Issue]:
 
     results = data.get("results", [])
     issues: list[Issue] = []
+    conf_map = {"HIGH": 0.9, "MEDIUM": 0.6, "LOW": 0.3}
     for item in results:
+        raw_sev = str(item.get("issue_severity", "MEDIUM")).upper()
+        raw_conf = str(item.get("issue_confidence", "HIGH")).upper()
+        score = conf_map.get(raw_conf, 0.7)
+        code_snippet = item.get("code", "").strip()
+        filename = item.get("filename", "")
+        line_num = item.get("line_number")
+        col_offset = item.get("col_offset")
+        test_id = item.get("test_id", "SECURITY_ISSUE")
+        msg = item.get("issue_text", "No description provided")
+        evidence_str = f"{filename}:{line_num}" if line_num else filename
+        if code_snippet:
+            evidence_str = f"{evidence_str}\n```python\n{code_snippet}\n```"
+        more_info = item.get("more_info", "")
+        fix_str = f"Remediate security vulnerability per Bandit advisory: {more_info}" if more_info else "Apply defensive validation, parameterized inputs, or safe APIs."
         issues.append(
             Issue(
-                code=item.get("test_id", "SECURITY_ISSUE"),
-                message=item.get("issue_text", "No description provided"),
-                file_path=item.get("filename", ""),
-                line=item.get("line_number"),
-                column=item.get("col_offset"),
-                severity=str(item.get("issue_severity", "MEDIUM")).upper(),
+                code=test_id,
+                message=msg,
+                file_path=filename,
+                line=line_num,
+                column=col_offset,
+                severity=raw_sev,
                 tool="bandit",
                 fixable=False,
+                confidence=raw_conf,
+                confidence_score=score,
+                what=msg,
+                why=f"Bandit security finding: potential {test_id} vulnerability with {raw_sev} severity.",
+                evidence=evidence_str,
+                suggested_fix=fix_str,
             )
         )
     return issues

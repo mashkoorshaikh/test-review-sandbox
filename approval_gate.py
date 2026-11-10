@@ -85,6 +85,7 @@ class ReviewComment:
     body: str
     side: str = "RIGHT"
     start_line: int | None = None
+    severity: str | None = None
 
     def validate(self) -> None:
         """Validate comment attributes."""
@@ -125,13 +126,16 @@ class ReviewComment:
             )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "path": self.path,
             "line": self.line,
             "body": self.body,
             "side": self.side,
             "start_line": self.start_line,
         }
+        if self.severity is not None:
+            d["severity"] = self.severity
+        return d
 
     def to_github_payload(self) -> dict[str, Any]:
         """

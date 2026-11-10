@@ -26,10 +26,11 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import MappingProxyType
@@ -66,7 +67,7 @@ from pr_workspace import (
     prepare_pr_workspace,
 )
 from state import ReviewState
-from tools import ToolResult
+from tools import Issue, ToolResult, normalize_severity
 from workflow import run_review_pipeline, split_agent_errors
 
 logger = logging.getLogger(__name__)
@@ -196,30 +197,465 @@ def parse_repo_and_pr(
 # ============================================================================
 
 
-def normalize_finding_rel_path(raw_path: str, workspace_root: Path) -> str:
+def normalize_finding_rel_path(raw_path: str, workspace_root: Path | str | None = None) -> str:
     """
     Normalize a tool finding file path into a clean, forward-slash relative path
     rooted at the workspace directory.
-    """
-    if not raw_path:
-        return ""
-    p = Path(raw_path)
-    try:
-        resolved_ws = workspace_root.resolve()
-        if p.is_absolute():
-            resolved_p = p.resolve()
-            if resolved_p.is_relative_to(resolved_ws):
-                rel = resolved_p.relative_to(resolved_ws)
-                return rel.as_posix()
-            return p.name
-        else:
-            # Already relative
-            posix_path = p.as_posix().lstrip("./")
-            return posix_path
-    except (ValueError, RuntimeError):
-        # Fallback to sanitized posix path
-        return p.as_posix().lstrip("./")
 
+    Guarantees:
+      1. Normalizes '/' and '\\' separators to forward slashes.
+      2. Resolves path against workspace_root (or current working directory if None).
+      3. Strictly rejects path traversal attempts (e.g. '../', '..\\') that escape the workspace.
+      4. Strictly rejects symlinks pointing outside the workspace.
+      5. Strictly rejects absolute paths pointing outside the workspace.
+      6. Raises a clear ValueError for invalid, empty, or escaping paths.
+      7. Returns a clean POSIX-style relative path inside the workspace.
+    """
+    if not raw_path or not str(raw_path).strip():
+        raise ValueError("Finding path cannot be empty.")
+
+    clean_str = str(raw_path).strip()
+    if "\0" in clean_str:
+        raise ValueError(f"Finding path {clean_str!r} contains null bytes.")
+
+    resolved_ws = Path(workspace_root).resolve() if workspace_root is not None else Path.cwd().resolve()
+    p = Path(clean_str)
+
+    if p.is_absolute():
+        resolved_target = p.resolve()
+    else:
+        # Check for root/drive-relative paths like r'\foo\bar' or '/foo/bar'
+        if clean_str.startswith(("/", "\\")):
+            root_prefix = resolved_ws.drive if resolved_ws.drive else ""
+            resolved_target = Path(f"{root_prefix}{clean_str}").resolve()
+        else:
+            resolved_target = (resolved_ws / p).resolve()
+
+    # Verify that resolved_target is contained strictly within resolved_ws
+    try:
+        is_rel = resolved_target.is_relative_to(resolved_ws)
+    except (ValueError, OSError) as exc:
+        raise ValueError(
+            f"Finding path '{raw_path}' cannot be resolved relative to workspace root '{resolved_ws}': {exc}"
+        ) from exc
+
+    if not is_rel:
+        raise ValueError(
+            f"Finding path '{raw_path}' escapes workspace root '{resolved_ws}'."
+        )
+
+    try:
+        rel = resolved_target.relative_to(resolved_ws).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"Finding path '{raw_path}' is outside workspace root '{resolved_ws}': {exc}"
+        ) from exc
+
+    if rel in ("", "."):
+        raise ValueError(
+            f"Finding path '{raw_path}' resolves to workspace root itself, not a file path."
+        )
+
+    return rel
+
+
+# ============================================================================
+# Finding Deduplication & Quality Enhancement
+# ============================================================================
+
+EQUIVALENT_RULE_CODES: dict[str, str] = {
+    # Assert
+    "B101": "ASSERT_USED",
+    "S101": "ASSERT_USED",
+    # Exec
+    "B102": "EXEC_USED",
+    "S102": "EXEC_USED",
+    # Eval
+    "B307": "EVAL_USED",
+    "S307": "EVAL_USED",
+    "PGH001": "EVAL_USED",
+    # Subprocess with shell=True
+    "B602": "SHELL_TRUE",
+    "S602": "SHELL_TRUE",
+    # Hardcoded secrets
+    "B105": "HARDCODED_SECRET",
+    "B106": "HARDCODED_SECRET",
+    "B107": "HARDCODED_SECRET",
+    "S105": "HARDCODED_SECRET",
+    "S106": "HARDCODED_SECRET",
+    "S107": "HARDCODED_SECRET",
+}
+
+SEVERITY_ORDER: dict[str, int] = {
+    "CRITICAL": 4,
+    "HIGH": 3,
+    "MEDIUM": 2,
+    "LOW": 1,
+}
+
+
+def _to_issue_dict(issue: dict[str, Any] | Issue) -> dict[str, Any]:
+    if isinstance(issue, Issue):
+        d = asdict(issue)
+        d["severity_level"] = issue.severity_level.value
+        return d
+    return dict(issue)
+
+
+_ISSUE_STOP_WORDS = {
+    "a", "an", "the", "in", "on", "at", "by", "for", "with", "about",
+    "into", "through", "during", "before", "after", "to", "from",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "should", "could", "can", "may",
+    "must", "and", "but", "or", "if", "because", "as", "of", "it", "its",
+    "this", "that", "detected", "found", "possible", "potential", "identified",
+    "issue", "warning", "error", "statement", "expression", "line", "code",
+    "file", "use", "used", "using", "check", "violation",
+}
+
+
+def _normalize_issue_text(text: str) -> str:
+    """Normalize finding message or description for comparison."""
+    if not text:
+        return ""
+    # Strip leading rule codes like [B101], S101:, SEM001 -, F401
+    s = re.sub(r"^\[?[A-Za-z]{1,5}\d{3,4}\]?[:\s\-]*", "", text.strip())
+    # Strip leading tool names like [Bandit], ruff:, semantic_analyzer:
+    s = re.sub(r"^\[?(?:ruff|bandit|semantic_analyzer|semantic)\]?[:\s\-]*", "", s, flags=re.IGNORECASE)
+    # Lowercase and replace non-alphanumeric characters with spaces
+    s = re.sub(r"[^a-z0-9]", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _findings_describe_same_issue(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    """
+    Check whether two findings have sufficient evidence that they describe the same issue.
+
+    Evidence sources:
+      1. Explicit matching non-empty issue identity / fingerprint / issue_id.
+      2. Normalized message or 'what' description:
+         - Exact match of normalized text.
+         - Substring match of meaningful issue description (>= 2 words and >= 8 chars).
+         - High keyword overlap (all tokens of smaller set shared or Jaccard >= 0.5 with >= 2 shared keywords).
+    """
+    # 1. Explicit issue identity / issue_id
+    id_a = str(a.get("issue_identity") or a.get("issue_id") or "").strip().lower()
+    id_b = str(b.get("issue_identity") or b.get("issue_id") or "").strip().lower()
+    if id_a and id_b and id_a == id_b:
+        return True
+
+    # 2. Extract description from 'what' or 'message'
+    msg_a = str(a.get("what") or a.get("message") or "").strip()
+    msg_b = str(b.get("what") or b.get("message") or "").strip()
+    if not msg_a or not msg_b:
+        return False
+
+    norm_a = _normalize_issue_text(msg_a)
+    norm_b = _normalize_issue_text(msg_b)
+    if not norm_a or not norm_b:
+        return False
+
+    # Exact normalized match
+    if norm_a == norm_b:
+        return True
+
+    words_a = [w for w in norm_a.split() if len(w) > 1]
+    words_b = [w for w in norm_b.split() if len(w) > 1]
+
+    # Substring match if the shorter message is substantial (at least 2 words and >= 8 chars)
+    if len(words_a) >= 2 and len(norm_a) >= 8 and norm_a in norm_b:
+        return True
+    if len(words_b) >= 2 and len(norm_b) >= 8 and norm_b in norm_a:
+        return True
+
+    # Strip quoted symbol names/values ('...', "...", `...`) to compare the issue type itself
+    # rather than arbitrary identifier names that happen to appear in the code on that line.
+    unquoted_a = re.sub(r"['\"`][^'\"`]+['\"`]", " ", msg_a)
+    unquoted_b = re.sub(r"['\"`][^'\"`]+['\"`]", " ", msg_b)
+    norm_uq_a = _normalize_issue_text(unquoted_a)
+    norm_uq_b = _normalize_issue_text(unquoted_b)
+
+    tokens_a = {w for w in norm_uq_a.split() if len(w) > 1 and w not in _ISSUE_STOP_WORDS}
+    tokens_b = {w for w in norm_uq_b.split() if len(w) > 1 and w not in _ISSUE_STOP_WORDS}
+
+    # Fallback to full tokens if stripping quotes left no tokens
+    if not tokens_a:
+        tokens_a = {w for w in words_a if w not in _ISSUE_STOP_WORDS}
+    if not tokens_b:
+        tokens_b = {w for w in words_b if w not in _ISSUE_STOP_WORDS}
+
+    if not tokens_a or not tokens_b:
+        return False
+
+    shared = tokens_a & tokens_b
+    if len(shared) >= 2:
+        # Overlap coefficient: ratio of shared meaningful keywords to the smaller finding
+        overlap_coeff = len(shared) / min(len(tokens_a), len(tokens_b))
+        if overlap_coeff >= 0.5:
+            return True
+
+    return False
+
+
+def are_findings_overlapping(
+    a: dict[str, Any],
+    b: dict[str, Any],
+    workspace_root: str | Path | None = None,
+) -> bool:
+    """
+    Determine whether two static analysis findings overlap and should be merged.
+
+    Matching criteria:
+      1. Normalized file paths match.
+      2. File-level findings (no line numbers):
+         - Identical non-empty rule codes or explicitly mapped equivalent rules.
+         - OR matching issue identity / normalized issue description.
+      3. Line-level findings:
+         - Line ranges match or overlap (exact line match, span overlap, or adjacent +/- 1 line for equivalent rules).
+         - Identical non-empty rule codes or explicitly mapped equivalent rules.
+         - For cross-tool findings without equivalent rule codes: requires additional evidence
+           that the findings describe the same issue (e.g. normalized message / issue identity),
+           not merely reporting on the same location.
+    """
+    try:
+        path_a = normalize_finding_rel_path(a.get("file_path", ""), workspace_root).casefold()
+    except ValueError:
+        path_a = ""
+    try:
+        path_b = normalize_finding_rel_path(b.get("file_path", ""), workspace_root).casefold()
+    except ValueError:
+        path_b = ""
+    if not path_a or path_a != path_b:
+        return False
+
+    raw_line_a = a.get("line")
+    raw_line_b = b.get("line")
+    line_a = raw_line_a if isinstance(raw_line_a, int) and raw_line_a > 0 else None
+    line_b = raw_line_b if isinstance(raw_line_b, int) and raw_line_b > 0 else None
+
+    code_a = str(a.get("code", "")).strip().upper()
+    code_b = str(b.get("code", "")).strip().upper()
+    equiv_a = EQUIVALENT_RULE_CODES.get(code_a)
+    equiv_b = EQUIVALENT_RULE_CODES.get(code_b)
+    has_rule_equiv = bool(equiv_a and equiv_a == equiv_b) or (code_a == code_b and code_a != "")
+
+    # File-level findings without line numbers
+    if line_a is None and line_b is None:
+        if has_rule_equiv:
+            return True
+        return _findings_describe_same_issue(a, b)
+
+    if line_a is None or line_b is None:
+        return False
+
+    raw_start_a = a.get("start_line")
+    start_a = raw_start_a if isinstance(raw_start_a, int) and 0 < raw_start_a <= line_a else line_a
+
+    raw_start_b = b.get("start_line")
+    start_b = raw_start_b if isinstance(raw_start_b, int) and 0 < raw_start_b <= line_b else line_b
+
+    exact_line_match = (line_a == line_b)
+    span_overlap = not (line_a < start_b or line_b < start_a)
+    location_match = exact_line_match or span_overlap
+
+    # 1. Equivalent or identical rule codes on same, overlapping, or adjacent lines
+    if has_rule_equiv and (location_match or abs(line_a - line_b) <= 1):
+        return True
+
+    # 2. Cross-tool or differing rule codes: requires location match AND evidence of same issue
+    if location_match:
+        return _findings_describe_same_issue(a, b)
+
+    return False
+
+
+def _safe_confidence_score(val: Any, categorical_conf: Any = None) -> float:
+    """
+    Safely extract a bounded float confidence score in [0.0, 1.0].
+
+    Guarantees:
+      - Gracefully handles None, malformed strings, and incompatible types.
+      - Rejects non-finite numbers (NaN, +inf, -inf).
+      - Clamps finite numbers to [0.0, 1.0].
+      - Falls back to categorical confidence ('HIGH' -> 0.9, 'MEDIUM' -> 0.6, etc.)
+        or default 0.6 if numeric value is missing or non-finite.
+    """
+    if val is not None:
+        try:
+            num = float(val)
+            if math.isfinite(num):
+                return max(0.0, min(1.0, num))
+        except (ValueError, TypeError):
+            pass
+
+    # Fallback to categorical confidence mapping
+    c = str(categorical_conf or "").strip().upper()
+    if c in ("CRITICAL", "VERY_HIGH"):
+        return 1.0
+    if c == "HIGH":
+        return 0.9
+    if c in ("MEDIUM", "MODERATE", "WARN", "WARNING"):
+        return 0.6
+    if c in ("LOW", "INFO", "NOTE"):
+        return 0.3
+    return 0.6
+
+
+def merge_two_findings(
+    a: dict[str, Any],
+    b: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Merge two overlapping findings without discarding important evidence.
+    """
+    # 1. Severity: select highest
+    sev_a = normalize_severity(a.get("severity", "MEDIUM")).upper()
+    sev_b = normalize_severity(b.get("severity", "MEDIUM")).upper()
+    rank_a = SEVERITY_ORDER.get(sev_a, 2)
+    rank_b = SEVERITY_ORDER.get(sev_b, 2)
+    if rank_a >= rank_b:
+        merged_sev = sev_a
+        raw_sev = a.get("severity", sev_a)
+    else:
+        merged_sev = sev_b
+        raw_sev = b.get("severity", sev_b)
+
+    # 2. Confidence: safely select maximum bounded confidence score
+    score_a = _safe_confidence_score(a.get("confidence_score"), a.get("confidence"))
+    score_b = _safe_confidence_score(b.get("confidence_score"), b.get("confidence"))
+    merged_score = round(max(score_a, score_b), 2)
+    merged_conf = (
+        "CRITICAL" if merged_score >= 1.0
+        else ("HIGH" if merged_score >= 0.8
+        else ("MEDIUM" if merged_score >= 0.5
+        else "LOW"))
+    )
+
+    # 3. Tools: combine unique
+    tools_set: set[str] = set()
+    for item in (a, b):
+        t = item.get("tool")
+        if t:
+            for sub in str(t).split(","):
+                sub_clean = sub.strip()
+                if sub_clean:
+                    tools_set.add(sub_clean)
+    merged_tool = ", ".join(sorted(tools_set))
+
+    # 4. Codes: combine unique
+    codes_set: set[str] = set()
+    for item in (a, b):
+        c = item.get("code")
+        if c:
+            for sub in str(c).split("/"):
+                sub_clean = sub.strip()
+                if sub_clean:
+                    codes_set.add(sub_clean)
+    merged_code = " / ".join(sorted(codes_set))
+
+    # 5. What / Message: combine without losing detail
+    what_a = (a.get("what") or a.get("message") or "").strip()
+    what_b = (b.get("what") or b.get("message") or "").strip()
+    if not what_a:
+        merged_what = what_b
+    elif not what_b or what_a.casefold() == what_b.casefold():
+        merged_what = what_a
+    elif what_a.casefold() in what_b.casefold():
+        merged_what = what_b
+    elif what_b.casefold() in what_a.casefold():
+        merged_what = what_a
+    else:
+        tool_b = b.get("tool", "scanner")
+        merged_what = f"{what_a} (Also reported by {tool_b}: {what_b})"
+
+    # 6. Why / Explanation: combine without losing rationale
+    why_a = (a.get("why") or a.get("explanation") or "").strip()
+    why_b = (b.get("why") or b.get("explanation") or "").strip()
+    if not why_a:
+        merged_why = why_b
+    elif not why_b or why_a.casefold() == why_b.casefold():
+        merged_why = why_a
+    elif why_a.casefold() in why_b.casefold():
+        merged_why = why_b
+    elif why_b.casefold() in why_a.casefold():
+        merged_why = why_a
+    else:
+        merged_why = f"{why_a}\n\n{why_b}"
+
+    # 7. Evidence: preserve all evidence snippets / locations
+    ev_a = (a.get("evidence") or "").strip()
+    ev_b = (b.get("evidence") or "").strip()
+    if not ev_a:
+        merged_evidence = ev_b
+    elif not ev_b or ev_a.casefold() == ev_b.casefold():
+        merged_evidence = ev_a
+    else:
+        merged_evidence = f"{ev_a}; {ev_b}"
+
+    # 8. Suggested Fix: combine practical recommendations
+    fix_a = (a.get("suggested_fix") or "").strip()
+    fix_b = (b.get("suggested_fix") or "").strip()
+    if not fix_a:
+        merged_fix = fix_b
+    elif not fix_b or fix_a.casefold() == fix_b.casefold():
+        merged_fix = fix_a
+    else:
+        merged_fix = f"{fix_a}\n\nAlternative Fix: {fix_b}"
+
+    line = a.get("line") if a.get("line") is not None else b.get("line")
+    col = a.get("column") if a.get("column") is not None else b.get("column")
+
+    merged = dict(a)
+    merged.update({
+        "code": merged_code,
+        "message": merged_what,
+        "file_path": a.get("file_path") or b.get("file_path", ""),
+        "line": line,
+        "column": col,
+        "severity": raw_sev,
+        "severity_level": normalize_severity(merged_sev),
+        "tool": merged_tool,
+        "fixable": bool(a.get("fixable") or b.get("fixable")),
+        "confidence": merged_conf,
+        "confidence_score": merged_score,
+        "explanation": merged_why,
+        "what": merged_what,
+        "why": merged_why,
+        "evidence": merged_evidence,
+        "suggested_fix": merged_fix,
+    })
+    return merged
+
+
+def deduplicate_findings(
+    issues: list[dict[str, Any] | Issue],
+    workspace_root: str | Path | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Deduplicate overlapping findings from different agents without discarding important evidence.
+
+    Returns:
+        List of deduplicated, consolidated finding dictionaries.
+    """
+    if not issues:
+        return []
+
+    raw_list = [_to_issue_dict(i) for i in issues]
+    merged_results: list[dict[str, Any]] = []
+
+    for issue in raw_list:
+        matched_idx = -1
+        for idx, existing in enumerate(merged_results):
+            if are_findings_overlapping(existing, issue, workspace_root=workspace_root):
+                matched_idx = idx
+                break
+
+        if matched_idx >= 0:
+            merged_results[matched_idx] = merge_two_findings(merged_results[matched_idx], issue)
+        else:
+            merged_results.append(dict(issue))
+
+    return merged_results
 
 
 def build_inline_comments(
@@ -241,9 +677,17 @@ def build_inline_comments(
     comments: list[ReviewComment] = []
     unmapped: list[dict[str, Any]] = []
 
-    for issue in issues:
+    # Apply deduplication across overlapping agent findings before building comments
+    deduped_issues = deduplicate_findings(issues, workspace_root=workspace_root)
+
+    for issue in deduped_issues:
         raw_path = issue.get("file_path", "")
-        rel_path = normalize_finding_rel_path(raw_path, workspace_root)
+        try:
+            rel_path = normalize_finding_rel_path(raw_path, workspace_root)
+        except ValueError as exc:
+            logger.warning("Rejecting invalid finding path %r: %s", raw_path, exc)
+            unmapped.append(issue)
+            continue
         line = issue.get("line")
         start_line = issue.get("start_line")
 
@@ -304,22 +748,37 @@ def build_inline_comments(
         severity = issue.get("severity", "WARNING")
         message = issue.get("message", "Issue detected.")
 
+        conf_score = issue.get("confidence_score")
+        conf_display = f" | Confidence: {conf_score:.2f}" if isinstance(conf_score, (int, float)) else ""
+
         body_parts = [
-            f"**[{tool} - {code}]** ({severity})",
+            f"**[{tool} - {code}]** ({severity}{conf_display})",
             message,
         ]
 
-        if tool.lower() == "ruff" and "linter" in explanations:
+        why = (issue.get("why") or issue.get("explanation") or "").strip()
+        evidence = (issue.get("evidence") or "").strip()
+        fix = (issue.get("suggested_fix") or "").strip()
+
+        if why:
+            body_parts.append(f"\n**Why it matters:**\n{why}")
+        elif tool.lower() == "ruff" and "linter" in explanations:
             body_parts.append(f"\n**Linter Context:**\n{explanations['linter']}")
         elif tool.lower() == "bandit" and "security" in explanations:
             body_parts.append(f"\n**Security Threat Assessment:**\n{explanations['security']}")
         elif tool.lower() == "semantic_analyzer":
             exp = issue.get("explanation")
-            fix = issue.get("suggested_fix")
-            if exp:
+            fix_item = issue.get("suggested_fix")
+            if exp and not why:
                 body_parts.append(f"\n**Analysis:**\n{exp}")
-            if fix:
-                body_parts.append(f"\n**Suggested Fix:**\n{fix}")
+            if fix_item and not fix:
+                body_parts.append(f"\n**Suggested Fix:**\n{fix_item}")
+
+        if evidence and evidence != f"{rel_path}:{line}":
+            body_parts.append(f"\n**Evidence:**\n{evidence}")
+
+        if fix:
+            body_parts.append(f"\n**Suggested Fix:**\n{fix}")
 
         body_parts.append(
             "\n> *Advisory Notice:* Automated analysis findings and AI explanations represent hypotheses. "
@@ -338,6 +797,7 @@ def build_inline_comments(
                 body=comment_body,
                 side="RIGHT",
                 start_line=effective_start_line,
+                severity=str(severity),
             )
             rc.validate()
             comments.append(rc)
@@ -367,9 +827,13 @@ def is_high_confidence_critical_issue(issue: dict[str, Any]) -> bool:
 
     tool = str(issue.get("tool", "")).strip().lower()
     conf = str(issue.get("confidence") or issue.get("issue_confidence", "")).strip().upper()
+    conf_score = issue.get("confidence_score")
+    if isinstance(conf_score, (int, float)):
+        is_high_conf = conf_score >= 0.85 or conf in ("HIGH", "CRITICAL")
+    else:
+        is_high_conf = conf in ("HIGH", "CRITICAL")
 
-    is_qualifying_severity = (sev == "CRITICAL") or (tool == "bandit" and sev == "HIGH")
-    is_high_conf = conf in ("HIGH", "CRITICAL")
+    is_qualifying_severity = (sev == "CRITICAL") or ("bandit" in tool and sev == "HIGH")
 
     return bool(is_qualifying_severity and is_high_conf)
 
@@ -456,6 +920,7 @@ def generate_review_summary(
         f"- **Total code issues found:** {total_issues}",
         f"- **Proposed inline comments (anchored in diff):** {inline_comments_count}",
         f"- **File-level / unmapped findings:** {unmapped_issues_count}",
+        f"- **Findings by Severity:** {sum(1 for u in (unmapped_issues or []) if normalize_severity(u.get('severity', '')) == 'Critical')} Critical, {sum(1 for u in (unmapped_issues or []) if normalize_severity(u.get('severity', '')) == 'High')} High, {sum(1 for u in (unmapped_issues or []) if normalize_severity(u.get('severity', '')) == 'Medium')} Medium, {sum(1 for u in (unmapped_issues or []) if normalize_severity(u.get('severity', '')) == 'Low')} Low",
         f"- **Primary Static Analysis Status:** {'FAILED (' + str(len(fatal_errors)) + ' tool error(s))' if fatal_errors else 'PASSED (Ruff & Bandit completed)'}",
     ]
     if advisory_warnings:

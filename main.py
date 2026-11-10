@@ -33,7 +33,7 @@ from langchain_core.language_models import BaseChatModel
 from llm_config import is_api_key_configured
 from sandbox_runner import is_docker_available
 from semantic_analyzer import run_semantic_analysis
-from tools import ToolResult, run_bandit, run_ruff
+from tools import ToolResult, normalize_severity, run_bandit, run_ruff
 from workflow import run_review_pipeline
 
 logger = logging.getLogger(__name__)
@@ -527,6 +527,18 @@ def _sanitize_markdown_text(text: str) -> str:
     return sanitized
 
 
+def _extract_comment_severity(comment: Any) -> str:
+    """Extract or infer normalized severity (Critical, High, Medium, Low) for an inline comment."""
+    sev = getattr(comment, "severity", None)
+    if sev:
+        return normalize_severity(sev)
+    body = getattr(comment, "body", "") or ""
+    m = re.search(r"\((CRITICAL|HIGH|MEDIUM|LOW|ERROR|WARNING|FATAL)\b", body, re.IGNORECASE)
+    if m:
+        return normalize_severity(m.group(1))
+    return "Medium"
+
+
 def format_github_step_summary(result: Any) -> str:
     """
     Format a GitHub Actions step summary markdown document from a PR review result.
@@ -534,7 +546,8 @@ def format_github_step_summary(result: Any) -> str:
     Includes:
       - Repository, PR number, target commit SHA, and review verdict.
       - Executive summary of findings (from generate_review_summary).
-      - Table of proposed inline comments (if any).
+      - Table of findings grouped by severity (Critical, High, Medium, Low).
+      - Table of proposed inline comments grouped by severity tier.
       - Required advisory notice.
     """
     owner = getattr(result, "owner", "")
@@ -579,22 +592,57 @@ def format_github_step_summary(result: Any) -> str:
         ])
 
     if comments:
+        # Group comments by structured severity tier
+        tier_badges = [
+            ("Critical", "🔴 Critical"),
+            ("High", "🟠 High"),
+            ("Medium", "🟡 Medium"),
+            ("Low", "🔵 Low"),
+        ]
+        comments_by_sev: dict[str, list[Any]] = {
+            "Critical": [],
+            "High": [],
+            "Medium": [],
+            "Low": [],
+        }
+        for c in comments:
+            tier = _extract_comment_severity(c)
+            comments_by_sev.setdefault(tier, []).append(c)
+
         lines.extend([
+            "### 📊 Findings by Severity",
+            "",
+            "| Severity Tier | Findings Count | Status |",
+            "|:---|:---:|:---|",
+            f"| 🔴 **Critical** | {len(comments_by_sev.get('Critical', []))} | {'Attention Required' if comments_by_sev.get('Critical') else 'Clean'} |",
+            f"| 🟠 **High** | {len(comments_by_sev.get('High', []))} | {'Attention Required' if comments_by_sev.get('High') else 'Clean'} |",
+            f"| 🟡 **Medium** | {len(comments_by_sev.get('Medium', []))} | {'Advisory' if comments_by_sev.get('Medium') else 'Clean'} |",
+            f"| 🔵 **Low** | {len(comments_by_sev.get('Low', []))} | {'Informational' if comments_by_sev.get('Low') else 'Clean'} |",
+            "",
             f"### Proposed Inline Comments ({len(comments)})",
             "",
-            "| File | Line | Side | Comment Preview |",
-            "|:---|:---:|:---:|:---|",
         ])
-        for c in comments:
-            raw_path = getattr(c, "path", "")
-            c_path = _escape_markdown_table_cell(str(raw_path))
-            c_line = _escape_markdown_table_cell(str(getattr(c, "line", None) or "file-level"))
-            c_side = _escape_markdown_table_cell(str(getattr(c, "side", "RIGHT")))
-            raw_body = getattr(c, "body", "").strip()
-            clean_body = _escape_markdown_table_cell(raw_body)
-            c_body = (clean_body[:97] + "...") if len(clean_body) > 100 else clean_body
-            lines.append(f"| `{c_path}` | `{c_line}` | `{c_side}` | {c_body} |")
-        lines.append("")
+
+        for tier_key, tier_label in tier_badges:
+            tier_comments = comments_by_sev.get(tier_key, [])
+            if not tier_comments:
+                continue
+            lines.extend([
+                f"#### {tier_label} Severity ({len(tier_comments)})",
+                "",
+                "| File | Line | Side | Comment Preview |",
+                "|:---|:---:|:---:|:---|",
+            ])
+            for c in tier_comments:
+                raw_path = getattr(c, "path", "")
+                c_path = _escape_markdown_table_cell(str(raw_path))
+                c_line = _escape_markdown_table_cell(str(getattr(c, "line", None) or "file-level"))
+                c_side = _escape_markdown_table_cell(str(getattr(c, "side", "RIGHT")))
+                raw_body = getattr(c, "body", "").strip()
+                clean_body = _escape_markdown_table_cell(raw_body)
+                c_body = (clean_body[:97] + "...") if len(clean_body) > 100 else clean_body
+                lines.append(f"| `{c_path}` | `{c_line}` | `{c_side}` | {c_body} |")
+            lines.append("")
 
     # Ensure advisory notice is explicitly included if not already in summary
     if "Advisory Notice:" not in clean_summary:

@@ -68,7 +68,9 @@ class ReviewState(TypedDict, total=False):
 
 def issue_to_dict(issue: Issue) -> dict[str, Any]:
     """Convert an Issue dataclass instance to a serializable dictionary."""
-    return asdict(issue)
+    d = asdict(issue)
+    d["severity_level"] = issue.severity_level.value
+    return d
 
 
 def dict_to_issue(data: dict[str, Any]) -> Issue:
@@ -85,6 +87,10 @@ def dict_to_issue(data: dict[str, Any]) -> Issue:
         confidence=data.get("confidence", "HIGH"),
         explanation=data.get("explanation", ""),
         suggested_fix=data.get("suggested_fix", ""),
+        confidence_score=data.get("confidence_score", 1.0),
+        what=data.get("what", ""),
+        why=data.get("why", ""),
+        evidence=data.get("evidence", ""),
     )
 
 
