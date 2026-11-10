@@ -1,0 +1,492 @@
+{
+  "version": "3.0.0",
+  "description": "Real-World Evaluation Framework Dataset for Multi-Agent Code Review & Debugging Pipeline",
+  "cases": [
+    {
+      "case_id": "clean_01",
+      "category": "clean",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/clean/clean_01_math_utils.py",
+      "description": "Clean math utility with zero division checks.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "clean_02",
+      "category": "clean",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/clean/clean_02_data_processing.py",
+      "description": "Clean data processing with None guards.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "clean_03",
+      "category": "clean",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/clean/clean_03_dict_operations.py",
+      "description": "Clean dictionary operations with membership checks.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "bug_01",
+      "category": "bugs",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/bugs/bug_01_division_zero.py",
+      "description": "Division by constant zero.",
+      "expected_findings": [
+        {
+          "rule": "SEM001",
+          "tool": "semantic_analyzer",
+          "line": 6,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "bug_02",
+      "category": "bugs",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/bugs/bug_02_none_deref.py",
+      "description": "Definite None dereference on assigned None.",
+      "expected_findings": [
+        {
+          "rule": "SEM002",
+          "tool": "semantic_analyzer",
+          "line": 7,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "bug_03",
+      "category": "bugs",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/bugs/bug_03_key_index_error.py",
+      "description": "Subscripting missing key from dictionary literal.",
+      "expected_findings": [
+        {
+          "rule": "SEM003",
+          "tool": "semantic_analyzer",
+          "line": 7,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "sec_01",
+      "category": "security",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/security/sec_01_assert_used.py",
+      "description": "Insecure assert used in non-test application logic.",
+      "expected_findings": [
+        {
+          "rule": "B101",
+          "tool": "bandit",
+          "line": 6,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "sec_02",
+      "category": "security",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/security/sec_02_weak_random.py",
+      "description": "Insecure pseudo-random generator used in token generation.",
+      "expected_findings": [
+        {
+          "rule": "B311",
+          "tool": "bandit",
+          "line": 9,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "sec_03",
+      "category": "security",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/security/sec_03_hardcoded_secret.py",
+      "description": "Hardcoded API secret token string.",
+      "expected_findings": [
+        {
+          "rule": "B105",
+          "tool": "bandit",
+          "line": 6,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "multi_01",
+      "category": "multi",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/multi/multi_01_lint_and_bug.py",
+      "description": "Unused import and division by zero.",
+      "expected_findings": [
+        {
+          "rule": "F401",
+          "tool": "ruff",
+          "line": 3,
+          "tolerance": 1
+        },
+        {
+          "rule": "SEM001",
+          "tool": "semantic_analyzer",
+          "line": 8,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "multi_02",
+      "category": "multi",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/multi/multi_02_sec_and_bug.py",
+      "description": "Insecure assert and unhandled None dereference.",
+      "expected_findings": [
+        {
+          "rule": "B101",
+          "tool": "bandit",
+          "line": 6,
+          "tolerance": 1
+        },
+        {
+          "rule": "SEM002",
+          "tool": "semantic_analyzer",
+          "line": 8,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "multi_03",
+      "category": "multi",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/multi/multi_03_all_detectors.py",
+      "description": "Unused variable, hardcoded secret, and missing dictionary key.",
+      "expected_findings": [
+        {
+          "rule": "F841",
+          "tool": "ruff",
+          "line": 6,
+          "tolerance": 1
+        },
+        {
+          "rule": "B105",
+          "tool": "bandit",
+          "line": 7,
+          "tolerance": 1
+        },
+        {
+          "rule": "SEM003",
+          "tool": "semantic_analyzer",
+          "line": 9,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "edge_01",
+      "category": "safe_edges",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/safe_edges/edge_01_comprehension_shadow.py",
+      "description": "Comprehension target shadows outer zero divisor.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "edge_02",
+      "category": "safe_edges",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/safe_edges/edge_02_early_return_guard.py",
+      "description": "Early-return guard protecting None-defaulted parameter.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "edge_03",
+      "category": "safe_edges",
+      "suite": "baseline",
+      "file_path": "benchmark/cases/safe_edges/edge_03_membership_key_guard.py",
+      "description": "Dictionary key access protected by in membership guard.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "bug_04",
+      "category": "bugs",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/bugs/bug_04_branch_none.py",
+      "description": "None dereference across symmetric if-else branches (challenging analyzer miss).",
+      "expected_findings": [
+        {
+          "rule": "SEM002",
+          "tool": "semantic_analyzer",
+          "line": 10,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "bug_05",
+      "category": "bugs",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/bugs/bug_05_none_return.py",
+      "description": "None dereference on function return value (challenging interprocedural miss).",
+      "expected_findings": [
+        {
+          "rule": "SEM002",
+          "tool": "semantic_analyzer",
+          "line": 12,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "bug_06",
+      "category": "bugs",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/bugs/bug_06_guarded_division_else.py",
+      "description": "Definite division by zero in the else branch of non-zero guard.",
+      "expected_findings": [
+        {
+          "rule": "SEM001",
+          "tool": "semantic_analyzer",
+          "line": 9,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "bug_07",
+      "category": "bugs",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/bugs/bug_07_list_out_of_bounds.py",
+      "description": "Sequence index out of range for list literal with known bounds.",
+      "expected_findings": [
+        {
+          "rule": "SEM003",
+          "tool": "semantic_analyzer",
+          "line": 7,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "bug_08",
+      "category": "bugs",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/bugs/bug_08_undefined_variable.py",
+      "description": "Use of undefined variable name in arithmetic expression.",
+      "expected_findings": [
+        {
+          "rule": "F821",
+          "tool": "ruff",
+          "line": 7,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "sec_04",
+      "category": "security",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/security/sec_04_insecure_md5.py",
+      "description": "Weak MD5 hash algorithm used for token generation.",
+      "expected_findings": [
+        {
+          "rule": "B324",
+          "tool": "bandit",
+          "line": 8,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "sec_05",
+      "category": "security",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/security/sec_05_subprocess_shell.py",
+      "description": "Subprocess execution with shell=True exposing command injection risk.",
+      "expected_findings": [
+        {
+          "rule": "B602",
+          "tool": "bandit",
+          "line": 8,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "sec_06",
+      "category": "security",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/security/sec_06_sql_injection.py",
+      "description": "Dynamic SQL query string construction vulnerable to injection.",
+      "expected_findings": [
+        {
+          "rule": "B608",
+          "tool": "bandit",
+          "line": 6,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "multi_04",
+      "category": "multi",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/multi/multi_04_all_three_detectors.py",
+      "description": "Unused local variable, weak MD5 hash, and division by zero.",
+      "expected_findings": [
+        {
+          "rule": "F841",
+          "tool": "ruff",
+          "line": 8,
+          "tolerance": 1
+        },
+        {
+          "rule": "B324",
+          "tool": "bandit",
+          "line": 9,
+          "tolerance": 1
+        },
+        {
+          "rule": "SEM001",
+          "tool": "semantic_analyzer",
+          "line": 11,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "multi_05",
+      "category": "multi",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/multi/multi_05_lint_and_security.py",
+      "description": "Hardcoded API secret token with undefined variable call.",
+      "expected_findings": [
+        {
+          "rule": "B105",
+          "tool": "bandit",
+          "line": 6,
+          "tolerance": 1
+        },
+        {
+          "rule": "F821",
+          "tool": "ruff",
+          "line": 7,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "clean_04",
+      "category": "clean",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/clean/clean_04_dict_safe_lookup.py",
+      "description": "Safe dictionary lookup using membership guard.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "clean_05",
+      "category": "clean",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/clean/clean_05_list_safe_index.py",
+      "description": "Safe list index protected by len bounds guard.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "clean_06",
+      "category": "clean",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/clean/clean_06_safe_crypto.py",
+      "description": "Cryptographically secure random generation and SHA-256.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "edge_04",
+      "category": "safe_edges",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/safe_edges/edge_04_short_circuit_guard.py",
+      "description": "Short-circuit guard protecting None and dictionary key access.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "edge_05",
+      "category": "safe_edges",
+      "suite": "expanded",
+      "file_path": "benchmark/cases/safe_edges/edge_05_try_except_zero.py",
+      "description": "Division guarded by explicit ZeroDivisionError exception handler.",
+      "expected_findings": []
+    },
+    {
+      "case_id": "err_01",
+      "category": "error_handling",
+      "suite": "evaluation",
+      "file_path": "benchmark/cases/error_handling/err_01_bare_except.py",
+      "description": "Bare except clause catching BaseException and system exit.",
+      "expected_findings": [
+        {
+          "rule": "E722",
+          "tool": "ruff",
+          "line": 8,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "err_02",
+      "category": "error_handling",
+      "suite": "evaluation",
+      "file_path": "benchmark/cases/error_handling/err_02_silent_exception_pass.py",
+      "description": "Silent exception swallowing with try-except-pass.",
+      "expected_findings": [
+        {
+          "rule": "B110",
+          "tool": "bandit",
+          "line": 9,
+          "tolerance": 1
+        },
+        {
+          "rule": "S110",
+          "tool": "ruff",
+          "line": 9,
+          "tolerance": 1
+        },
+        {
+          "rule": "BLE001",
+          "tool": "ruff",
+          "line": 9,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "err_03",
+      "category": "error_handling",
+      "suite": "evaluation",
+      "file_path": "benchmark/cases/error_handling/err_03_return_in_finally.py",
+      "description": "Return statement inside finally block silencing exceptions.",
+      "expected_findings": [
+        {
+          "rule": "B012",
+          "tool": "ruff",
+          "line": 11,
+          "tolerance": 1
+        },
+        {
+          "rule": "SIM107",
+          "tool": "ruff",
+          "line": 11,
+          "tolerance": 1
+        }
+      ]
+    },
+    {
+      "case_id": "err_04",
+      "category": "error_handling",
+      "suite": "evaluation",
+      "file_path": "benchmark/cases/error_handling/err_04_safe_exception_handling.py",
+      "description": "Safe error handling with specific exception types and proper chaining.",
+      "expected_findings": []
+    }
+  ]
+}

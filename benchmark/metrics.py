@@ -61,6 +61,7 @@ class ExpectedFinding:
     tool: str | None = None
     line: int | None = None
     tolerance: int = 1
+    file_path: str | None = None
 
 
 @dataclass
@@ -108,11 +109,13 @@ def classify_detector_name(finding: ExpectedFinding | dict[str, Any]) -> str:
         tool = str(finding.get("tool", "")).lower().strip()
         code = str(finding.get("code", finding.get("rule", ""))).upper().strip()
 
-    if tool == "semantic_analyzer" or code.startswith("SEM"):
+    if tool in ("semantic_analyzer", "bandit", "ruff"):
+        return tool
+    if tool == "semantic" or code.startswith("SEM"):
         return "semantic_analyzer"
     if tool == "bandit" or code.startswith("B"):
         return "bandit"
-    if tool == "ruff" or code.startswith(("F", "E", "W", "I")):
+    if tool == "ruff" or code.startswith(("F", "E", "W", "I", "SIM", "UP", "RUF")):
         return "ruff"
     return tool or "unknown"
 
@@ -147,6 +150,7 @@ def match_findings(
                 "tool": exp.tool.lower() if exp.tool else None,
                 "line": exp.line,
                 "tolerance": exp.tolerance,
+                "file_path": exp.file_path,
             })
         elif isinstance(exp, dict):
             norm_expected.append({
@@ -154,6 +158,7 @@ def match_findings(
                 "tool": str(exp.get("tool", "")).lower() if exp.get("tool") else None,
                 "line": exp.get("line"),
                 "tolerance": exp.get("tolerance", default_tolerance),
+                "file_path": exp.get("file_path"),
             })
 
     # Prepare actual findings with assigned index
@@ -168,6 +173,7 @@ def match_findings(
         target_line = exp["line"]
         tol = exp.get("tolerance", default_tolerance)
         target_tool = exp.get("tool")
+        target_file = exp.get("file_path")
 
         best_actual_idx: int | None = None
         best_distance: float = float("inf")
@@ -179,6 +185,7 @@ def match_findings(
             act_code = str(act.get("code", "")).upper().strip()
             act_tool = str(act.get("tool", "")).lower().strip()
             act_line = act.get("line")
+            act_file = act.get("file_path")
 
             # Check rule code match
             if act_code != target_rule:
@@ -187,6 +194,13 @@ def match_findings(
             # Check tool match if specified
             if target_tool and act_tool and target_tool != act_tool:
                 continue
+
+            # Check file_path match if specified in expected
+            if target_file and act_file:
+                norm_target = normalize_path(target_file).lower()
+                norm_act = normalize_path(act_file).lower()
+                if not (norm_target == norm_act or norm_act.endswith("/" + norm_target) or norm_target.endswith("/" + norm_act)):
+                    continue
 
             # Check line distance
             if target_line is not None and act_line is not None:
@@ -405,6 +419,14 @@ def compute_benchmark_summary(
         cat["fp"] += r.fp
         cat["fn"] += r.fn
 
+    for cat in categories.values():
+        c_prec = calculate_precision(cat["tp"], cat["fp"])
+        c_rec = calculate_recall(cat["tp"], cat["fn"])
+        c_f1 = calculate_f1(c_prec, c_rec)
+        cat["precision"] = round(c_prec, 4)
+        cat["recall"] = round(c_rec, 4)
+        cat["f1_score"] = round(c_f1, 4)
+
     return {
         "timestamp": timestamp,
         "git_commit": git_commit,
@@ -466,9 +488,13 @@ def compute_benchmark_summary(
             "total_runtime_seconds": round(total_runtime_seconds, 4),
             "tool_failures": tool_failures,
         },
+        "total_runtime_seconds": round(total_runtime_seconds, 4),
+        "tool_failures": tool_failures,
         "by_detector": detector_metrics,
         "by_category": categories,
+        "categories": categories,
         "case_results": [asdict(r) for r in case_results],
+        "cases": [asdict(r) for r in case_results],
     }
 
 

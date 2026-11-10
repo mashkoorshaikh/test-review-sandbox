@@ -27,7 +27,8 @@ from benchmark.metrics import (
     export_summary_json,
     normalize_path,
 )
-from workflow import run_deterministic_only
+from github_review_workflow import deduplicate_findings
+from workflow import run_deterministic_only, run_review_pipeline
 
 
 def get_current_git_commit(cwd: str | None = None) -> str | None:
@@ -185,9 +186,25 @@ def run_benchmark(
     tolerance: int = 1,
     cwd: str | None = None,
     quiet: bool = False,
+    mode: str = "deterministic",
+    eval_report: str | None = None,
+    dedup: bool = False,
 ) -> tuple[dict[str, Any], int]:
     """
-    Execute the benchmark pipeline across selected cases.
+    Execute the benchmark or evaluation pipeline across selected cases.
+
+    Parameters:
+        manifest_path: Path to manifest JSON file.
+        category: Optional category filter (e.g. 'security', 'bugs', 'error_handling', 'clean').
+        case_id: Optional single case ID to run.
+        suite: Optional suite filter ('baseline', 'expanded', 'evaluation', or 'all').
+        output_dir: Optional directory to export benchmark_summary.json and benchmark_cases.csv.
+        tolerance: Line distance matching tolerance window (default: 1 line).
+        cwd: Base workspace directory.
+        quiet: Suppress stdout printing when True.
+        mode: Pipeline mode ('deterministic' or 'full').
+        eval_report: Optional file path to export standalone JSON evaluation report.
+        dedup: If True, apply finding deduplication before ground-truth matching.
 
     Returns:
         (summary_dict, exit_code) where exit_code is 0 on success, 1 on tool failure.
@@ -198,6 +215,12 @@ def run_benchmark(
         if os.path.isabs(manifest_path)
         else os.path.join(base_dir, manifest_path)
     )
+
+    # If category or suite refers to evaluation error_handling, automatically select eval_manifest if using default
+    if (category == "error_handling" or suite == "evaluation") and manifest_path == "benchmark/manifest.json":
+        eval_cand = os.path.join(base_dir, "benchmark/eval_manifest.json")
+        if os.path.isfile(eval_cand):
+            full_manifest_path = eval_cand
 
     all_cases = load_manifest(full_manifest_path)
 
@@ -221,6 +244,7 @@ def run_benchmark(
             git_commit=get_current_git_commit(base_dir),
             total_runtime_seconds=0.0,
             tool_failures=0,
+            mode=mode,
         )
         return empty_summary, 0
 
@@ -244,18 +268,28 @@ def run_benchmark(
                 tool=e.get("tool"),
                 line=e.get("line"),
                 tolerance=e.get("tolerance", tolerance),
+                file_path=e.get("file_path", rel_path),
             )
             for e in exp_raw
         ]
 
-        # Execute deterministic pipeline on case
+        # Execute designated pipeline on case
         case_start = time.perf_counter()
         actual_findings: list[dict[str, Any]] = []
         case_success = True
         err_msg: str | None = None
 
         try:
-            state = run_deterministic_only(target_path)
+            if mode == "full":
+                state = run_review_pipeline(
+                    target_path=target_path,
+                    enable_ai=True,
+                    enable_sandbox=False,
+                    enable_debugging=False,
+                )
+            else:
+                state = run_deterministic_only(target_path)
+
             ruff_findings = state.get("ruff_findings")
             bandit_findings = state.get("bandit_findings")
             semantic_findings = state.get("semantic_findings")
@@ -276,6 +310,9 @@ def run_benchmark(
                 missing_scanners.append("SemanticAnalyzer")
             else:
                 actual_findings.extend(semantic_findings)
+
+            if dedup:
+                actual_findings = deduplicate_findings(actual_findings)
 
             if missing_scanners:
                 err_msg = f"Missing required scanner output: {', '.join(missing_scanners)}"
@@ -319,6 +356,7 @@ def run_benchmark(
         git_commit=commit_sha,
         total_runtime_seconds=total_duration,
         tool_failures=tool_failures,
+        mode=mode,
     )
 
     if not quiet:
@@ -336,8 +374,49 @@ def run_benchmark(
         if not quiet:
             print(f"Saved machine-readable results to:\n  - {normalize_path(json_path)}\n  - {normalize_path(csv_path)}\n")
 
+    if eval_report:
+        abs_eval_report = (
+            eval_report if os.path.isabs(eval_report) else os.path.join(base_dir, eval_report)
+        )
+        export_summary_json(summary, abs_eval_report)
+        if not quiet:
+            print(f"Saved evaluation report JSON to: {normalize_path(abs_eval_report)}")
+
     exit_code = 1 if tool_failures > 0 else 0
     return summary, exit_code
+
+
+def run_evaluation(
+    manifest_path: str = "benchmark/eval_manifest.json",
+    output_report: str | None = "evaluation_report.json",
+    category: str | None = None,
+    case_id: str | None = None,
+    suite: str | None = None,
+    mode: str = "deterministic",
+    tolerance: int = 1,
+    dedup: bool = False,
+    quiet: bool = True,
+    cwd: str | None = None,
+) -> tuple[dict[str, Any], int]:
+    """
+    Execute the Stage 7.1 Real-World Evaluation Framework against the evaluation dataset.
+
+    Returns:
+        (summary_dict, exit_code)
+    """
+    return run_benchmark(
+        manifest_path=manifest_path,
+        category=category,
+        case_id=case_id,
+        suite=suite,
+        output_dir=None,
+        tolerance=tolerance,
+        cwd=cwd,
+        quiet=quiet,
+        mode=mode,
+        eval_report=output_report,
+        dedup=dedup,
+    )
 
 
 def main() -> None:
@@ -355,7 +434,7 @@ def main() -> None:
         "--category",
         dest="category",
         default=None,
-        choices=["clean", "bugs", "security", "multi", "safe_edges"],
+        choices=["clean", "bugs", "security", "multi", "safe_edges", "error_handling"],
         help="Filter benchmark cases by category",
     )
     parser.add_argument(
@@ -371,6 +450,12 @@ def main() -> None:
         help="Directory to write benchmark_summary.json and benchmark_cases.csv",
     )
     parser.add_argument(
+        "--eval-report",
+        dest="eval_report",
+        default=None,
+        help="File path to write standalone machine-readable evaluation report JSON",
+    )
+    parser.add_argument(
         "--tolerance",
         dest="tolerance",
         type=int,
@@ -381,8 +466,22 @@ def main() -> None:
         "--suite",
         dest="suite",
         default="all",
-        choices=["all", "baseline", "expanded"],
-        help="Filter benchmark cases by suite ('baseline', 'expanded', or 'all')",
+        choices=["all", "baseline", "expanded", "evaluation"],
+        help="Filter benchmark cases by suite ('baseline', 'expanded', 'evaluation', or 'all')",
+    )
+    parser.add_argument(
+        "--mode",
+        dest="mode",
+        choices=["deterministic", "full"],
+        default="deterministic",
+        help="Pipeline execution mode ('deterministic' or 'full')",
+    )
+    parser.add_argument(
+        "--dedup",
+        dest="dedup",
+        action="store_true",
+        default=False,
+        help="Apply finding deduplication before ground-truth matching",
     )
     args = parser.parse_args()
 
@@ -393,6 +492,9 @@ def main() -> None:
         suite=args.suite,
         output_dir=args.output_dir,
         tolerance=args.tolerance,
+        mode=args.mode,
+        eval_report=args.eval_report,
+        dedup=args.dedup,
     )
     sys.exit(exit_code)
 
