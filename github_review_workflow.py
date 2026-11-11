@@ -659,13 +659,23 @@ def deduplicate_findings(
 
 
 def build_inline_comments(
-    issues: list[dict[str, Any]],
+    issues: list[dict[str, Any] | Issue],
     diff_map: dict[str, DiffFile],
     workspace_root: Path,
     ai_explanations: dict[str, str] | None = None,
+    deduplicate: bool = True,
 ) -> tuple[list[ReviewComment], list[dict[str, Any]]]:
     """
     Map static analysis issues to diff hunks/lines to formulate inline ReviewComment proposals.
+
+    Parameters:
+        issues: List of static analysis findings (dict or Issue objects).
+        diff_map: Mapping of relative file paths to DiffFile objects.
+        workspace_root: Base workspace root directory.
+        ai_explanations: Optional mapping of agent names to context explanations.
+        deduplicate: If True (default), applies deduplicate_findings() before mapping.
+                     Set to False when the caller has already deduplicated findings
+                     to avoid redundant double-deduplication.
 
     Returns:
         A tuple of (inline_comments, unmapped_issues).
@@ -677,8 +687,12 @@ def build_inline_comments(
     comments: list[ReviewComment] = []
     unmapped: list[dict[str, Any]] = []
 
-    # Apply deduplication across overlapping agent findings before building comments
-    deduped_issues = deduplicate_findings(issues, workspace_root=workspace_root)
+    # Apply deduplication across overlapping agent findings before building comments if requested
+    deduped_issues = (
+        deduplicate_findings(issues, workspace_root=workspace_root)
+        if deduplicate
+        else [_to_issue_dict(i) for i in issues]
+    )
 
     for issue in deduped_issues:
         raw_path = issue.get("file_path", "")
@@ -894,6 +908,9 @@ def generate_review_summary(
     workflow_state: ReviewState,
     changed_files: list[str],
     unmapped_issues: list[dict[str, Any]] | None = None,
+    raw_issues_count: int | None = None,
+    duplicate_issues_count: int | None = None,
+    distinct_issues: list[dict[str, Any]] | None = None,
 ) -> str:
     """
     Generate an executive markdown summary of the PR review findings.
@@ -908,6 +925,15 @@ def generate_review_summary(
     agent_errors = workflow_state.get("agent_errors", [])
     fatal_errors, advisory_warnings = split_agent_errors(agent_errors)
 
+    effective_raw = raw_issues_count if raw_issues_count is not None else total_issues
+    effective_dups = (
+        duplicate_issues_count
+        if duplicate_issues_count is not None
+        else max(0, effective_raw - total_issues)
+    )
+
+    sev_source = distinct_issues if distinct_issues is not None else (unmapped_issues or [])
+
     lines = [
         f"### Automated Code Review & Security Report: PR #{meta.pr_number}",
         f"**Repository:** `{meta.owner}/{meta.repo}`  ",
@@ -917,10 +943,12 @@ def generate_review_summary(
         "",
         "#### Summary of Findings",
         f"- **Changed files analyzed:** {len(changed_files)}",
-        f"- **Total code issues found:** {total_issues}",
+        f"- **Total distinct findings:** {total_issues}",
+        f"- **Raw scanner findings:** {effective_raw}",
+        f"- **Duplicate findings consolidated:** {effective_dups}",
         f"- **Proposed inline comments (anchored in diff):** {inline_comments_count}",
         f"- **File-level / unmapped findings:** {unmapped_issues_count}",
-        f"- **Findings by Severity:** {sum(1 for u in (unmapped_issues or []) if normalize_severity(u.get('severity', '')) == 'Critical')} Critical, {sum(1 for u in (unmapped_issues or []) if normalize_severity(u.get('severity', '')) == 'High')} High, {sum(1 for u in (unmapped_issues or []) if normalize_severity(u.get('severity', '')) == 'Medium')} Medium, {sum(1 for u in (unmapped_issues or []) if normalize_severity(u.get('severity', '')) == 'Low')} Low",
+        f"- **Findings by Severity:** {sum(1 for u in sev_source if normalize_severity(u.get('severity', '')) == 'Critical')} Critical, {sum(1 for u in sev_source if normalize_severity(u.get('severity', '')) == 'High')} High, {sum(1 for u in sev_source if normalize_severity(u.get('severity', '')) == 'Medium')} Medium, {sum(1 for u in sev_source if normalize_severity(u.get('severity', '')) == 'Low')} Low",
         f"- **Primary Static Analysis Status:** {'FAILED (' + str(len(fatal_errors)) + ' tool error(s))' if fatal_errors else 'PASSED (Ruff & Bandit completed)'}",
     ]
     if advisory_warnings:
@@ -1757,16 +1785,23 @@ def run_pr_review_workflow(
         ruff_findings = workflow_state.get("ruff_findings", [])
         bandit_findings = workflow_state.get("bandit_findings", [])
         semantic_findings = workflow_state.get("semantic_findings", [])
-        all_issues = ruff_findings + bandit_findings + semantic_findings
+        raw_issues = ruff_findings + bandit_findings + semantic_findings
         ai_explanations = workflow_state.get("ai_explanations", {})
         agent_errors = workflow_state.get("agent_errors", [])
 
+        # Deduplicate findings exactly once across analyzers
+        deduped_issues = deduplicate_findings(raw_issues, workspace_root=workspace_dir)
+        raw_issues_count = len(raw_issues)
+        distinct_issues_count = len(deduped_issues)
+        duplicate_issues_count = max(0, raw_issues_count - distinct_issues_count)
+
         # 8. Map findings to diff hunks to build inline ReviewComments
         inline_comments, unmapped_issues = build_inline_comments(
-            issues=all_issues,
+            issues=deduped_issues,
             diff_map=diff_map,
             workspace_root=workspace_dir,
             ai_explanations=ai_explanations,
+            deduplicate=False,
         )
 
         # 9. Verify PR head SHA remains unchanged (TOCTOU race check)
@@ -1776,7 +1811,7 @@ def run_pr_review_workflow(
         # 10. Determine review verdict and formulate executive summary
         tool_status = workflow_state.get("tool_status", {})
         verdict = determine_review_verdict(
-            issues=all_issues,
+            issues=deduped_issues,
             agent_errors=agent_errors,
             inline_comments=inline_comments,
             tool_status=tool_status,
@@ -1785,12 +1820,15 @@ def run_pr_review_workflow(
         summary_text = generate_review_summary(
             meta=meta,
             verdict=verdict,
-            total_issues=len(all_issues),
+            total_issues=distinct_issues_count,
             inline_comments_count=len(inline_comments),
             unmapped_issues_count=len(unmapped_issues),
             workflow_state=workflow_state,
             changed_files=changed_files,
             unmapped_issues=unmapped_issues,
+            raw_issues_count=raw_issues_count,
+            duplicate_issues_count=duplicate_issues_count,
+            distinct_issues=deduped_issues,
         )
 
         # 11. Formulate ActionPlan
@@ -1809,7 +1847,10 @@ def run_pr_review_workflow(
             metadata={
                 "workflow_phase": "milestone_4_stage_4_phase_2" if not dry_run else "milestone_4_stage_4_phase_1",
                 "timestamp": datetime.now(UTC).isoformat(),
-                "total_issues": len(all_issues),
+                "total_issues": distinct_issues_count,
+                "distinct_issues_count": distinct_issues_count,
+                "raw_issues_count": raw_issues_count,
+                "duplicate_issues_count": duplicate_issues_count,
                 "inline_comments_count": len(inline_comments),
                 "unmapped_issues_count": len(unmapped_issues),
                 "changed_files_count": len(changed_files),

@@ -11,7 +11,6 @@ Verifies:
 from __future__ import annotations
 
 import sys
-import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -102,55 +101,95 @@ def test_cli_renders_all_sections_when_ai_enabled(sample_file, capsys):
 
 
 class TestCLITokenHandlingAndDeprecation:
-    """Tests for CLI token handling, deprecation warnings, and credential protection."""
+    """Tests for CLI token handling, rejection, and credential protection."""
 
-    def test_token_cli_arg_emits_deprecation_warning(self, sample_file):
+    def test_token_cli_arg_is_rejected_for_security(self, sample_file):
         test_args = ["main.py", "--token", "ghp_insecure_cli_token_9999", sample_file]
         with (
             patch.object(sys, "argv", test_args),
             patch("main.run_pipeline", return_value=0) as mock_pipeline,
-            pytest.warns(UserWarning, match="Passing GitHub token via '--token' CLI option is deprecated"),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 2
+        mock_pipeline.assert_not_called()
+
+    def test_token_cli_arg_rejection_never_exposes_token(self, sample_file, capsys):
+        secret = "ghp_super_secret_never_print_me_123456"
+        test_args = ["main.py", "--token", secret, sample_file]
+        with (
+            patch.object(sys, "argv", test_args),
+            patch("main.run_pipeline", return_value=0),
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        # Neither stdout nor stderr must contain the token
+        assert secret not in captured.out
+        assert secret not in captured.err
+        assert "[Security Error]" in captured.err
+
+    def test_cli_without_token_arg_uses_environment(self, sample_file, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_env_var_token_valid_12345")
+        test_args = ["main.py", sample_file]
+        with (
+            patch.object(sys, "argv", test_args),
+            patch("main.run_pipeline", return_value=0) as mock_pipeline,
             pytest.raises(SystemExit) as exc_info,
         ):
             main()
         assert exc_info.value.code == 0
         mock_pipeline.assert_called_once()
 
-    def test_token_cli_arg_warning_never_exposes_token(self, sample_file, capsys):
-        secret = "ghp_super_secret_never_print_me_123456"
-        test_args = ["main.py", "--token", secret, sample_file]
-        with (
-            patch.object(sys, "argv", test_args),
-            patch("main.run_pipeline", return_value=0),
-            pytest.warns(UserWarning),
-            pytest.raises(SystemExit),
-        ):
-            main()
-        captured = capsys.readouterr()
-        # Neither stdout nor stderr must contain the token
-        assert secret not in captured.out
-        assert secret not in captured.err
-        assert "[Security Warning]" in captured.err
-
-    def test_cli_without_token_arg_does_not_warn(self, sample_file, monkeypatch):
-        monkeypatch.setenv("GITHUB_TOKEN", "ghp_env_var_token_valid_12345")
-        test_args = ["main.py", sample_file]
-        with (
-            patch.object(sys, "argv", test_args),
-            patch("main.run_pipeline", return_value=0),
-            warnings.catch_warnings(record=True) as recorded,
-        ):
-            warnings.simplefilter("always")
-            with pytest.raises(SystemExit):
-                main()
-            # Must not emit any warning about --token
-            assert not any("CLI option is deprecated" in str(w.message) for w in recorded)
-
-    def test_token_parser_help_indicates_deprecation(self, capsys):
+    def test_token_parser_help_indicates_disabled(self, capsys):
         with (
             patch.object(sys, "argv", ["main.py", "--help"]),
             pytest.raises(SystemExit),
         ):
             main()
         captured = capsys.readouterr()
-        assert "DEPRECATED" in captured.out
+        assert "DISABLED" in captured.out
+
+    def test_cli_auth_with_gh_token_env_var(self, sample_file, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.setenv("GH_TOKEN", "ghp_gh_token_env_var_99999")
+        test_args = ["main.py", sample_file]
+        with (
+            patch.object(sys, "argv", test_args),
+            patch("main.run_pipeline", return_value=0) as mock_pipeline,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 0
+        mock_pipeline.assert_called_once()
+
+    def test_cli_auth_with_github_token_file(self, sample_file, tmp_path, monkeypatch):
+        token_file = tmp_path / "token.secret"
+        token_file.write_text("ghp_token_from_secure_file_7777\n", encoding="utf-8")
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.setenv("GITHUB_TOKEN_FILE", str(token_file))
+        test_args = ["main.py", sample_file]
+        with (
+            patch.object(sys, "argv", test_args),
+            patch("main.run_pipeline", return_value=0) as mock_pipeline,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 0
+        mock_pipeline.assert_called_once()
+
+    def test_pr_mode_cli_invokes_pipeline_with_none_token(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_env_token_for_pr_mode")
+        test_args = ["main.py", "--pr", "42", "--repo", "owner/repo"]
+        with (
+            patch.object(sys, "argv", test_args),
+            patch("main.run_pr_pipeline", return_value=0) as mock_pr_pipeline,
+            pytest.raises(SystemExit) as exc_info,
+        ):
+            main()
+        assert exc_info.value.code == 0
+        mock_pr_pipeline.assert_called_once()
+        # Verify token parameter passed to run_pr_pipeline is strictly None
+        assert mock_pr_pipeline.call_args.kwargs["token"] is None

@@ -341,6 +341,102 @@ class TestGetPRDiff:
         with pytest.raises(GitHubNetworkError, match="timed out"):
             client.get_pr_diff("owner", "repo", 7)
 
+    def test_get_pr_diff_oversized_rejected_while_streaming(self):
+        """Oversized diff must raise GitHubClientError and close response socket."""
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        # Yield two chunks of 60 bytes each = 120 bytes
+        mock_response.iter_content.return_value = [b"A" * 60, b"B" * 60]
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="exceeded maximum allowed size of 100 bytes"):
+            client.get_pr_diff("owner", "repo", 7, max_bytes=100)
+
+        # Verify response stream was closed
+        assert mock_response.close.called
+
+    def test_get_pr_diff_streaming_normal_sized_success(self):
+        """Streaming normal-sized diff succeeds and closes response socket."""
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.encoding = "utf-8"
+        mock_response.iter_content.return_value = [
+            b"diff --git a/foo.py b/foo.py\n",
+            b"--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-a\n+b\n",
+        ]
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        diff = client.get_pr_diff("owner", "repo", 7, max_bytes=1024)
+
+        assert diff == "diff --git a/foo.py b/foo.py\n--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n-a\n+b\n"
+        assert mock_response.close.called
+
+    def test_get_pr_diff_resources_closed_on_error(self):
+        """Response resources must be closed even when streaming encounters a network error."""
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.iter_content.side_effect = requests.exceptions.ConnectionError("Connection dropped mid-stream")
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubNetworkError, match="connection failed"):
+            client.get_pr_diff("owner", "repo", 7)
+
+        assert mock_response.close.called
+
+    def test_get_pr_diff_empty_response(self):
+        """Empty diff response returns an empty string and closes resources."""
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.iter_content.return_value = []
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        diff = client.get_pr_diff("owner", "repo", 7)
+        assert diff == ""
+        assert mock_response.close.called
+
+    def test_get_pr_diff_malformed_encoding_fallback(self):
+        """Malformed bytes decode safely using replacement characters and close response."""
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.encoding = "utf-8"
+        # Invalid UTF-8 byte sequence
+        mock_response.iter_content.return_value = [b"diff --git a/file.py \xff\xfe\n"]
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        diff = client.get_pr_diff("owner", "repo", 7)
+        assert "diff --git a/file.py" in diff
+        assert mock_response.close.called
+
+    def test_get_pr_diff_mock_text_fallback_bounded_oversized(self):
+        """In-memory mock text fallback is safely bounded and rejects oversized text."""
+        mock_response = MagicMock(spec=requests.Response)
+        mock_response.status_code = 200
+        mock_response.iter_content.return_value = []
+        mock_response.text = "X" * 500
+
+        mock_session = MagicMock(spec=requests.Session)
+        mock_session.get.return_value = mock_response
+
+        client = GitHubClient(session=mock_session)
+        with pytest.raises(GitHubClientError, match="exceeded maximum allowed size of 100 bytes"):
+            client.get_pr_diff("owner", "repo", 7, max_bytes=100)
+        assert mock_response.close.called
+
 
 # ============================================================================
 # Unified Diff Parsing Tests

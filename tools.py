@@ -18,6 +18,7 @@ Safety guarantees:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -26,6 +27,8 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class SeverityLevel(str, Enum):
@@ -394,12 +397,15 @@ def run_ruff(
     target_path: str,
     custom_cmd: list[str] | None = None,
     timeout: int = 60,
+    select_rules: list[str] | tuple[str, ...] | None = None,
 ) -> ToolResult:
     """
     Execute Ruff linter safely on the target path using Python subprocess.
 
     Key behaviors:
       - Uses shell=False with argument list.
+      - Enforces '--isolated' to prevent untrusted repo configs (pyproject.toml/ruff.toml) from overriding rules.
+      - Optionally accepts trusted rule sets via select_rules (e.g. ['E', 'F', 'B']).
       - Ruff exit code 0: Clean code, no lint issues. (success=True, issues_found=False)
       - Ruff exit code 1: Lint issues found. (success=True, issues_found=True)
       - Ruff exit code >= 2: Tool runtime error or invalid config. (success=False)
@@ -409,6 +415,7 @@ def run_ruff(
         target_path: File or directory path to inspect.
         custom_cmd: Optional override for the base command executable.
         timeout: Maximum seconds to wait before terminating the subprocess.
+        select_rules: Optional list/tuple of rule codes to enforce (passed via trusted --select CLI argument).
 
     Returns:
         ToolResult instance with status, issues, and raw outputs.
@@ -433,8 +440,12 @@ def run_ruff(
     safe_path = target_path
     if safe_path.startswith("-"):
         safe_path = f".{os.sep}{safe_path}"
+    # Use '--isolated' to prevent untrusted repo configs (pyproject.toml/ruff.toml) from overriding rules
     # Use '--' to prevent paths starting with a dash or flag-like names from being parsed as options
-    cmd = list(base_cmd) + ["check", "--output-format=json", "--", safe_path]
+    cmd = list(base_cmd) + ["check", "--output-format=json", "--isolated"]
+    if select_rules:
+        cmd.append(f"--select={','.join(select_rules)}")
+    cmd.extend(["--", safe_path])
 
     try:
         process = subprocess.run(
@@ -546,18 +557,65 @@ def run_ruff(
 
 
 
+def is_trusted_config_path(
+    candidate: str | None,
+    trusted_roots: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    """
+    Verify that a configuration path resolves strictly within maintainer-controlled trusted directories.
+
+    Prevents untrusted PR repositories or arbitrary working directories from supplying malicious scanner configs
+    (e.g., bandit.yaml or .bandit) to suppress security rules.
+
+    Args:
+        candidate: File path to validate.
+        trusted_roots: Directory paths considered trusted (defaults to the pipeline package directory).
+
+    Returns:
+        True if the candidate is an existing regular file within a trusted root; False otherwise.
+    """
+    if not candidate or not isinstance(candidate, str):
+        return False
+
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    roots = list(trusted_roots) if trusted_roots is not None else [project_dir]
+
+    try:
+        abs_candidate = os.path.abspath(os.path.realpath(candidate))
+        if not os.path.isfile(abs_candidate):
+            return False
+
+        for root in roots:
+            abs_root = os.path.abspath(os.path.realpath(root))
+            try:
+                common = os.path.commonpath([abs_candidate, abs_root])
+                if common == abs_root:
+                    return True
+            except ValueError:
+                # Handles path comparison across different drive letters on Windows (e.g. C: vs E:)
+                continue
+        return False
+    except (OSError, ValueError):
+        return False
+
+
 def run_bandit(
     target_path: str,
     custom_cmd: list[str] | None = None,
     timeout: int = 120,
     config_path: str | None = None,
+    trusted_dirs: list[str] | tuple[str, ...] | None = None,
 ) -> ToolResult:
     """
     Execute Bandit security scanner safely on the target path using Python subprocess.
 
     Key behaviors:
       - Uses shell=False with argument list.
-      - Automatically loads bandit.yaml / .bandit configuration when available.
+      - Enforces strict configuration trust boundaries (SEC-01):
+        * Never discovers configuration from the untrusted PR target_path.
+        * Never implicitly trusts os.getcwd().
+        * Discovers configuration solely from verified maintainer directory (project_dir).
+        * Validates any explicit config_path against trusted_dirs (project_dir by default).
       - Bandit exit code 0: Clean code, no security findings. (success=True, issues_found=False)
       - Bandit exit code 1: Security findings detected. (success=True, issues_found=True)
       - Bandit exit code >= 2: Tool runtime error or fatal syntax problem. (success=False)
@@ -568,6 +626,7 @@ def run_bandit(
         custom_cmd: Optional override for the base command executable.
         timeout: Maximum seconds to wait before terminating the subprocess.
         config_path: Optional explicit path to Bandit YAML configuration file.
+        trusted_dirs: Optional trusted root directories for config validation (defaults to pipeline project_dir).
 
     Returns:
         ToolResult instance with status, issues, and raw outputs.
@@ -593,21 +652,32 @@ def run_bandit(
     if safe_path.startswith("-"):
         safe_path = f".{os.sep}{safe_path}"
 
-    # Resolve Bandit configuration file (e.g. bandit.yaml or .bandit)
-    resolved_config = config_path
-    if not resolved_config:
-        candidates = []
-        if os.path.isdir(target_path):
-            candidates.append(os.path.join(target_path, "bandit.yaml"))
-            candidates.append(os.path.join(target_path, ".bandit"))
-        project_dir = os.path.dirname(os.path.abspath(__file__))
-        candidates.append(os.path.join(project_dir, "bandit.yaml"))
-        candidates.append(os.path.join(project_dir, ".bandit"))
-        candidates.append(os.path.join(os.getcwd(), "bandit.yaml"))
-        candidates.append(os.path.join(os.getcwd(), ".bandit"))
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    effective_trusted_roots = list(trusted_dirs) if trusted_dirs is not None else [project_dir]
 
+    # Resolve Bandit configuration file (only trusted maintainer locations, never untrusted target_path or os.getcwd())
+    resolved_config: str | None = None
+    if config_path:
+        if is_trusted_config_path(config_path, trusted_roots=effective_trusted_roots):
+            resolved_config = os.path.abspath(os.path.realpath(config_path))
+        else:
+            logger.warning(
+                "Untrusted Bandit configuration path rejected: '%s' is outside trusted boundary %s. "
+                "Falling back to maintainer pipeline configuration.",
+                config_path,
+                effective_trusted_roots,
+            )
+            resolved_config = None
+
+    if not resolved_config:
+        # Only search verified maintainer-controlled locations (project_dir)
+        # NEVER search untrusted target_path and NEVER implicitly trust os.getcwd()
+        candidates = [
+            os.path.join(project_dir, "bandit.yaml"),
+            os.path.join(project_dir, ".bandit"),
+        ]
         for cand in candidates:
-            if os.path.isfile(cand):
+            if is_trusted_config_path(cand, trusted_roots=effective_trusted_roots):
                 resolved_config = cand
                 break
 

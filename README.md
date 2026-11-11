@@ -1,127 +1,216 @@
 # Multi-Agent Code Review & Debugging Pipeline
 
-> **Milestone 4:** GitHub Pull Request Review & Controlled Review Publishing
+> **Autonomous Multi-Agent Static Analysis, Semantic Hazard Detection, Sandboxed Test Execution, and Verified Patch Synthesis for Python.**
 
-An end-to-end, multi-agent Python code review and automated debugging pipeline built with **LangGraph**, **Ruff**, **Bandit**, **Docker**, and the **GitHub REST API**.
+The **Multi-Agent Code Review & Debugging Pipeline** is an end-to-end code analysis and repair system built with **LangGraph**, **Ruff**, **Bandit**, **Python AST Semantic Analysis**, **Docker**, and the **GitHub REST API**.
 
-The system combines deterministic static analysis with specialized AI agents to inspect code, model security threats, generate isolated unit tests, execute them safely in isolated Docker sandboxes, and synthesize verified, minimal patches for failing tests. In Milestone 4, the pipeline extends seamlessly to GitHub Pull Requests, offering read-only diff inspection, dry-run simulations, and human-gated review publishing with strict credential protection.
+The system features a **dual-mode architecture**:
+1. **Deterministic Mode (Default & CI)**: Operates completely offline without requiring LLM credentials or network calls. Combines Ruff (style/linting), Bandit (security AST analysis), and a custom pure-AST Semantic Analyzer to catch PEP 8 violations, security vulnerabilities, and runtime exceptions (`ZeroDivisionError`, `AttributeError` from `None` dereference, `IndexError`, `KeyError`) with 100% reproducible results and zero hallucinations.
+2. **AI-Enabled Mode (Optional)**: When LLM credentials (`OPENAI_API_KEY`) are provided, coordinates specialized LangGraph agents (Linter Agent, Security Agent, Test-Writer Agent, and Debugging Agent) to synthesize contextual threat modeling, generate targeted `pytest` test suites, validate them against strict AST safety constraints, execute them inside resource-isolated Docker sandboxes, and synthesize verified minimal diff patches.
+
+The pipeline extends directly into GitHub Pull Request workflows, offering read-only diff inspection, dry-run simulations, GitHub Actions Step Summaries, and human-in-the-loop review publishing guarded by cryptographic plan-hash verification.
 
 ---
 
 ## 📋 Table of Contents
 
-- [Project Architecture](#-project-architecture)
-- [Project Structure](#-project-structure)
+- [Problem Statement & Motivation](#-problem-statement--motivation)
+- [Project Objectives](#-project-objectives)
 - [Key Features](#-key-features)
+- [System Architecture](#-system-architecture)
+- [Technology Stack](#-technology-stack)
+- [Project Structure](#-project-structure)
+- [Installation & Setup (Windows)](#-installation--setup-windows)
+- [Environment Configuration](#-environment-configuration)
+- [Running the Project Locally](#-running-the-project-locally)
+- [GitHub Pull Request Integration](#-github-pull-request-integration)
+- [Review Modes: Read-Only Preview vs. Controlled Publishing](#-review-modes-read-only-preview-vs-controlled-publishing)
+- [Testing & Evaluation Results](#-testing--evaluation-results)
+- [Limitations & Future Enhancements](#-limitations--future-enhancements)
 - [Milestone Progression](#-milestone-progression)
-- [Prerequisites & Installation](#-prerequisites--installation)
-- [Usage Guide](#-usage-guide)
-  - [CLI Flags & Options](#cli-flags--options)
-  - [Example Invocations](#example-invocations)
-  - [Running the Test Suite](#running-the-test-suite)
-- [How It Works](#-how-it-works)
-  - [1. Static Analysis (Milestone 1)](#1-static-analysis-milestone-1)
-  - [2. Multi-Agent Review Workflow (Milestone 2)](#2-multi-agent-review-workflow-milestone-2)
-  - [3. Test Validation & Storage (Milestone 3)](#3-test-validation--storage-milestone-3)
-  - [4. Docker Sandbox Execution (Milestone 3)](#4-docker-sandbox-execution-milestone-3)
-  - [5. Debugging Agent & Verified Patch Loop (Milestone 3)](#5-debugging-agent--verified-patch-loop-milestone-3)
-  - [6. GitHub PR Review & Controlled Publication (Milestone 4)](#6-github-pr-review--controlled-publication-milestone-4)
-- [Sample Demonstrations](#-sample-demonstrations)
-- [Roadmap & Completed Milestones](#-roadmap--completed-milestones)
 
 ---
 
-## 🏛 Project Architecture
+## 🎯 Problem Statement & Motivation
 
+Code reviews in modern software development are critical for quality and security, but present recurring pain points:
+- **Reviewer Fatigue & Oversight**: Manual reviews are time-consuming and often miss subtle defects such as unconditional `None` dereferences, division-by-zero edge cases, dictionary key lookups without defaults, or insecure cryptographic primitives.
+- **Disconnected & Unprioritized Tooling**: Running separate linters, security scanners, and formatters produces fragmented, noisy, and unranked warnings. Reviewers are overwhelmed by duplicate findings reported across multiple tools on the same lines of code.
+- **LLM Reliability & Safety Risks**: LLM-based code reviewers can hallucinate nonexistent APIs or propose broken, untested fixes. Furthermore, executing unvetted AI-generated test code directly on developer machines or CI hosts poses arbitrary code execution risks.
+
+**Motivation**: This pipeline bridges deterministic static analysis with intelligent agent workflows. By anchoring all analysis in verifiable AST inspection and isolating dynamic test execution inside disposable Docker sandboxes, the system delivers high-confidence, prioritized code-review findings and verified patches without risking host security or relying on ungrounded AI guesses.
+
+---
+
+## 🎯 Project Objectives
+
+1. **Deterministic Core**: Provide zero-overhead, reproducible static analysis and semantic hazard detection that functions completely offline without external APIs or LLM dependencies.
+2. **Specialized Multi-Agent Collaboration**: Use LangGraph to orchestrate focused agents for linter diagnostics, security threat modeling, test synthesis, and patch debugging.
+3. **Structured Finding Prioritization**: Standardize findings into structured severity tiers (**Critical**, **High**, **Medium**, **Low**) with calibrated confidence scores (0.0 to 1.0) and complete explanatory metadata (What, Why, Evidence, Suggested Fix).
+4. **Cross-Tool Finding Deduplication**: Consolidate overlapping findings from multiple scanners (e.g., Bandit and Ruff flagging the same line or equivalent rule codes) while preserving merged evidence and tool attribution.
+5. **Defense-in-Depth Sandboxing**: Ensure AI-generated tests undergo strict AST safety screening (blocking dangerous imports and builtins) and execute inside hardened, network-isolated Docker containers with strict CPU/memory limits.
+6. **Automated, Verified Patch Loop**: Synthesize minimal unified diff patches for failing tests and verify that the proposed patches pass in a disposable scratch sandbox before presenting them to the user.
+7. **Read-Only GitHub CI Integration**: Integrate seamlessly with GitHub Actions using least-privilege permissions (`contents: read`, `pull-requests: read`) and non-mutating preview summaries.
+8. **Cryptographic Human-in-the-Loop Gate**: Require interactive human approval and SHA-256 plan-hash integrity verification before posting review comments or verdicts to GitHub.
+9. **Empirical Evaluation**: Maintain a rigorous, repeatable benchmark suite with labeled ground truth to measure precision, recall, and false positive rates.
+
+---
+
+## ✨ Key Features
+
+### 1. Linter Agent (Ruff)
+- Uses [Ruff](https://github.com/astral-sh/ruff) via subprocess isolation (`shell=False`, argument vectors separated by `--` to prevent injection).
+- Identifies syntax errors, unused imports (`F401`), unused variables (`F841`), and PEP 8 style issues.
+- In AI mode, provides beginner-friendly explanations of why the lint violation matters and how to refactor it cleanly.
+
+### 2. Security Agent (Bandit)
+- Uses [Bandit](https://github.com/PyCQA/bandit) to inspect the Python Abstract Syntax Tree (AST) for common security vulnerabilities.
+- Detects insecure `assert` usage in production logic (`B101`), hardcoded credentials (`B105`), weak pseudo-random number generators (`B311`), and unsafe executions.
+- In AI mode, frames issues from a threat-modeling perspective, explaining attack vectors, potential impact, and secure alternatives.
+
+### 3. AST Semantic Analyzer
+- Custom pure-AST deterministic analyzer operating with zero network calls and zero LLMs.
+- Detects common runtime hazards before code executes:
+  - **`SEM001`**: Unhandled division, floor division, or modulo by zero (`ZeroDivisionError`).
+  - **`SEM002`**: Unhandled `None` dereference (`AttributeError` / `TypeError`) on literal `None`, variables proven to be `None` in branches, or unvalidated regex match chaining.
+  - **`SEM003`**: Provably out-of-bounds constant indexing (`IndexError`) on literal lists/tuples, or missing constant key access (`KeyError`) on literal dictionaries.
+- Implements strict **exception-handling awareness**: suppresses findings only when the enclosing `try` block catches the specific runtime exception type.
+- Assigns calibrated confidence scores (`HIGH` for literals and proven flow branches; `MEDIUM` for unguarded parameters).
+
+### 4. Test-Writer Agent & AST Safety Validator
+- Synthesizes targeted `pytest` test suites designed to reproduce static and semantic defects.
+- **Safety Screening (`test_validator.py`)**: All generated test code passes through a strict AST firewall before touching disk:
+  - Must define valid test functions (`test_*`) or test classes (`Test*`).
+  - Blocks dangerous modules (`subprocess`, `socket`, `ctypes`, `shutil`, `urllib`, `requests`).
+  - Blocks dangerous builtins (`eval`, `exec`, `__import__`, `open` in write modes).
+  - Enforces size limits (≤ 128 KB) and valid syntax.
+- Approved tests are written to an isolated temporary workspace, never polluting the user's project directory.
+
+### 5. Docker Sandbox Runner
+- Executes validated tests in disposable containers using a pinned Python 3.11 environment (`code-review-sandbox:3.11`).
+- Enforces strict container containment:
+  - Read-only source code mounting (`:ro`).
+  - Total network isolation (`--network none`).
+  - Resource limits (`--memory 512m`, `--cpus 1.0`, `--pids-limit 100`).
+  - Bounded execution timeouts with guaranteed container kill and cleanup guards on exit.
+- If Docker is unavailable or `--no-sandbox` is specified, the pipeline gracefully skips container execution without failing.
+
+### 6. Debugging Agent & Verified Patch Synthesis
+- When tests fail in the Docker sandbox, the Debugging Agent analyzes source files, static findings, and pytest failure logs.
+- Synthesizes a minimal unified diff patch addressing the failure.
+- Verifies the candidate patch by applying it to a disposable copy of the target in a scratch sandbox and re-running the test suite.
+- Rejects unverified or invalid patches and enforces bounded retry limits to prevent infinite loops.
+
+### 7. GitHub Pull Request Integration
+- Inspects GitHub pull requests directly using `--pr owner/repo#123` or PR URLs.
+- Fetches metadata, commit details, and unified diffs via `github_client.py`.
+- Maps findings strictly to newly added or modified lines in diff hunks. Issues located outside changed lines are organized as file-level / unmapped findings.
+- Generates rich GitHub Actions Step Summaries with severity-grouped tables and review badges.
+
+### 8. Human-in-the-Loop Approval Gate
+- Enforces strict human governance before publishing reviews:
+  - Computes a SHA-256 cryptographic plan hash over the finalized review summary, verdict, and comments.
+  - Verifies that the PR head commit SHA has not changed since analysis began, preventing stale review posting.
+  - Presents an interactive terminal prompt requiring explicit human confirmation (`yes`) before any write call is made to the GitHub REST API.
+  - Fails closed (`NonInteractivePublishingDisabledError`) in automated or headless CI environments.
+
+### 9. Finding Prioritization & Cross-Tool Deduplication
+- Normalizes all scanner findings into four distinct severity levels: **Critical**, **High**, **Medium**, and **Low**.
+- Computes normalized confidence scores (0.0 to 1.0).
+- Structures explanations into four standardized fields:
+  - **What**: The specific code defect or vulnerability.
+  - **Why**: The architectural or security reason why the issue matters.
+  - **Evidence**: The exact file path, line number, column, or diff context.
+  - **Suggested Fix**: Practical, actionable remediation advice.
+- Merges overlapping findings from different tools (e.g., Bandit `B101` and Ruff `S101` on the same line), retaining the highest severity, highest confidence, combined evidence, and full tool attribution.
+- Guarantees the invariant:
+  $$\text{Total Distinct Findings} = \text{Inline Comments} + \text{Unmapped Findings}$$
+
+### 10. Evaluation Framework & Benchmark Suite
+- Comprehensive benchmark runner (`benchmark/runner.py`) executing pipeline workflows against curated test cases.
+- Evaluates against labeled ground truth with configurable line tolerances.
+- Computes True Positives (TP), False Positives (FP), False Negatives (FN), Precision, Recall, and F1 scores across individual detectors and defect categories.
+- Exports machine-readable evaluation reports (`evaluation_report.json`) and CSV summaries.
+
+---
+
+## 🏛 System Architecture
+
+The pipeline processes code through deterministic scanning, optional multi-agent reasoning, sandboxed verification, and governed publishing:
+
+```mermaid
+flowchart TD
+    Target["Target Python Code or GitHub PR Diff"] --> InputRouter{"Input Target Type"}
+
+    InputRouter -->|"Local Path"| LocalPrep["Local Codepath Resolution"]
+    InputRouter -->|"--pr / GitHub API"| PRPrep["Ephemeral PR Workspace & Diff Parser"]
+
+    LocalPrep --> StaticEngines["Deterministic Analysis Engines"]
+    PRPrep --> StaticEngines
+
+    subgraph StaticEngines["Deterministic Analysis Engines (Offline / Zero-LLM)"]
+        direction TB
+        Ruff["Ruff Linter\n(Style, PEP 8, Unused Imports)"]
+        Bandit["Bandit Security Scanner\n(Vulnerabilities & Hardcoded Secrets)"]
+        Semantic["AST Semantic Analyzer\n(ZeroDivision, None Dereference, KeyError/IndexError)"]
+    end
+
+    StaticEngines --> Dedup["Finding Prioritization & Deduplication\n(Critical / High / Medium / Low | Confidence 0.0 - 1.0)"]
+
+    Dedup --> ModeSplit{"AI Enabled & LLM Key Configured?"}
+
+    ModeSplit -->|"No (--no-ai or no API key)"| PlanGen["Action Plan Generator\n(Summary & Inline Comment Mapping)"]
+
+    ModeSplit -->|"Yes (OPENAI_API_KEY)"| LangGraph["LangGraph Multi-Agent Workflow"]
+
+    subgraph LangGraph["LangGraph Agent Workflow (Optional LLM)"]
+        direction TB
+        AgentFanOut{"Parallel Fan-Out"}
+        AgentFanOut --> LinterAgent["Linter Agent\n(Beginner-Friendly Context)"]
+        AgentFanOut --> SecurityAgent["Security Agent\n(Threat Modeling & Impact)"]
+        LinterAgent --> TestWriter["Test-Writer Agent\n(pytest Suite Generation)"]
+        SecurityAgent --> TestWriter
+        TestWriter --> TestValidator["Test Safety Validator\n(AST Defense-in-Depth Filter)"]
+    end
+
+    TestValidator --> SandboxDecision{"Enable Sandbox & Docker Active?"}
+    SandboxDecision -->|"Yes"| DockerSandbox["Docker Sandbox Runner\n(--network none, --read-only, CPU/RAM Caps)"]
+    SandboxDecision -->|"No"| PlanGen
+
+    DockerSandbox --> TestResult{"Tests Passed?"}
+    TestResult -->|"Yes / Skipped"| PlanGen
+    TestResult -->|"No (Failing Tests)"| Debugger["Debugging Agent\n(Synthesizes Minimal Verified Patch)"]
+    Debugger --> PlanGen
+
+    PlanGen --> ReviewPlan["Structured Review Action Plan\n(Verdict: COMMENT / APPROVE / REQUEST_CHANGES)"]
+
+    ReviewPlan --> PublishDecision{"Execution Mode"}
+
+    PublishDecision -->|"Local Terminal"| LocalDisplay["Console Summary & Inline Recommendations"]
+    PublishDecision -->|"GitHub Actions CI"| CISummary["GitHub Actions Step Summary\n(Read-Only Preview, Exit Code 0/2)"]
+    PublishDecision -->|"--publish --dry-run"| DryRun["Dry-Run Output\n(Simulated REST Payloads, Zero Write Calls)"]
+    PublishDecision -->|"--publish"| ApprovalGate["Human-in-the-Loop Approval Gate\n(Plan-Hash SHA-256 + Head-SHA Freshness Check)"]
+
+    ApprovalGate -->|"Rejected / Cancelled"| Abort["Safe Abort (Exit Code 1)"]
+    ApprovalGate -->|"Approved (Interactive 'yes')"| GitHubPublish["GitHub REST API\n(Atomic Review Submission)"]
 ```
-                                  +------------------------------------+
-                                  |    Target Source or GitHub PR      |
-                                  |   (Local Path or --pr owner/repo)  |
-                                  +-----------------+------------------+
-                                                    |
-                         +--------------------------+--------------------------+
-                         |                                                     |
-                         v                                                     v
-            +------------------------+                             +------------------------+
-            |      Ruff Linter       |                             |     Bandit Scanner     |
-            |  (tools.py: run_ruff)  |                             | (tools.py: run_bandit) |
-            +------------+-----------+                             +-----------+------------+
-                         |                                                     |
-                         +--------------------------+--------------------------+
-                                                    |
-                                      Deterministic Findings
-                                                    |
-                                                    v
-                                  +------------------------------------+
-                                  |       LangGraph Orchestrator       |
-                                  |            (workflow.py)           |
-                                  +-----------------+------------------+
-                                                    |
-                         +--------------------------+--------------------------+
-                         | (Parallel Fan-Out)                                  | (Parallel Fan-Out)
-                         v                                                     v
-            +------------------------+                             +------------------------+
-            |      Linter Agent      |                             |     Security Agent     |
-            |     (agents.py)        |                             |      (agents.py)       |
-            +------------+-----------+                             +-----------+------------+
-                         |                                                     |
-                         +--------------------------+--------------------------+
-                                                    | (Fan-In Sync)
-                                                    v
-                                  +------------------------------------+
-                                  |         Test-Writer Agent          |
-                                  |     - Generates pytest suites      |
-                                  |     - test_validator.py            |
-                                  |     - Stores in temp workspace     |
-                                  +-----------------+------------------+
-                                                    |
-                                      [enable_sandbox == True?]
-                                       /                     \
-                                    No/                       \Yes
-                                     /                         v
-                                    |             +------------------------+
-                                    |             |  Docker Sandbox Runner |
-                                    |             |   (sandbox_runner.py)  |
-                                    |             |  - Read-only source    |
-                                    |             |  - Isolated container  |
-                                    |             +-----------+------------+
-                                    |                         |
-                                    |            [Tests Passed or Skipped?]
-                                    |                    /         \
-                                    |                Yes/           \No (Failed tests)
-                                    |                  /             v
-                                    |                 |  +------------------------+
-                                    |                 |  |    Debugging Agent     |
-                                    |                 |  |  - Analyzes fail log   |
-                                    |                 |  |  - Minimal unified diff|
-                                    |                 |  |  - Verified in copy    |
-                                    |                 |  +-----------+------------+
-                                    |                 |              |
-                                    v                 v              v
-                                  +------------------------------------+
-                                  |        Review Action Plan          |
-                                  |   - Top-level Markdown summary     |
-                                  |   - Validated inline comments      |
-                                  |   - Verdict: COMMENT/APPROVE/REQ   |
-                                  +-----------------+------------------+
-                                                    |
-                                        [--publish enabled?]
-                                         /                \
-                                      No/                  \Yes
-                                       v                    v
-                        +----------------------+    +--------------------------+
-                        |  Read-Only Preview   |    |    Human Approval Gate   |
-                        |  or --dry-run Output |    | - Plan-hash verification |
-                        +----------------------+    | - PR head-SHA check      |
-                                                    | - Interactive prompt     |
-                                                    +-------------+------------+
-                                                                  | [Approved?]
-                                                                  v
-                                                    +--------------------------+
-                                                    |  GitHub REST Publication |
-                                                    |  (github_client.py)      |
-                                                    +--------------------------+
-```
+
+---
+
+## 🛠 Technology Stack
+
+| Category | Component / Library | Purpose |
+| :--- | :--- | :--- |
+| **Orchestration & Workflow** | [LangGraph](https://github.com/langchain-ai/langgraph) (`>=0.2.0`) | StateGraph multi-agent flow, state reducers, parallel fan-out |
+| **Agent Foundation** | [LangChain Core](https://github.com/langchain-ai/langchain) (`>=0.3.0`) | Prompt templates, model abstractions, output parsers |
+| **LLM Provider** | [LangChain OpenAI](https://github.com/langchain-ai/langchain) (`>=0.2.0`) | Integration with OpenAI and OpenAI-compatible inference APIs |
+| **Static Code Linter** | [Ruff](https://github.com/astral-sh/ruff) (`>=0.5.0`) | Fast PEP 8, import, syntax, and style inspection |
+| **Security Scanner** | [Bandit](https://github.com/PyCQA/bandit) (`>=1.7.5`) | AST-based Python security vulnerability detection |
+| **Semantic Analysis** | Python `ast` (Standard Library) | Pure deterministic detection of `SEM001`, `SEM002`, `SEM003` |
+| **Sandboxing & Isolation** | [Docker](https://www.docker.com/) Engine / CLI | Ephemeral container execution (`--network none`, resource caps) |
+| **Test Execution** | [pytest](https://docs.pytest.org/) (`>=7.4.0`) | Unit test execution and failure log parsing |
+| **GitHub Integration** | GitHub REST API v3 / `urllib.request` | Pull request metadata, diff parsing, and review publishing |
+| **Environment & Config** | [python-dotenv](https://github.com/theskumar/python-dotenv) (`>=1.0.0`) | Local `.env` credential management |
 
 ---
 
@@ -129,257 +218,266 @@ The system combines deterministic static analysis with specialized AI agents to 
 
 ```
 code review/
-├── .gitignore                   # Git ignore patterns for Python, venv, caches, temp tests
-├── .venv/                       # Project virtual environment
-├── pytest.ini                   # Pytest configuration and pythonpath discovery
-├── requirements.txt             # Pinned, compatible dependencies
-├── README.md                    # Comprehensive architecture & usage documentation
-├── state.py                     # ReviewState TypedDict definitions and reducers
-├── tools.py                     # Subprocess execution and output parsing for Ruff & Bandit
-├── agents.py                    # LinterAgent, SecurityAgent, TestWriterAgent
-├── debugging_agent.py           # DebuggingAgent: minimal patch synthesis & verification
-├── test_validator.py            # Safety scanning, syntax validation, & temp storage for tests
-├── sandbox_runner.py            # Hardened Docker runner with timeouts and cleanup guards
-├── workflow.py                  # LangGraph StateGraph review workflow and state routing
-├── github_client.py             # GitHub REST API client, diff parser, & credential defense
-├── github_review_workflow.py    # PR review orchestration, action planning, & publishing
-├── approval_gate.py             # Cryptographic plan-hash integrity & human approval gate
-├── pr_workspace.py              # Isolated PR branch checkout & patch workspace manager
-├── semantic_analyzer.py         # Interprocedural static None and call-graph analyzer
-├── main.py                      # Unified CLI entry point and human-readable reporting
-├── sample_project/              # Demonstration codebase
-│   └── app.py                   # Code containing deliberate lint and security issues
-└── tests/                       # Automated test suite (816 passed, 5 skipped)
-    ├── test_tools.py            # Subprocess wrapper and option injection hardening tests
-    ├── test_agents.py           # Linter, Security, and Test-Writer agent unit tests
-    ├── test_workflow.py         # Local multi-agent LangGraph orchestration tests
-    ├── test_test_validator.py   # Test syntax and defense-in-depth safety checks
-    ├── test_sandbox_runner.py   # Docker sandbox execution and timeout cleanup tests
-    ├── test_debugging_agent.py  # Patch synthesis, verification, & temp directory cleanup
-    ├── test_github_client.py    # REST client, token resolution, & credential redaction
-    ├── test_github_review_workflow.py # PR review planning & publication workflow tests
-    ├── test_approval_gate.py    # Plan-hash integrity and interactive approval tests
-    ├── test_controlled_publishing.py # Publication safeguards & dry-run validation tests
-    ├── test_pr_workspace.py     # PR workspace isolation and checkout tests
-    ├── test_semantic_analyzer.py# Static None-safety and call-graph analysis tests
-    └── test_cli.py              # CLI entry point, flag handling, & deprecation tests
+├── .github/
+│   └── workflows/
+│       └── pr-review.yml            # Least-privilege read-only GitHub Actions workflow
+├── benchmark/                       # Phase 6 & Milestone 7 Evaluation Framework
+│   ├── cases/                       # 34 curated evaluation benchmark cases
+│   │   ├── bugs/                    # Division-by-zero, None deref, KeyError/IndexError
+│   │   ├── clean/                   # Clean code samples verifying zero false alarms
+│   │   ├── error_handling/          # Exception handling and suppression tests
+│   │   ├── multi/                   # Overlapping lint and semantic issues
+│   │   ├── safe_edges/              # Complex constructs that must not trigger false alarms
+│   │   └── security/                # Assert usage, hardcoded secrets, weak random
+│   ├── eval_manifest.json           # Evaluation suite manifest with labeled ground truth
+│   ├── manifest.json                # Complete benchmark manifest
+│   ├── metrics.py                   # Precision, recall, F1, and ground-truth matcher
+│   └── runner.py                    # Benchmark CLI runner with JSON/CSV export
+├── sample_project/                  # Demonstration codebase
+│   └── app.py                       # Sample file with deliberate lint and security issues
+├── tests/                           # Comprehensive test suite (984 passed, 6 skipped)
+│   ├── test_agents.py               # Linter, Security, and Test-Writer agent unit tests
+│   ├── test_approval_gate.py        # Cryptographic plan-hash integrity and approval tests
+│   ├── test_benchmark.py            # Benchmark execution and metrics unit tests
+│   ├── test_cli.py                  # CLI argument parsing, flags, and deprecation checks
+│   ├── test_controlled_publishing.py # Review publishing safeguards & dry-run tests
+│   ├── test_debugging_agent.py      # Patch synthesis, verification, & scratch sandbox tests
+│   ├── test_evaluation_framework.py # Ground-truth matching, FP tracking, & manifest tests
+│   ├── test_finding_quality.py      # Severity, confidence, explanation, & dedup tests
+│   ├── test_github_actions_workflow.py # GitHub Actions step summary & security tests
+│   ├── test_github_client.py        # GitHub REST client, token handling, & redaction
+│   ├── test_github_review_workflow.py # PR diff parsing, inline comments, & workflow tests
+│   ├── test_pr_workspace.py         # Ephemeral PR workspace checkout & isolation tests
+│   ├── test_safety.py               # Shell safety and argument injection defense tests
+│   ├── test_sandbox_integration.py  # Live Docker daemon integration tests (opt-in)
+│   ├── test_sandbox_runner.py       # Docker sandbox runner, timeouts, and cleanup tests
+│   ├── test_security_audit_m3_1.py  # Security audit regressions
+│   ├── test_semantic_analyzer.py    # AST semantic analyzer (SEM001, SEM002, SEM003) tests
+│   ├── test_test_validator.py       # AST test safety validation firewall tests
+│   ├── test_tools.py                # Ruff and Bandit subprocess wrapper tests
+│   ├── test_workflow.py             # LangGraph StateGraph orchestration tests
+│   └── test_workflow_m3.py          # Milestone 3 workflow integration tests
+├── .env.example                     # Safe environment template with placeholders
+├── .gitignore                       # Git ignore patterns for venv, caches, and temp tests
+├── agents.py                        # LangGraph agent definitions (Linter, Security, TestWriter)
+├── approval_gate.py                 # SHA-256 plan hash and human approval gate
+├── bandit.yaml                      # Pinned Bandit configuration
+├── debugging_agent.py               # Debugging Agent: minimal patch synthesis & verification
+├── Dockerfile                       # Pinned Python 3.11 sandbox image definition
+├── evaluation_report.json           # Machine-readable evaluation report from benchmark run
+├── github_client.py                 # GitHub REST API client, diff parser, & credential scrubber
+├── github_review_workflow.py        # PR review orchestration, comment mapping, & publishing
+├── llm_config.py                    # LLM factory and credential detection
+├── main.py                          # Unified CLI entry point and reporter
+├── pr_workspace.py                  # Isolated PR branch checkout manager
+├── pyproject.toml                   # Project configuration and Ruff exclusion rules
+├── pytest.ini                       # Pytest configuration and path discovery
+├── README.md                        # Project documentation
+├── requirements.txt                 # Pinned Python dependencies
+├── safety.py                        # Subprocess argument safety utilities
+├── sandbox_runner.py                # Hardened Docker runner with timeout guards
+├── semantic_analyzer.py             # Pure AST Semantic Hazard Analyzer
+├── state.py                         # ReviewState TypedDict definitions and reducers
+├── test_validator.py                # AST safety screening firewall for test code
+├── tools.py                         # Subprocess execution for Ruff and Bandit
+└── workflow.py                      # LangGraph review workflow and deterministic runner
 ```
 
 ---
 
-## ✨ Key Features
+## ⚙️ Installation & Setup (Windows)
 
-1. **Subprocess Isolation**: Linters run safely with `shell=False` and explicit argument lists separated by `--` to prevent option and command injection.
-2. **Read-Only Source Integrity**: Target source code is never modified by the pipeline. Patches and tests are isolated in disposable temporary environments.
-3. **Multi-Agent Orchestration**: LangGraph coordinates parallel Linter and Security agents, then sequences the Test-Writer, Sandbox Runner, and Debugging agents.
-4. **AST & Static Safety Validation for Tests**: All LLM-generated test files undergo structural checks (must define test functions) and defense-in-depth safety screening (blocks `subprocess`, `socket`, `ctypes`, `os.system`, `eval`, `exec`, write operations, etc.) before storage.
-5. **Sandboxed Docker Execution**: Executes approved pytest test files against disposable, read-only copies of target code inside an ephemeral container (`--network none`, `--read-only`, capped memory and CPU, bounded timeout, guaranteed cleanup).
-6. **Graceful Degradation & Deterministic Mode**: When Docker is offline or disabled via `--no-sandbox`, sandbox execution is skipped cleanly. When API keys are absent or `--no-ai` is supplied, deterministic static analysis runs with full reporting.
-7. **Automated Debugging Agent**: When tests fail, the Debugging Agent synthesizes a minimal unified diff patch, verified against a disposable copy in the sandbox before presentation. Can be disabled via `--no-debug`.
-8. **GitHub Pull Request Review Automation**: Deep inspection of GitHub pull requests via `--pr` and `--repo`, with unified diff parsing that maps findings strictly to changed lines.
-9. **Controlled Publication & Human Approval Gate**: Review publication (`--publish`) requires interactive human confirmation and enforces cryptographic plan-hash verification and PR head-SHA staleness checks before posting.
-10. **Safe Dry-Run Simulations**: `--dry-run` previews complete top-level summaries and inline comment payloads in memory without making any mutating API calls.
-11. **Comprehensive Credential Defense**: All tokens, whether loaded from environment variables, files, or instances, are globally scrubbed from logs, errors, and LLM prompts.
+### 1. Prerequisites
+- **Operating System**: Windows 10/11 (macOS and Linux also supported).
+- **Python**: Python 3.11 or higher (developed and tested on Python 3.13).
+- **Git**: Git for Windows installed and accessible in `PATH`.
+- **Docker Desktop** *(Optional)*: Required only if executing tests in the live Docker sandbox. If Docker is not running or `--no-sandbox` is specified, the pipeline skips sandboxed execution cleanly.
 
----
+### 2. Clone the Repository & Create Virtual Environment
 
-## ⚙️ Prerequisites & Installation
-
-### 1. Requirements
-- Python 3.9+ (Python 3.11+ recommended; developed with Python 3.13)
-- Windows, macOS, or Linux
-- Docker (optional, required only for live container sandbox execution)
-
-### 2. Setup Virtual Environment
+Open PowerShell in your workspace:
 
 ```powershell
+# Clone the repository
+git clone https://github.com/your-username/code-review.git
+cd "code review"
+
+# Create a virtual environment
 python -m venv .venv
+
+# Activate the virtual environment
 .\.venv\Scripts\Activate.ps1
+
+# Upgrade pip and install pinned dependencies
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 3. Configure Credentials
+### 3. Build Sandbox Docker Image (Optional)
 
-Create a `.env` file or export environment variables:
-
-```env
-# Optional: For AI Agent analysis, explanations, test generation, and patch proposals
-OPENAI_API_KEY=your-openai-api-key
-OPENAI_MODEL=gpt-4o-mini
-
-# Optional: For GitHub Pull Request reviews and publishing (Milestone 4)
-GITHUB_TOKEN=ghp_your_github_token_here
-```
-
-> **Credential Safety & Token Precedence:**
-> - The pipeline resolves GitHub credentials with the following precedence:
->   1. Explicit parameter / CLI `--token` (highest priority; deprecated for security).
->   2. `GITHUB_TOKEN` environment variable.
->   3. `GH_TOKEN` environment variable.
->   4. `GITHUB_TOKEN_FILE` environment variable.
-> - All tokens are automatically redacted across all logs, exception traces, and terminal output.
-
-### 4. Build Sandbox Docker Image (Optional)
-
-The sandboxed execution runner uses a Docker image with Python and pre-installed `pytest` (`code-review-sandbox:3.11`). Build the pinned image from the project's Dockerfile:
+If you plan to use the live Docker sandbox runner, build the pinned Docker image:
 
 ```powershell
 docker build -t code-review-sandbox:3.11 -t python:3.11-slim .
 ```
 
-*Note: If Docker is unavailable or `--no-sandbox` is provided, sandbox execution is safely skipped without pipeline interruption.*
+*Note: If Docker is unavailable or `--no-sandbox` is supplied, the pipeline automatically skips container execution without error.*
 
 ---
 
-## 🚀 Usage Guide
+## 🔐 Environment Configuration
 
-### CLI Flags & Options
+Create a local `.env` file in the project root by copying `.env.example`:
 
-```
-python main.py [target] [options]
-
-Positional Arguments:
-  target                 Path to Python file or directory to review (default: 'sample_project')
-
-Options:
-  -h, --help             Show this help message and exit
-  --pr PR                GitHub PR to review in read-only preview mode (e.g., 'owner/repo#123' or PR URL)
-  --repo REPO            GitHub repository name if --pr is only the PR number (e.g., 'owner/repo')
-  --publish              Publish the review to GitHub PR after interactive human approval
-  --dry-run              Simulate review publishing without performing any write requests
-  --no-ai                Disable AI analysis and use only deterministic Ruff and Bandit scanners
-  --no-sandbox           Disable Docker sandbox execution even when Docker is available
-  --no-debug             Disable the Debugging Agent (no patch proposals)
-  --token TOKEN          GitHub token (DEPRECATED for security: prefer GITHUB_TOKEN or GH_TOKEN env var)
-```
-
-### Example Invocations
-
-#### 1. Local Code Review
 ```powershell
-# Full pipeline with AI review, Docker sandbox, and Debugging Agent
+Copy-Item .env.example .env
+```
+
+Edit `.env` using placeholder values. **Never commit real API keys or tokens to version control.**
+
+```env
+# =============================================================================
+# Multi-Agent Code Review & Debugging Pipeline - Environment Configuration
+# =============================================================================
+
+# Optional: OpenAI API Key (Required ONLY for AI agent explanations and test/patch synthesis)
+# If omitted or left blank, the pipeline runs in 100% deterministic mode.
+OPENAI_API_KEY=your_openai_api_key_here
+
+# Optional: Custom API Base URL (for Ollama, vLLM, Azure, OpenRouter)
+# OPENAI_BASE_URL=https://api.openai.com/v1
+
+# Optional: Model identifier for review agents (Default: gpt-4o-mini)
+OPENAI_MODEL_NAME=gpt-4o-mini
+
+# Optional: Request timeout in seconds for LLM calls (Default: 30)
+LLM_TIMEOUT=30
+
+# Optional: GitHub Personal Access Token (Required for PR review and publishing)
+# Used to avoid public API rate limits when downloading PR diffs and metadata.
+GITHUB_TOKEN=your_github_token_here
+```
+
+### Credential Resolution & Hygiene
+
+- **GitHub Token Precedence**:
+  1. `GITHUB_TOKEN` environment variable *(Recommended)*.
+  2. `GH_TOKEN` environment variable.
+  3. `GITHUB_TOKEN_FILE` environment variable (file path pointing to secret).
+  4. `--token <TOKEN>` CLI parameter *(Deprecated for security: CLI arguments are visible in process tables)*.
+- **Automatic Token Redaction**: All recognized tokens and secrets are registered with `register_sensitive_token()` and globally scrubbed (`***REDACTED***`) across all logs, exception traces, terminal messages, and GitHub Actions step summaries.
+- **Deterministic Fallback**: If `OPENAI_API_KEY` is not set, the pipeline automatically detects the absence of credentials, prints `[Notice] LLM credentials not configured. Running in deterministic mode.`, and executes full Ruff, Bandit, and Semantic Analyzer scans without failing.
+
+---
+
+## 🚀 Running the Project Locally
+
+### CLI Synopsis
+
+```powershell
+python main.py [target] [options]
+```
+
+| Argument / Flag | Description |
+| :--- | :--- |
+| `target` | Path to Python file or directory to review (default: `sample_project`). |
+| `--pr PR` | GitHub PR to review in read-only preview mode (e.g., `owner/repo#123` or URL). |
+| `--repo REPO` | GitHub repository name if `--pr` contains only the PR number. |
+| `--publish` | Publish review to GitHub PR after interactive human approval. |
+| `--dry-run` | Simulate review publishing without performing any write requests. |
+| `--no-ai` | Disable AI agents; run only deterministic Ruff, Bandit, and Semantic analyzers. |
+| `--no-sandbox` | Disable Docker sandbox execution even when Docker is available. |
+| `--no-debug` | Disable the Debugging Agent (skip patch generation). |
+
+---
+
+### Local Code Review Examples
+
+#### 1. Full Multi-Agent Review (Requires `OPENAI_API_KEY`)
+Executes static analysis, semantic analysis, AI explanations, test generation, Docker sandbox execution, and patch synthesis:
+```powershell
 python main.py sample_project/app.py
+```
 
-# Deterministic local scan (no LLM, no external calls)
+#### 2. Deterministic Local Scan (Offline / No LLM Required)
+Executes Ruff, Bandit, and the AST Semantic Analyzer with zero network calls and zero cost:
+```powershell
 python main.py sample_project/app.py --no-ai
+```
 
-# Local review skipping Docker sandbox and patch generation
+#### 3. Local Review Skipping Docker Sandbox
+Runs static analysis and AI explanations without invoking Docker containers:
+```powershell
 python main.py sample_project/app.py --no-sandbox --no-debug
 ```
 
-#### 2. GitHub Pull Request Review (Read-Only Preview)
+---
+
+### Running the Evaluation Framework & Benchmark
+
+The evaluation framework evaluates the pipeline against 34 curated benchmark test cases:
+
 ```powershell
-# Analyze a PR using full owner/repo#number format
+# Run the complete benchmark suite in deterministic mode
+python -m benchmark.runner
+
+# Run evaluation suite and export a standalone JSON report
+python -m benchmark.runner --suite evaluation --eval-report evaluation_report.json
+
+# Run only a specific category (bugs, security, clean, safe_edges, error_handling, multi)
+python -m benchmark.runner --category bugs
+
+# Run a single benchmark case
+python -m benchmark.runner --case bug_01
+
+# Run with finding deduplication enabled
+python -m benchmark.runner --dedup
+```
+
+---
+
+## 🐙 GitHub Pull Request Integration
+
+The pipeline supports deep inspection of GitHub pull requests. It downloads PR diffs and changed files into an ephemeral workspace, runs analysis, maps findings directly to changed lines, and generates executive summaries.
+
+### Local PR Review Examples
+
+#### 1. Read-Only PR Preview
+Fetches PR metadata and diff, analyzes changed lines, and prints the proposed review to the console without writing to GitHub:
+```powershell
+# Using owner/repo#number format
 python main.py --pr octocat/Hello-World#42
 
-# Analyze a PR using separate --pr and --repo flags
+# Using separate --pr and --repo flags
 python main.py --pr 42 --repo octocat/Hello-World
 
-# Review PR using a direct URL
+# Using direct PR URL
 python main.py --pr https://github.com/octocat/Hello-World/pull/42
+```
 
-# Deterministic PR review (Ruff & Bandit on changed files, zero LLM calls)
+#### 2. Deterministic PR Review (Zero LLM Costs)
+Runs static and semantic analysis on changed PR files without making AI calls:
+```powershell
 python main.py --pr octocat/Hello-World#42 --no-ai
 ```
 
 #### 3. Safe Dry-Run Publishing Simulation
+Simulates the publishing workflow, validates diff line anchors, formats the summary and inline comments in memory, and prints the payload without sending write requests:
 ```powershell
-# Previews complete review summary and inline comments without making any write requests
 python main.py --pr octocat/Hello-World#42 --publish --dry-run
 ```
 
-#### 4. Controlled Review Publication (Human Approval Gate)
+#### 4. Controlled Review Publication (Human-in-the-Loop)
+Analyzes the PR, prompts the human reviewer for interactive confirmation, and submits the review upon approval:
 ```powershell
-# Runs PR analysis, verifies plan-hash integrity, and prompts for interactive approval
 python main.py --pr octocat/Hello-World#42 --publish
 ```
 
-### Running the Test Suite
-
-All unit and workflow tests execute completely offline with mocked runners and zero external API or network calls:
-
-```powershell
-pytest -v
-```
-
-**Verified Test Suite Status:**
-- **838 passed, 5 skipped** (integration tests requiring opt-in live Docker daemon)
-
-To optionally run the live Docker integration tests when Docker is active:
-
-```powershell
-$env:SANDBOX_INTEGRATION_TESTS="1"
-pytest tests/test_sandbox_integration.py -v
-```
-
 ---
 
-## 🔍 How It Works
+### GitHub Actions CI Workflow
 
-### 1. Static Analysis (Milestone 1)
-- **Ruff**: Inspects Python code for PEP 8 compliance, unused imports (`F401`), unused variables (`F841`), and code quality issues.
-- **Bandit**: Analyzes Python AST for security vulnerabilities (`B101` assert usage, `B105` hardcoded passwords, `B311` weak PRNGs).
-
-### 2. Multi-Agent Review Workflow (Milestone 2)
-- StateGraph runs **LinterAgent** and **SecurityAgent** concurrently using fan-out edges from `START`.
-- Both agents independently evaluate findings and provide structured explanations, severity assessments, and threat-modeling context.
-- Agents include explicit advisory disclaimers noting that AI explanations represent hypotheses and that static scans do not guarantee runtime security.
-
-### 3. Test Validation & Storage (Milestone 3)
-- **TestWriterAgent** generates targeted pytest unit tests for functions under review.
-- **`test_validator.py`** inspects the test content:
-  - Verifies presence of `test_` functions or `Test` classes.
-  - Verifies syntactical validity via `ast.parse`.
-  - Rejects dangerous calls (`subprocess`, `socket`, `ctypes`, `os.system`, `exec`, `eval`, arbitrary file writes).
-  - Enforces size limits (≤ 128 KB).
-- Approved tests are written to a dedicated temporary test workspace, never into the primary project folder.
-
-### 4. Docker Sandbox Execution (Milestone 3)
-- **`sandbox_runner.py`** executes tests inside a hardened container:
-  - Read-only source mounting (`:ro`)
-  - Direct argument execution without shell interpretation
-  - Strict resource constraints (`--memory 512m`, `--cpus 1.0`, `--pids-limit 100`)
-  - Network isolation (`--network none`)
-  - Bounded execution timeout with guaranteed container termination on timeout or failure.
-- Returns structured results with return codes, pytest stdout/stderr, duration, and status.
-
-### 5. Debugging Agent & Verified Patch Loop (Milestone 3)
-- If sandbox tests fail, **DebuggingAgent** analyzes the source code, static findings, and pytest failure logs.
-- Synthesizes a minimal unified diff patch.
-- Verifies the patch against a disposable copy of the target in a scratch sandbox before presenting it to the user.
-- Enforces bounded retry limits to prevent infinite loops.
-- Automatically cleans up disposable directories on success, diff mismatch, and all exception paths.
-
-### 6. GitHub PR Review & Controlled Publication (Milestone 4)
-- **Read-Only Inspection**: Fetches PR metadata, commit status, and unified diffs via `github_client.py`.
-- **Hunk & Line Mapping**: `parse_diff_hunks` maps changes to ensure that inline comments attach only to valid newly added or modified lines on the head commit.
-- **PR Workspace Isolation**: `pr_workspace.py` manages an ephemeral workspace for running linters, tests, and patch checks on PR changes.
-- **Action Planning**: The orchestrator produces a structured review action plan with overall verdict (`COMMENT`, `APPROVE`, or `REQUEST_CHANGES`), top-level summary, and file-anchored inline suggestions.
-- **Safe Dry-Run Simulation (`--dry-run`)**: Fully prepares and formats the review payload, displaying all top-level commentary and inline line comments without sending HTTP write requests.
-- **Cryptographic Approval Gate (`--publish`)**:
-  - Calculates a SHA-256 plan hash over the finalized review payload.
-  - Re-verifies PR head-SHA to ensure the PR branch was not modified during analysis (preventing stale reviews).
-  - Prompts the human reviewer with an interactive approval gate requiring explicit confirmation (`yes`).
-  - Publishes the review in a single atomic submission via GitHub REST API upon approval.
-
-### 7. GitHub Actions CI Integration (Milestone 5)
-- **Automated Trigger**: Configured in [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml), triggering on pull request `opened`, `synchronize`, and `reopened` events.
-- **Least-Privilege Permissions**: Declares strict read-only permissions (`contents: read`, `pull-requests: read`) with zero write access.
-- **Secret-Free Workflow**: No custom repository secrets or `OPENAI_API_KEY` are provided to the workflow. The ephemeral `GITHUB_TOKEN` is available to the workflow step for API rate limits when downloading diffs, but is strictly restricted by the declared read-only permissions.
-- **Rejection of `pull_request_target`**: The workflow strictly uses standard `pull_request` triggers and intentionally avoids `pull_request_target` to prevent privileged execution against untrusted PR code.
-- **Trust Boundary & Runner Isolation**: The runner checks out the repository's trusted base branch (`ref: ${{ github.base_ref || github.event.repository.default_branch }}`) so dependencies (`requirements.txt`) and pipeline logic (`main.py`) are trusted maintainer code. Untrusted PR code is downloaded into an isolated temporary workspace for static analysis and is never executed on the runner host (`--no-sandbox`).
-- **Passive Data Inspection**: PR source files are treated strictly as read-only input. They are never imported (`import`/`importlib`), never executed (`python`/`pytest`), and only inspected via static AST scanners.
-- **Credential Hygiene**: `persist-credentials: false` ensures `actions/checkout` does not leave the token stored in `.git/config`. Automatic token redaction scrubs recognized tokens and credentials across GitHubClient logs, exceptions, CLI error output, and GitHub Actions step summaries.
-- **Step Summary Markdown Defenses**: Step summaries sanitize all PR-derived table cells (escaping pipes `\|`, backticks, HTML tags, and markdown image/link embeds) to prevent formatting corruption, tracking pixel leakage, or phishing injection.
-- **Approval Gate Preservation**: Review publishing is strictly disabled in non-interactive CI environments (`NonInteractivePublishingDisabledError` fails closed). Live publication requires explicit interactive human confirmation via the local CLI.
-
----
-
-## ⚙️ GitHub Actions CI Integration (Milestone 5)
-
-The pipeline includes an automated GitHub Actions workflow configured in [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml).
-
-### Workflow Configuration
+The repository includes an automated CI workflow in [`.github/workflows/pr-review.yml`](.github/workflows/pr-review.yml) that executes on every pull request `opened`, `synchronize`, or `reopened`.
 
 ```yaml
 name: Multi-Agent PR Review
@@ -392,8 +490,7 @@ concurrency:
   group: pr-review-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-# Strictly enforce least-privilege permissions: read-only access to repository contents and PRs.
-# Never grant write permissions (contents: write or pull-requests: write) in pull_request workflows.
+# Strictly enforce least-privilege permissions: read-only access.
 permissions:
   contents: read
   pull-requests: read
@@ -404,10 +501,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Trust boundary defense: Check out the trusted repository base branch (NOT untrusted PR code).
-      # The review pipeline fetches PR diff and source files via GitHub API into an isolated
-      # ephemeral workspace for static inspection, preventing malicious PR code or requirements.txt
-      # from executing on the runner or accessing repository secrets.
+      # Trust boundary: Check out the trusted repository base branch (NOT untrusted PR code).
       - name: Checkout Trusted Repository Base
         uses: actions/checkout@v4
         with:
@@ -420,17 +514,14 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # Dependencies are installed strictly from the trusted base branch requirements.txt.
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Executes the review pipeline from the trusted base repository.
-      # PR code is inspected as passive data in an isolated workspace; dynamic execution is skipped (--no-sandbox).
-      # No custom repository secrets or OPENAI_API_KEY are provided to this workflow.
-      # GITHUB_TOKEN is available to the workflow step, restricted to the declared read-only permissions.
-      # PR context values are mapped via environment variables to eliminate shell script injection risks.
+      # Executes the review pipeline in read-only preview mode.
+      # PR code is inspected as passive data in an isolated workspace. Dynamic execution is skipped (--no-sandbox).
+      # No write tokens or custom secrets are exposed.
       - name: Run Multi-Agent PR Review (Read-Only Preview)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -440,54 +531,110 @@ jobs:
           python main.py --pr "$PR_NUMBER" --repo "$REPO_NAME" --no-sandbox
 ```
 
-### Setup & Credentials
+#### CI Security & Trust Boundary Highlights:
+- **Least-Privilege**: Permissions are restricted to `contents: read` and `pull-requests: read`. Zero write permissions are granted.
+- **No Secrets Exposed**: `OPENAI_API_KEY` is omitted from the CI workflow. CI reviews execute deterministically using Ruff, Bandit, and the Semantic Analyzer.
+- **Untrusted Code Isolation**: The runner checks out the trusted base branch to run pipeline logic; untrusted PR code is downloaded into an isolated ephemeral directory and inspected strictly as passive text data. Untrusted code is never imported or executed on the runner host.
+- **Sanitized Step Summary**: Output markdown escapes table pipes, backticks, HTML tags, and markdown image embeds to prevent formatting injection or tracking pixels.
 
-1. **Automatic GitHub Token**: GitHub Actions automatically injects `secrets.GITHUB_TOKEN`. Used with least privilege (`contents: read`, `pull-requests: read`) for API rate limits when fetching PR diffs.
-2. **Secret-Free CI Security**: `OPENAI_API_KEY` is deliberately omitted from CI pull request workflows to prevent PR-controlled workflow definitions from accessing secrets. CI reviews run deterministically with Ruff and Bandit. AI analysis and fix proposals remain available for maintainers running the review locally.
+---
 
-### Viewing Run Results & Step Summaries
+## 🔒 Review Modes: Read-Only Preview vs. Controlled Publishing
 
-1. Navigate to the **Actions** tab in your GitHub repository.
-2. Select the **Multi-Agent PR Review** workflow run for your pull request.
-3. Open the job to view the rendered **Step Summary**, which provides:
-   - PR number and repository link
-   - Analyzed commit head SHA
-   - Review verdict badge (`COMMENT`, `REQUEST_CHANGES`, `APPROVE`)
-   - Executive findings overview
-   - Proposed inline comments table with line numbers and preview snippets
-   - Advisory notice disclaimer
+| Dimension | Read-Only Preview Mode | Dry-Run Publishing Mode | Controlled Publishing Mode |
+| :--- | :--- | :--- | :--- |
+| **CLI Invocation** | `python main.py --pr <TARGET>` | `python main.py --pr <TARGET> --publish --dry-run` | `python main.py --pr <TARGET> --publish` |
+| **Target Environment** | CI Pipelines & Local Inspection | Local Terminal | Local Interactive Terminal Only |
+| **GitHub REST Writes** | **None** (Zero write calls) | **None** (Zero write calls) | **Atomic Review Submission** |
+| **Human Gate** | Skipped | Skipped | **Required** (Interactive `yes`) |
+| **Plan Hash Check** | Skipped | Calculated & displayed | Verified (SHA-256 + Head-SHA) |
+| **Head-SHA Staleness Check**| Skipped | Verified in memory | Verified prior to REST submission |
+| **Non-Interactive CI Safe** | **Yes** (Fails open, exit 0) | **Yes** (Safe simulation) | **No** (Fails closed, exit 2) |
+| **Primary Output** | Console / CI Step Summary | Console preview of payload | Published PR Review + Inline Comments |
 
-### Troubleshooting & Common Scenarios
+### Exit Codes & CI Semantics
 
-- **Exit Codes & CI Status:**
-  - `0`: Read-only PR review completed successfully. The review analysis finished cleanly and published its findings, verdict, and proposed inline comments to the GitHub Actions Step Summary and console output (even when code issues or a `REQUEST_CHANGES` verdict are reported). In local single-target analysis (`python main.py <target>`), exit code `0` indicates no issues were detected.
-  - `1`: In local deterministic mode (`python main.py <target>`), indicates lint or security issues were detected. In controlled publishing mode (`--publish`), indicates the human reviewer cancelled publication, changes were requested (`REQUEST_CHANGES`), or proposed review comments exist.
-  - `2`: Genuine execution or workflow failure (e.g. fatal tool crash, invalid repository/PR target, GitHub API network/auth error, or publishing rejected in a non-interactive CI environment).
-- **Forked Pull Requests:**
-  GitHub Actions omits repository secrets on forked PRs for security. The pipeline detects this automatically, reports `[Notice] LLM credentials not configured. Running PR review in deterministic mode.`, and proceeds with Ruff & Bandit static scans without failing.
-- **Publishing Reviews:**
-  Publishing reviews with inline comments to GitHub requires human confirmation and cannot be executed automatically by CI. Maintainers can review proposed actions locally and publish with human authorization:
+- **`Exit Code 0`**: Completed read-only review. The analysis completed cleanly, and findings/verdicts were written to console and GitHub Actions Step Summary. Exit code `0` is returned even when findings or a `REQUEST_CHANGES` verdict exist so CI checks pass while reporting issues in the summary. For local single-target analysis (`python main.py <target>`), exit code `0` indicates no issues were detected.
+- **`Exit Code 1`**: In local single-target scanning (`python main.py <target>`), indicates lint or security issues were detected. In controlled publishing mode (`--publish`), indicates the human reviewer cancelled publication or requested changes.
+- **`Exit Code 2`**: Tool failure or execution error (e.g., fatal tool crash, invalid repository/PR target, network failure, or attempting to publish in a non-interactive CI environment).
+
+---
+
+## 📊 Testing & Evaluation Results
+
+### 1. Test Suite Verification
+The complete test suite runs completely offline with mocked runners, zero external API calls, and zero network access:
+
+```powershell
+pytest -q
+```
+
+- **Test Suite Results**: **984 passed, 6 skipped** in 169s.
+  - The 6 skipped tests are integration tests requiring an opt-in live Docker daemon (`$env:SANDBOX_INTEGRATION_TESTS="1"`).
+- **Code Quality / Linter**:
   ```powershell
-  python main.py --pr owner/repo#123 --publish
+  ruff check .
+  # All checks passed!
   ```
-  *(replace `owner/repo#123` with your target repository and pull request number)*
 
 ---
 
-## 🧪 Sample Demonstrations
+### 2. Empirical Benchmark Evaluation (Stage 7.1)
+The pipeline was evaluated against the curated 34-case benchmark dataset (`benchmark/eval_manifest.json`) spanning common bugs, security flaws, multi-issue files, error-handling edges, and clean code:
 
-The file [`sample_project/app.py`](sample_project/app.py) contains deliberate demonstrations:
-- **Ruff Issues**: Unused imports (`os`, `math`), unused variables (`unused_debug_tag`), unsorted imports.
-- **Bandit Warnings**: Use of `assert` in business logic (`B101`), hardcoded token string (`B105`), weak pseudo-random generator for tokens (`B311`).
+```powershell
+python -m benchmark.runner --eval-report evaluation_report.json
+```
+
+#### Overall Benchmark Metrics
+
+| Metric | Result | Notes |
+| :--- | :--- | :--- |
+| **Total Test Cases** | **34** | 22 defect cases, 12 clean / safe-edge cases |
+| **Cases Passed** | **32 / 34** | 94.1% case pass rate |
+| **Expected Findings** | **32** | Labeled ground truth |
+| **Actual Findings Detected** | **34** | Post-deduplication |
+| **True Positives (TP)** | **32** | Successfully matched against ground truth |
+| **False Positives (FP)** | **2** | 2 benign cosmetic warnings in complex defect cases |
+| **False Negatives (FN)** | **0** | **100% recall** across all expected defects |
+| **Defect Precision** | **94.12%** | $\frac{TP}{TP + FP} = \frac{32}{34}$ |
+| **Defect Recall** | **100.00%** | $\frac{TP}{TP + FN} = \frac{32}{32}$ |
+| **Defect F1 Score** | **96.97%** | $2 \times \frac{P \times R}{P + R} = 0.9697$ |
+| **Clean Case False Alarm Rate**| **0.00%** | 0 false positives across all 12 clean cases |
+
+#### Detector Performance Breakdown
+
+| Detector Engine | Expected | Actual | True Positives | False Positives | False Negatives | Precision | Recall | F1 Score |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **AST Semantic Analyzer** | 11 | 11 | 11 | 0 | 0 | **100.0%** | **100.0%** | **1.0000** |
+| **Bandit Security Scanner** | 11 | 12 | 11 | 1 | 0 | **91.67%** | **100.0%** | **0.9565** |
+| **Ruff Linter** | 10 | 11 | 10 | 1 | 0 | **90.91%** | **100.0%** | **0.9524** |
 
 ---
 
-## 🗺 Roadmap & Completed Milestones
+## 🚧 Limitations & Future Enhancements
 
-- [x] **Milestone 1:** Automated Local Static Analysis & Security Review Pipeline (Ruff + Bandit)
-- [x] **Milestone 2:** Multi-Agent AI Review using LangGraph (Linter, Security, Test-Writer Agents)
-- [x] **Milestone 3:** Test Generation, Docker Sandboxed Execution & Verified Fix Proposals
-- [x] **Milestone 4:** GitHub Integration (PR review automation, inline GitHub suggestions, controlled publishing)
-- [x] **Milestone 5:** GitHub Actions Integration (automated CI review, least-privilege permissions, step summaries)
+### Known Limitations
+1. **LLM Credentials Required for AI Features**: AI explanations, test generation, and automated patch synthesis require a configured `OPENAI_API_KEY`. Without LLM credentials, the pipeline runs strictly in deterministic mode.
+2. **Docker Requirement for Sandbox**: Dynamic test execution and patch verification require an active Docker daemon. If Docker is unavailable, the pipeline falls back cleanly to static and semantic analysis.
+3. **Intraprocedural AST Analysis**: The Semantic Analyzer operates intraprocedurally within individual files and functions. It does not perform full interprocedural taint analysis across module boundaries or resolve dynamic runtime metaprogramming (`getattr`, `eval`, runtime monkeypatching).
+4. **Read-Only CI Design**: GitHub Actions workflows run in read-only preview mode and cannot automatically submit PR review comments. Live review publication requires interactive human execution via the CLI.
 
-<!-- GitHub Actions workflow test -->
+### Future Roadmap
+- [ ] **Multi-Language Support**: Extend static and semantic analysis to TypeScript/JavaScript, Go, and Rust.
+- [ ] **Interprocedural Taint Analysis**: Trace tainted user inputs across function calls and module boundaries for advanced vulnerability detection (SQLi, SSRF, Command Injection).
+- [ ] **Interactive Web / TUI Dashboard**: Visual terminal UI for browsing findings, inspecting diffs, and approving patch proposals with one click.
+- [ ] **Safe Automated Auto-Fixes**: Automatically apply safe, deterministic Ruff autofixes (`--fix`) during PR reviews.
+- [ ] **GitHub App Bot Integration**: Support authorized bot-based webhook execution with automated check-run statuses and inline suggestion threads.
+
+---
+
+## 🗺 Milestone Progression
+
+- [x] **Milestone 1**: Automated Local Static Analysis & Security Pipeline (Ruff + Bandit, subprocess isolation, injection hardening).
+- [x] **Milestone 2**: Multi-Agent AI Review using LangGraph (Linter, Security, and Test-Writer agents, fan-out/fan-in graph).
+- [x] **Milestone 3**: Test Safety Validation, Docker Sandboxed Execution, and Verified Patch Loop (Debugging Agent, AST validator, scratch sandbox).
+- [x] **Milestone 4**: GitHub Integration & Controlled Publishing (PR diff parsing, line-to-hunk mapping, SHA-256 plan hash, human approval gate).
+- [x] **Milestone 5**: GitHub Actions CI Integration (least-privilege permissions, read-only preview, sanitized step summaries, secret-free workflow).
+- [x] **Milestone 6**: Review Quality & Finding Prioritization (Critical/High/Medium/Low tiers, confidence scoring, 4-part explanations, cross-tool deduplication).
+- [x] **Milestone 7 (Stage 7.1)**: Real-World Evaluation Framework (34-case benchmark dataset, ground-truth matcher, TP/FP/FN metrics, 96.97% F1 score).

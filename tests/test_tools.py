@@ -31,6 +31,7 @@ from main import run_pipeline
 from tools import (
     Issue,
     ToolResult,
+    is_trusted_config_path,
     parse_bandit_json,
     parse_ruff_json,
     resolve_tool_command,
@@ -558,3 +559,173 @@ class TestPipelineOrchestration:
     def test_pipeline_nonexistent_target_returns_two(self):
         exit_code = run_pipeline("this/does/not/exist_at_all.py")
         assert exit_code == 2
+
+
+class TestScannerConfigurationHardening:
+    """Tests verifying that untrusted repo files cannot hijack scanner configurations (SEC-01 & SEC-02)."""
+
+    def test_is_trusted_config_path_validation(self, tmp_path):
+        """Validate boundary checks for configuration file paths."""
+        trusted_root = tmp_path / "maintainer_pipeline"
+        trusted_root.mkdir()
+        trusted_file = trusted_root / "bandit.yaml"
+        trusted_file.write_text("skips: []\n", encoding="utf-8")
+
+        untrusted_root = tmp_path / "pr_checkout"
+        untrusted_root.mkdir()
+        untrusted_file = untrusted_root / "bandit.yaml"
+        untrusted_file.write_text("skips: ['B101']\n", encoding="utf-8")
+
+        # None and empty candidates
+        assert is_trusted_config_path(None, [str(trusted_root)]) is False
+        assert is_trusted_config_path("", [str(trusted_root)]) is False
+
+        # Non-existent file
+        assert is_trusted_config_path(str(trusted_root / "missing.yaml"), [str(trusted_root)]) is False
+
+        # Untrusted location outside root
+        assert is_trusted_config_path(str(untrusted_file), [str(trusted_root)]) is False
+
+        # Valid trusted location
+        assert is_trusted_config_path(str(trusted_file), [str(trusted_root)]) is True
+
+    def test_run_bandit_ignores_malicious_config_in_target_dir(self, tmp_path):
+        """Untrusted bandit.yaml in target_path must NOT be discovered or suppress findings."""
+        target_dir = tmp_path / "untrusted_repo"
+        target_dir.mkdir()
+        # Malicious config trying to skip B307 (eval_used)
+        malicious_cfg = target_dir / "bandit.yaml"
+        malicious_cfg.write_text("skips: ['B307']\n", encoding="utf-8")
+        malicious_bandit = target_dir / ".bandit"
+        malicious_bandit.write_text("skips: ['B307']\n", encoding="utf-8")
+
+        # Vulnerable production file
+        vuln_file = target_dir / "eval_service.py"
+        vuln_file.write_text("def run_code(code):\n    return eval(code)\n", encoding="utf-8")
+
+        result = run_bandit(str(target_dir))
+        assert result.success is True
+        assert result.issues_found is True
+        # B307 must still be reported despite malicious bandit.yaml in target directory
+        b307_issues = [i for i in result.issues if i.code == "B307"]
+        assert len(b307_issues) >= 1
+
+    def test_run_bandit_ignores_malicious_config_in_cwd(self, tmp_path, monkeypatch):
+        """Untrusted bandit.yaml in current working directory must NOT suppress findings."""
+        untrusted_cwd = tmp_path / "untrusted_cwd"
+        untrusted_cwd.mkdir()
+        malicious_cfg = untrusted_cwd / "bandit.yaml"
+        malicious_cfg.write_text("skips: ['B307']\n", encoding="utf-8")
+
+        target_dir = tmp_path / "clean_target"
+        target_dir.mkdir()
+        vuln_file = target_dir / "service.py"
+        vuln_file.write_text("def run(s):\n    return eval(s)\n", encoding="utf-8")
+
+        # Switch cwd to untrusted directory during scan
+        monkeypatch.chdir(untrusted_cwd)
+
+        result = run_bandit(str(target_dir))
+        assert result.success is True
+        assert result.issues_found is True
+        b307_issues = [i for i in result.issues if i.code == "B307"]
+        assert len(b307_issues) >= 1
+
+    def test_run_bandit_rejects_explicit_untrusted_config_path(self, tmp_path):
+        """Explicit config_path pointing outside trusted directories must be rejected and not used."""
+        untrusted_dir = tmp_path / "attacker_controlled"
+        untrusted_dir.mkdir()
+        malicious_cfg = untrusted_dir / "malicious_bandit.yaml"
+        malicious_cfg.write_text("skips: ['B307']\n", encoding="utf-8")
+
+        target_dir = tmp_path / "target_src"
+        target_dir.mkdir()
+        vuln_file = target_dir / "app.py"
+        vuln_file.write_text("def test(x):\n    return eval(x)\n", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout='{"results": []}', stderr="")
+            # Pass untrusted config_path
+            run_bandit(str(target_dir), config_path=str(malicious_cfg))
+
+            mock_run.assert_called_once()
+            cmd_args = mock_run.call_args[0][0]
+            # Ensure the untrusted malicious_bandit.yaml was NOT passed via -c
+            assert str(malicious_cfg) not in cmd_args
+
+    def test_run_bandit_accepts_valid_trusted_config_path(self, tmp_path):
+        """Explicit config_path within trusted boundary must be accepted."""
+        trusted_dir = tmp_path / "pipeline_trusted"
+        trusted_dir.mkdir()
+        trusted_cfg = trusted_dir / "trusted_bandit.yaml"
+        trusted_cfg.write_text("skips: []\n", encoding="utf-8")
+
+        target_dir = tmp_path / "target_src"
+        target_dir.mkdir()
+        vuln_file = target_dir / "app.py"
+        vuln_file.write_text("x = 1\n", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='{"results": []}', stderr="")
+            run_bandit(str(target_dir), config_path=str(trusted_cfg), trusted_dirs=[str(trusted_dir)])
+
+            mock_run.assert_called_once()
+            cmd_args = mock_run.call_args[0][0]
+            assert "-c" in cmd_args
+            c_idx = cmd_args.index("-c")
+            assert cmd_args[c_idx + 1] == str(trusted_cfg.resolve())
+
+    def test_run_bandit_normal_findings_clean_and_vulnerable(self, tmp_path):
+        """Verify normal Bandit findings for both clean and vulnerable Python files."""
+        # Clean file
+        clean_file = tmp_path / "clean.py"
+        clean_file.write_text("def add(a: int, b: int) -> int:\n    return a + b\n", encoding="utf-8")
+        clean_res = run_bandit(str(clean_file))
+        assert clean_res.success is True
+        assert clean_res.issues_found is False
+        assert len(clean_res.issues) == 0
+
+        # Vulnerable file (eval)
+        vuln_file = tmp_path / "vuln.py"
+        vuln_file.write_text("def run(cmd: str):\n    return eval(cmd)\n", encoding="utf-8")
+        vuln_res = run_bandit(str(vuln_file))
+        assert vuln_res.success is True
+        assert vuln_res.issues_found is True
+        assert any(i.code == "B307" for i in vuln_res.issues)
+
+    def test_run_ruff_ignores_malicious_config_with_isolated(self, tmp_path):
+        """Untrusted pyproject.toml, ruff.toml, and .ruff.toml in target must NOT suppress rules."""
+        target_dir = tmp_path / "untrusted_repo"
+        target_dir.mkdir()
+        # Malicious config attempting to ignore all linter checks
+        pyproject = target_dir / "pyproject.toml"
+        pyproject.write_text('[tool.ruff.lint]\nignore = ["ALL"]\nselect = []\n', encoding="utf-8")
+        ruff_toml = target_dir / "ruff.toml"
+        ruff_toml.write_text('lint.ignore = ["ALL"]\nlint.select = []\n', encoding="utf-8")
+        dot_ruff = target_dir / ".ruff.toml"
+        dot_ruff.write_text('lint.ignore = ["ALL"]\nlint.select = []\n', encoding="utf-8")
+
+        # Source file with unused import (F401) and undefined variable (F821)
+        test_file = target_dir / "service.py"
+        test_file.write_text("import sys\nimport os\n\ndef run():\n    return undefined_var\n", encoding="utf-8")
+
+        result = run_ruff(str(test_file))
+        assert result.success is True
+        assert result.issues_found is True
+        codes = {i.code for i in result.issues}
+        assert "F401" in codes
+        assert "F821" in codes
+
+    def test_run_ruff_preserves_rules_with_explicit_select(self, tmp_path):
+        """Explicit select_rules CLI argument must be forwarded to ensure required rules are enforced."""
+        target_file = tmp_path / "test_module.py"
+        target_file.write_text("import sys\n", encoding="utf-8")
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="[]", stderr="")
+            run_ruff(str(target_file), select_rules=["E", "F", "B"])
+
+            mock_run.assert_called_once()
+            cmd_args = mock_run.call_args[0][0]
+            assert "--isolated" in cmd_args
+            assert "--select=E,F,B" in cmd_args

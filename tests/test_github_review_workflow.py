@@ -46,6 +46,7 @@ from github_review_workflow import (
     PRReviewInputError,
     PRReviewResult,
     build_inline_comments,
+    deduplicate_findings,
     determine_review_verdict,
     generate_review_summary,
     has_fatal_analysis_error,
@@ -1640,3 +1641,253 @@ class TestZeroWriteRequestsPrePublication:
         mock_client.put.assert_not_called()
         mock_client.patch.assert_not_called()
         mock_client.delete.assert_not_called()
+
+
+# ============================================================================
+# 11. Findings Count Consistency & Deduplication Invariant Tests
+# ============================================================================
+
+
+class TestFindingsCountConsistencyAndDeduplication:
+    """
+    Verifies that the review report and workflow maintain:
+      distinct_findings == inline_comments + unmapped_findings
+    and properly distinguish raw scanner findings, consolidated duplicates,
+    inline comments, and unmapped findings.
+    """
+
+    def test_count_consistency_invariant_exact_match(self, mock_pr_metadata):
+        unmapped = [
+            {"code": "BIN01", "file_path": "logo.png", "line": None, "severity": "LOW"},
+            {"code": "E501", "file_path": "old.py", "line": 40, "severity": "MEDIUM"},
+        ]
+        distinct = [
+            {"code": "F401", "file_path": "app.py", "line": 2, "severity": "HIGH"},
+            {"code": "BIN01", "file_path": "logo.png", "line": None, "severity": "LOW"},
+            {"code": "E501", "file_path": "old.py", "line": 40, "severity": "MEDIUM"},
+        ]
+        summary = generate_review_summary(
+            meta=mock_pr_metadata,
+            verdict="COMMENT",
+            total_issues=3,
+            inline_comments_count=1,
+            unmapped_issues_count=2,
+            workflow_state={},
+            changed_files=["app.py"],
+            unmapped_issues=unmapped,
+            raw_issues_count=5,
+            duplicate_issues_count=2,
+            distinct_issues=distinct,
+        )
+
+        assert "- **Total distinct findings:** 3" in summary
+        assert "- **Raw scanner findings:** 5" in summary
+        assert "- **Duplicate findings consolidated:** 2" in summary
+        assert "- **Proposed inline comments (anchored in diff):** 1" in summary
+        assert "- **File-level / unmapped findings:** 2" in summary
+        # 1 + 2 == 3
+        assert "- **Findings by Severity:** 0 Critical, 1 High, 1 Medium, 1 Low" in summary
+
+    def test_report_with_zero_findings(self, mock_pr_metadata):
+        summary = generate_review_summary(
+            meta=mock_pr_metadata,
+            verdict="COMMENT",
+            total_issues=0,
+            inline_comments_count=0,
+            unmapped_issues_count=0,
+            workflow_state={},
+            changed_files=["app.py"],
+            unmapped_issues=[],
+            raw_issues_count=0,
+            duplicate_issues_count=0,
+            distinct_issues=[],
+        )
+
+        assert "- **Total distinct findings:** 0" in summary
+        assert "- **Raw scanner findings:** 0" in summary
+        assert "- **Duplicate findings consolidated:** 0" in summary
+        assert "- **Proposed inline comments (anchored in diff):** 0" in summary
+        assert "- **File-level / unmapped findings:** 0" in summary
+        assert "- **Findings by Severity:** 0 Critical, 0 High, 0 Medium, 0 Low" in summary
+
+    def test_duplicate_findings_from_multiple_scanners(self, tmp_path):
+        ws_root = tmp_path / "workspace"
+        ws_root.mkdir()
+        hunk = DiffHunk(
+            header="@@ -1,15 +1,15 @@",
+            old_start=1,
+            old_count=15,
+            new_start=1,
+            new_count=15,
+            section_heading="",
+            lines=[
+                DiffLine(line_type="add", content=f"line_{i}", old_line_number=None, new_line_number=i)
+                for i in range(1, 16)
+            ],
+        )
+        diff_file = DiffFile(
+            old_path="calc.py",
+            new_path="calc.py",
+            status="modified",
+            hunks=[hunk],
+        )
+        diff_map = {"calc.py": diff_file}
+
+        # 5 raw findings: 2 duplicates on line 10, 2 duplicates on line 12, 1 distinct on line 80
+        raw_issues = [
+            {"code": "B101", "file_path": "calc.py", "line": 10, "tool": "bandit", "severity": "LOW", "message": "assert"},
+            {"code": "S101", "file_path": "calc.py", "line": 10, "tool": "ruff", "severity": "MEDIUM", "message": "assert"},
+            {"code": "B307", "file_path": "calc.py", "line": 12, "tool": "bandit", "severity": "HIGH", "message": "eval"},
+            {"code": "S307", "file_path": "calc.py", "line": 12, "tool": "ruff", "severity": "HIGH", "message": "eval"},
+            {"code": "SEM001", "file_path": "calc.py", "line": 80, "tool": "semantic_analyzer", "severity": "HIGH", "message": "div0"},
+        ]
+
+        deduped = deduplicate_findings(raw_issues, workspace_root=ws_root)
+        assert len(deduped) == 3
+
+        comments, unmapped = build_inline_comments(
+            issues=deduped,
+            diff_map=diff_map,
+            workspace_root=ws_root,
+            deduplicate=False,
+        )
+
+        assert len(comments) == 2  # lines 10 and 12 are in diff
+        assert len(unmapped) == 1  # line 80 is outside diff
+        assert len(comments) + len(unmapped) == len(deduped) == 3
+
+    def test_build_inline_comments_deduplication_control(self, tmp_path):
+        ws_root = tmp_path / "workspace"
+        ws_root.mkdir()
+        hunk = DiffHunk(
+            header="@@ -1,15 +1,15 @@",
+            old_start=1,
+            old_count=15,
+            new_start=1,
+            new_count=15,
+            section_heading="",
+            lines=[
+                DiffLine(line_type="add", content=f"line_{i}", old_line_number=None, new_line_number=i)
+                for i in range(1, 16)
+            ],
+        )
+        diff_file = DiffFile(
+            old_path="calc.py",
+            new_path="calc.py",
+            status="modified",
+            hunks=[hunk],
+        )
+        diff_map = {"calc.py": diff_file}
+        # Two duplicate findings on line 10
+        duplicate_issues = [
+            {"code": "B101", "file_path": "calc.py", "line": 10, "tool": "bandit", "severity": "LOW"},
+            {"code": "S101", "file_path": "calc.py", "line": 10, "tool": "ruff", "severity": "MEDIUM"},
+        ]
+
+        # 1. Default invocation deduplicates findings (deduplicate=True by default)
+        with patch("github_review_workflow.deduplicate_findings", wraps=deduplicate_findings) as spy_dedup:
+            comments_def, unmapped_def = build_inline_comments(
+                issues=duplicate_issues,
+                diff_map=diff_map,
+                workspace_root=ws_root,
+            )
+            assert spy_dedup.called, "Default invocation must invoke deduplicate_findings"
+            assert len(comments_def) == 1, "Duplicate findings must be consolidated by default"
+            assert len(unmapped_def) == 0
+
+        # 2. Explicit deduplicate=False does not deduplicate again
+        with patch("github_review_workflow.deduplicate_findings") as mock_dedup:
+            comments_no_dedup, unmapped_no_dedup = build_inline_comments(
+                issues=duplicate_issues,
+                diff_map=diff_map,
+                workspace_root=ws_root,
+                deduplicate=False,
+            )
+            assert not mock_dedup.called, "Explicit deduplicate=False must not call deduplicate_findings"
+            # Without deduplication, both issues are mapped as separate comments
+            assert len(comments_no_dedup) == 2
+            assert len(unmapped_no_dedup) == 0
+
+    def test_end_to_end_workflow_count_consistency_and_invariant(
+        self, mock_pr_metadata, mock_pr_workspace
+    ):
+        mock_client = MagicMock(spec=GitHubClient)
+        mock_client.get_pr_metadata.return_value = mock_pr_metadata
+        mock_client.get_pr_diff.return_value = SAMPLE_DIFF
+
+        # Return overlapping issues from Ruff and Bandit
+        ruff_findings = [
+            Issue(
+                file_path="sample_project/app.py",
+                line=2,
+                column=1,
+                code="S101",
+                message="Use of assert detected",
+                severity="MEDIUM",
+                tool="ruff",
+            ),
+            Issue(
+                file_path="sample_project/app.py",
+                line=999,  # Outside diff hunk -> will be unmapped
+                column=1,
+                code="F841",
+                message="Unused variable x",
+                severity="LOW",
+                tool="ruff",
+            ),
+        ]
+        bandit_findings = [
+            Issue(
+                file_path="sample_project/app.py",
+                line=2,  # Overlaps with S101 -> will be consolidated
+                column=1,
+                code="B101",
+                message="Use of assert detected",
+                severity="LOW",
+                tool="bandit",
+            ),
+        ]
+
+        with patch("github_review_workflow.prepare_pr_workspace", return_value=mock_pr_workspace), \
+             patch("github_review_workflow.run_review_pipeline") as mock_pipeline:
+
+            mock_pipeline.return_value = {
+                "ruff_findings": ruff_findings,
+                "bandit_findings": bandit_findings,
+                "semantic_findings": [],
+                "agent_errors": [],
+                "final_review_report": {},
+                "tool_status": {"ruff": True, "bandit": True, "semantic": True},
+            }
+
+            result = run_pr_review_workflow(
+                repo_or_url="octocat/Hello-World#42",
+                client=mock_client,
+                enable_ai=False,
+                enable_sandbox=False,
+                display_preview=False,
+            )
+
+            # Raw findings: 3 (2 ruff + 1 bandit)
+            # Distinct findings: 2 (line 2 S101/B101 consolidated to 1, line 999 F841)
+            # Duplicate findings: 1
+            # Inline comments: 1 (line 2 is in diff)
+            # Unmapped findings: 1 (line 999 is outside diff)
+            meta = result.action_plan.metadata
+            assert meta["raw_issues_count"] == 3
+            assert meta["distinct_issues_count"] == 2
+            assert meta["duplicate_issues_count"] == 1
+            assert meta["inline_comments_count"] == 1
+            assert meta["unmapped_issues_count"] == 1
+            assert meta["total_issues"] == 2
+
+            # Invariant: distinct_findings == inline_comments + unmapped_findings
+            assert meta["distinct_issues_count"] == meta["inline_comments_count"] + meta["unmapped_issues_count"]
+
+            # Report text assertions
+            summary = result.action_plan.summary
+            assert "- **Total distinct findings:** 2" in summary
+            assert "- **Raw scanner findings:** 3" in summary
+            assert "- **Duplicate findings consolidated:** 1" in summary
+            assert "- **Proposed inline comments (anchored in diff):** 1" in summary
+            assert "- **File-level / unmapped findings:** 1" in summary

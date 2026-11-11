@@ -28,6 +28,9 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+# Maximum allowed size for raw pull request diff downloads (20 MB)
+DEFAULT_MAX_DIFF_BYTES: int = 20 * 1024 * 1024
+
 # Patterns used for credential redaction
 # Registered active tokens across client instances and secure file sources
 _REGISTERED_TOKENS: set[str] = set()
@@ -850,25 +853,83 @@ class GitHubClient:
             raw_data=data,
         )
 
-    def get_pr_diff(self, owner: str, repo: str, pr_number: int) -> str:
+    def get_pr_diff(
+        self,
+        owner: str,
+        repo: str,
+        pr_number: int,
+        max_bytes: int = DEFAULT_MAX_DIFF_BYTES,
+    ) -> str:
         """
         Fetch raw unified diff text for a pull request from GitHub REST API.
+
+        Args:
+            owner: Repository owner.
+            repo: Repository name.
+            pr_number: Pull request number.
+            max_bytes: Maximum allowed diff size in bytes (default: 20 MB).
 
         Raises:
             GitHubAuthError: If authentication fails (401) or credentials invalid.
             GitHubNotFoundError: If repository or PR does not exist (404).
             GitHubRateLimitError: If rate limit is exceeded (403/429).
             GitHubNetworkError: If connection or timeout occurs.
-            GitHubClientError: On other HTTP errors.
+            GitHubClientError: On other HTTP errors or if diff exceeds max_bytes.
         """
         num = self._validate_repo_params(owner, repo, pr_number)
         url = f"{self.base_url}/repos/{owner}/{repo}/pulls/{num}"
         headers = self._get_headers(accept="application/vnd.github.v3.diff")
 
+        resp = None
         try:
             resp = self._session.get(
-                url, headers=headers, timeout=self.timeout, allow_redirects=False
+                url, headers=headers, stream=True, timeout=self.timeout, allow_redirects=False
             )
+            if resp.status_code != 200:
+                self._handle_response_error(resp, owner, repo, num)
+
+            # Stream response content while enforcing max_bytes limit
+            chunks: list[bytes] = []
+            total_bytes = 0
+            if hasattr(resp, "iter_content") and callable(resp.iter_content):
+                for chunk in resp.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            raise GitHubClientError(
+                                f"PR diff exceeded maximum allowed size of {max_bytes} bytes "
+                                f"for {owner}/{repo} PR #{num}.",
+                                token=self._token,
+                            )
+                        chunks.append(chunk)
+
+            # Safely bounded fallback only for mock responses or non-streaming responses where iter_content was not configured
+            if not chunks and hasattr(resp, "text") and isinstance(resp.text, str) and resp.text:
+                raw_text = resp.text
+                text_bytes = raw_text.encode("utf-8", errors="replace")
+                if len(text_bytes) > max_bytes:
+                    raise GitHubClientError(
+                        f"PR diff exceeded maximum allowed size of {max_bytes} bytes "
+                        f"for {owner}/{repo} PR #{num}.",
+                        token=self._token,
+                    )
+                return raw_text
+
+            diff_bytes = b"".join(chunks)
+            encoding = getattr(resp, "encoding", None) or "utf-8"
+            try:
+                return diff_bytes.decode(encoding)
+            except (UnicodeDecodeError, LookupError):
+                return diff_bytes.decode("utf-8", errors="replace")
+
+        except (
+            GitHubClientError,
+            GitHubAuthError,
+            GitHubNotFoundError,
+            GitHubRateLimitError,
+            GitHubNetworkError,
+        ):
+            raise
         except requests.exceptions.Timeout as e:
             raise GitHubNetworkError(
                 f"GitHub API diff request timed out after {self.timeout}s: {e}",
@@ -884,11 +945,9 @@ class GitHubClient:
                 f"GitHub API diff request error: {e}",
                 token=self._token,
             ) from None
-
-        if resp.status_code != 200:
-            self._handle_response_error(resp, owner, repo, num)
-
-        return resp.text
+        finally:
+            if resp is not None and hasattr(resp, "close") and callable(resp.close):
+                resp.close()
 
     def download_commit_archive(
         self,
@@ -1590,10 +1649,13 @@ def get_pr_diff(
     token: str | None = None,
     base_url: str | None = None,
     timeout: float = 30.0,
+    max_bytes: int | None = None,
     **kwargs: Any,
 ) -> str:
     """Convenience helper to fetch PR diff."""
     client = GitHubClient(token=token, base_url=base_url, timeout=timeout, **kwargs)
+    if max_bytes is not None:
+        return client.get_pr_diff(owner, repo, pr_number, max_bytes=max_bytes)
     return client.get_pr_diff(owner, repo, pr_number)
 
 

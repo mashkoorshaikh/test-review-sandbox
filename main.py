@@ -22,7 +22,6 @@ import logging
 import os
 import re
 import sys
-import warnings
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -905,7 +904,7 @@ def main() -> None:
         "--token",
         dest="token",
         default=None,
-        help="GitHub token (DEPRECATED for security: prefer GITHUB_TOKEN or GH_TOKEN env var)",
+        help="DEPRECATED & DISABLED: Passing tokens via CLI is disabled for security. Use GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN_FILE.",
     )
     parser.add_argument(
         "--publish",
@@ -945,18 +944,13 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.token is not None:
-        warnings.warn(
-            "Passing GitHub token via '--token' CLI option is deprecated for security reasons: "
-            "command-line arguments can be exposed in process tables and shell history. "
-            "Please set the GITHUB_TOKEN or GH_TOKEN environment variable (or GITHUB_TOKEN_FILE) instead.",
-            UserWarning,
-            stacklevel=2,
-        )
+        register_sensitive_token(args.token)
         sys.stderr.write(
-            "[Security Warning] Passing GitHub token via '--token' CLI option is deprecated. "
-            "Command-line arguments can be visible to other users and logged in shell history. "
-            "Please set the GITHUB_TOKEN or GH_TOKEN environment variable instead.\n"
+            "[Security Error] Passing GitHub token via '--token' CLI option is disabled for security reasons: "
+            "command-line arguments can be exposed in process tables and shell history.\n"
+            "Please set the GITHUB_TOKEN or GH_TOKEN environment variable (or GITHUB_TOKEN_FILE) instead.\n"
         )
+        sys.exit(2)
 
     if args.publish and not args.pr:
         print("ERROR: --publish requires a GitHub PR target specified via --pr.")
@@ -966,7 +960,7 @@ def main() -> None:
         exit_code = run_pr_pipeline(
             pr_target=args.pr,
             repo=args.repo,
-            token=args.token,
+            token=None,
             enable_ai=args.enable_ai,
             enable_sandbox=args.enable_sandbox,
             enable_debugging=args.enable_debugging,
